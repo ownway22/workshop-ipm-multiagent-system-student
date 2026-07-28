@@ -1,9 +1,9 @@
 """專家 Agent 的健檢結果資料契約。
 
-這是整個多代理系統唯一橫跨四個檢查點的資料契約。因為所有 agent 都不掛工具（FR-019），
+這是整個多代理系統唯一橫跨四個檢查點的資料契約。因為所有 agent 都不掛工具，
 協作品質完全取決於這份契約是否穩定。
 
-語言分工（FR-057）：欄位名與列舉值維持英文（機器契約，跨層解析用），
+語言分工：欄位名與列舉值維持英文（機器契約，跨層解析用），
 自由文字欄位一律繁體中文（給人閱讀），其中的技術名詞、API、型別與變數名維持原始英文。
 """
 
@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ReviewCategory(str, Enum):
-    """健檢類別。MUST 與產出結果的專家 agent 對應，不得跨界。"""
+    """健檢類別。必須與產出結果的專家 agent 對應，不得跨界。"""
 
     CODE = "code"
     ARCHITECTURE = "architecture"
@@ -44,14 +44,14 @@ class SpecialistReview(BaseModel):
     """專家 Agent 的結構化健檢結果。
 
     掛載方式：以 `default_options={"response_format": SpecialistReview}` 傳入
-    `FoundryChatClient.as_agent(...)`。這是資料契約而非工具，符合憲章原則 III。
+    `FoundryChatClient.as_agent(...)`。這是資料契約而非工具，因此不違反「不掛工具」的設計。
     """
 
     # 三個專家 agent 的輸出必須嚴格符合此形狀，多餘欄位視為契約違反。
     model_config = ConfigDict(extra="forbid")
 
     category: ReviewCategory = Field(
-        description="健檢類別；MUST 與產出的專家 agent 對應",
+        description="健檢類別；必須與產出的專家 agent 對應",
     )
     summary: str = Field(
         min_length=1,
@@ -67,8 +67,8 @@ class SpecialistReview(BaseModel):
     evidence: list[str] = Field(
         min_length=1,
         description=(
-            "繁體中文的證據清單；每一項 MUST 可追溯到使用者訊息或交付包內的虛構材料。"
-            "MUST NOT 引用未提供的檔案、repository、Azure 即時狀態或外部文件"
+            "繁體中文的證據清單；每一項必須可追溯到使用者訊息或課程提供的虛構材料。"
+            "不可引用未提供的檔案、repository、Azure 即時狀態或外部文件"
         ),
     )
     recommendations: list[str] = Field(
@@ -78,7 +78,7 @@ class SpecialistReview(BaseModel):
     limitations: list[str] = Field(
         min_length=1,
         description=(
-            "繁體中文的限制清單；MUST 至少說明一項未涵蓋範圍。"
+            "繁體中文的限制清單；必須至少說明一項未涵蓋範圍。"
             "此欄位是防止 agent 誇大的結構性保險——即使模型傾向宣稱完整覆蓋，"
             "也必須在同一份輸出中宣告自己的限制"
         ),
@@ -101,7 +101,7 @@ class SpecialistReview(BaseModel):
 #: 這些會在產生 portal 貼上版時被移除，對應的約束改由 `SpecialistReview` 在解析階段把關，
 #: 並在欄位 `description` 中以文字告知模型（例如「至少 1 項」）。
 #:
-#: 注意這是**保守做法，不是服務端的硬性限制**：2026-07-27 spike S1 實測，SDK 路徑經
+#: 這是**保守做法，不是服務端的硬性限制**：2026-07-27 實測，SDK 路徑經
 #: `to_prompt_agent()` 送出的 schema 保留這些關鍵字且 `strict: true`，`create_version()`
 #: 一樣接受。移除它們是為了讓 portal 對話框的貼上版本盡量落在 OpenAI 相容 structured
 #: outputs 的受限子集內，降低學員在 Lab 1 卡關的機率。
@@ -126,7 +126,7 @@ def build_portal_response_format(name: str = "specialist_review") -> dict:
 
     portal 需要的是 raw JSON schema（含 `name`／`strict`／`schema` 三個鍵），與 SDK 直接
     傳 Pydantic 型別的路徑不同。這個函式**從同一個 `SpecialistReview` 產生**，避免講義裡
-    的 JSON 與程式碼日後分歧——這與 FR-061 對 instructions 的要求是同一種問題。
+    的 JSON 與程式碼日後分歧——這與 instructions 要求單一事實來源是同一種問題。
 
     產生時做三件事：
 

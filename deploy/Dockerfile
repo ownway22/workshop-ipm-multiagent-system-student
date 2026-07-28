@@ -24,7 +24,7 @@ COPY src/pyproject.toml src/uv.lock ./
 # 不會靜默升級。`--no-dev` 排除 pytest。
 RUN uv sync --locked --no-dev
 
-# 交付包程式碼。`.dockerignore` 已排除 `.venv`、`__pycache__` 與 `.env`，
+# 本專案的程式碼。`.dockerignore` 已排除 `.venv`、`__pycache__` 與 `.env`，
 # 其中 `.venv` 尤其重要：開發機的 venv 可能是 arm64，混進映像會直接壞掉。
 COPY src/ ./
 

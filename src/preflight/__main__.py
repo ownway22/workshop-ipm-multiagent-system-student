@@ -1,17 +1,13 @@
 """環境前置檢查的單一指令入口。
 
-執行方式（在 `src/` 目錄下）：
+執行方式（cwd 必須是 `src`）：
 
-```bash
-uv run python -m preflight
-```
-
-契約：[contracts/preflight-contract.md](../../specs/001-ipm-workshop-delivery/contracts/preflight-contract.md)
+    cd src && uv run python -m preflight
 
 行為要點：
 
-- **單一入口**：六項檢查 MUST 由這一支指令全部涵蓋，MUST NOT 拆成多支（FR-006）。
-- **不早退**：某項失敗時仍繼續檢查其餘項目，一次呈現完整狀況（FR-004）。
+- **單一入口**：六項檢查由這一支指令全部涵蓋，不拆成多支。
+- **不早退**：某項失敗時仍繼續檢查其餘項目，一次呈現完整狀況。
 - **結束碼**：`0` 全數通過｜`1` 至少一項失敗｜`2` 必要環境變數缺漏。
 
 不論執行幾次、在什麼時點執行，跑的都是**同一支**指令，結果可直接比對。
@@ -94,7 +90,7 @@ def run_all_checks() -> list[CheckResult]:
 
 
 def render(results: list[CheckResult]) -> str:
-    """把檢查結果組成契約第 4 節規定的輸出。"""
+    """把檢查結果組成可直接印出的報告。"""
     lines = [_HEADER, _RULE]
 
     for result in results:
@@ -141,5 +137,13 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-# `format_missing_env_message` 由 config 提供，於此重新匯出僅為讓測試可從單一入口取得。
-__all__ = ["EXIT_CHECK_FAILED", "EXIT_MISSING_ENV", "EXIT_OK", "format_missing_env_message", "main", "render", "run_all_checks"]
+# `format_missing_env_message` 由 config 提供，在此重新匯出只為了讓測試可從單一入口取得。
+__all__ = [
+    "EXIT_CHECK_FAILED",
+    "EXIT_MISSING_ENV",
+    "EXIT_OK",
+    "format_missing_env_message",
+    "main",
+    "render",
+    "run_all_checks",
+]

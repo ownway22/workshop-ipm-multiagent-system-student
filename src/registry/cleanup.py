@@ -1,6 +1,6 @@
 """刪除本 workshop 建立的 agent（課後清理）。
 
-執行方式（cwd MUST 為 `src`）：
+執行方式（cwd 必須是 `src`）：
 
     cd src && uv run python -m registry.cleanup            # 先看要刪什麼
     cd src && uv run python -m registry.cleanup --confirm  # 真的刪
@@ -11,9 +11,9 @@
 很可能有其他人或其他專案的 agent，誤刪是不可逆的。
 
 **預設是乾跑（dry run）。** 不帶 `--confirm` 只會列出清單，不會刪任何東西。
-刪除是不可逆操作，MUST NOT 讓「手滑執行一次指令」就造成損失。
+刪除是不可逆操作，不可讓「手滑執行一次指令」就造成損失。
 
-**MUST NOT 刪除 Foundry 專案或模型部署。** 那兩者是學員的既有資產，
+**不刪除 Foundry 專案或模型部署。** 那兩者是學員的既有資產，
 不是本 workshop 建立的。
 
 ## 這支腳本刪不到的東西
@@ -23,7 +23,7 @@ Lab 3、Lab 4 會建立**計費資源**，它們不是 agent，本腳本刪不�
 - Azure Container Registry（`azd down` 或手動刪除）
 - Bot Service（Teams 發布時建立）
 
-執行完會提示，MUST 自行到 portal 確認並移除，否則會持續計費。
+執行完會提示，請自行到 portal 確認並移除，否則會持續計費。
 """
 
 import argparse
@@ -116,7 +116,7 @@ async def run(confirm: bool) -> int:
     print()
     print(f"完成：已刪除 {len(to_delete)} 個 agent。")
     print()
-    print("⚠️ 下列資源**不是** agent，本腳本刪不到，MUST 自行確認：")
+    print("⚠️ 下列資源**不是** agent，本腳本刪不到，請自行確認：")
     print("    · Azure Container Registry（Lab 3 建立）")
     print("      cd deploy && azd down")
     print("    · Bot Service（Lab 4 發布到 Teams 時建立）")

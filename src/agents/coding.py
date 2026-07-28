@@ -1,12 +1,12 @@
 """程式碼健檢專家（Coding Agent）的角色定義。
 
-此 agent 於 **Lab 1** 由學員在 Foundry portal 手動建立，Lab 2 MUST NOT 重新建立
-（FR-053 的 Lab 1 → Lab 2 沿用閘門）。本檔的 instructions 同時是：
+此 agent 在 **Lab 1** 由學員在 Foundry portal 手動建立，Lab 2 不會重建
+（這是 Lab 1 → Lab 2 的沿用閘門）。本檔的 instructions 同時用於兩處：
 
-- Lab 1 講義請學員貼上 portal 的內容
+- Lab 1 講義請學員貼進 portal 的內容
 - Lab 2 建構 Handoff 執行期參與者時使用的內容
 
-兩者為同一份文字，MUST NOT 分岔（FR-061）。
+兩處是同一份文字，不可分岐。
 """
 
 from models.agent_role import AgentRole, compose_agent_name
@@ -14,10 +14,12 @@ from models.specialist_review import SpecialistReview
 
 KEY = "coding"
 
-# description 是 agent discovery 的唯一依據（FR-012）。
-# 以「輸入材料的型態」而非動詞區分，且把具區別力的名詞放在句首，
-# 避免與另外兩位專家的描述出現可被混淆的共用句型。
-DESCRIPTION = "Python 程式碼健檢：分析使用者貼上的 Python 程式碼或程式碼摘要，回報實作層面的品質問題。"
+# description 是 agent discovery 的唯一依據。
+# 以「輸入材料的型態」而非動詞區分，並把具區別力的名詞放在句首，
+# 避免與另外兩位專家的描述出現容易混淆的共用句型。
+DESCRIPTION = (
+    "Python 程式碼健檢：分析使用者貼上的 Python 程式碼或程式碼摘要，回報實作層面的品質問題。"
+)
 
 INSTRUCTIONS = """\
 你是 IPM 專案交付包健檢團隊的**程式碼健檢專家**。

@@ -1,6 +1,7 @@
 # Lab 4：發布到 Teams
 
-**前置**：[Lab 3](03-lab3-deploy.md) 完成，hosted agent 狀態為 `active`
+**前置條件**：[Lab 3](03-lab3-deploy.md) 已完成，hosted agent 狀態為 `active`。
+**完成條件**：在 Teams 的「Your agents」中找到 agent，並完成一輪交接對話。
 
 ---
 
@@ -8,16 +9,16 @@
 
 把 Lab 3 部署好的 agent 發布到 Microsoft Teams，在 Teams 裡與它對話。
 
-做完你會得到：一個在 Teams「Your agents」裡看得到、可以直接私訊的 agent。
+完成後，你會在 Teams 的「Your agents」中看到可直接私訊的 agent。
 
 ---
 
-## 先講清楚：這一關能做到什麼、不能做到什麼
+## 限制與範圍
 
 **能做到**：
 
 - ✅ 在 Teams 裡與 agent **1:1 私訊**
-- ✅ 完整的交接對話（和 playground 一樣）
+- ✅ 完整的交接對話（與 Playground 一樣）
 
 **做不到**（框架目前的限制，不是你設定錯）：
 
@@ -32,14 +33,14 @@
 
 ---
 
-## 步驟一：確認有 active version
+## 步驟一：確認 agent 狀態
 
 ```bash
 cd deploy
 azd ai agent show
 ```
 
-`status` 必須是 `active`。不是的話回 [Lab 3](03-lab3-deploy.md) 步驟五。
+`status` 必須是 `active`。若不是，回到 [Lab 3 步驟五](03-lab3-deploy.md#步驟五輪詢到-active)。
 
 ---
 
@@ -74,11 +75,11 @@ Foundry portal → 你的專案 → Agents → `qvn-ipm-review` → **Publish**
 
 Publish options → **Direct publish**。
 
-（另一個選項會走系統管理員核准流程，今天不用。）
+> ℹ️ 另一個選項會走系統管理員核准流程，本課程不使用。
 
 ---
 
-## 步驟五：範圍選「Just you」
+## 步驟五：選擇「Just you」範圍
 
 使用範圍 → **Just you**。
 
@@ -124,7 +125,7 @@ result = eval(request.args.get("expr"))
 
 ---
 
-## 一個 1:1 對話串 = 一份記憶
+## 1:1 對話與 session
 
 Teams 端的 session 邊界對應 **Teams 原生的對話識別碼**：
 
@@ -136,26 +137,26 @@ Teams 端的 session 邊界對應 **Teams 原生的對話識別碼**：
 
 ---
 
-## 常見失敗
+## 常見問題排除
 
-| 現象                                           | 原因                                                    | 處理                                                                |
-| ---------------------------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------- |
-| 驗證錯誤，指向 Developer name                  | 超過 32 字元                                            | 縮短                                                                |
-| `403 AuthorizationFailed on botServices/write` | 缺 `Azure Bot Service Contributor Role`（資源群組範圍） | 請訂閱管理員在**資源群組**上指派；訂閱 Owner **不包含**這個角色     |
-| 發布成功但 Teams 裡找不到                      | Teams 帳號與 Azure 訂閱不同租戶                         | 用同租戶的帳號登入 Teams                                            |
-| 第一則訊息等很久                               | 閒置超過 15 分鐘被回收，冷啟動中                        | 等一下就好，不是壞掉                                                |
-| 完全沒有回應                                   | 先看 traces 判斷請求有沒有抵達                          | 見 [Lab 3 步驟八](03-lab3-deploy.md#這個技能真正的用處分辨兩種失敗) |
-| 回應內容像是舊版本                             | 舊 session 綁在舊 agent 版本                            | `azd ai agent sessions delete <id>`；只開新對話不夠                 |
-| 在頻道 `@` 它沒反應                            | **不支援**頻道提及                                      | 改用 1:1 私訊                                                       |
+| 現象                                           | 原因                                                    | 處理                                                            |
+| ---------------------------------------------- | ------------------------------------------------------- | --------------------------------------------------------------- |
+| 驗證錯誤，指向 Developer name                  | 超過 32 字元                                            | 縮短                                                            |
+| `403 AuthorizationFailed on botServices/write` | 缺 `Azure Bot Service Contributor Role`（資源群組範圍） | 請訂閱管理員在**資源群組**上指派；訂閱 Owner **不包含**這個角色 |
+| 發布成功但 Teams 裡找不到                      | Teams 帳號與 Azure 訂閱不同租戶                         | 用同租戶的帳號登入 Teams                                        |
+| 第一則訊息等很久                               | 閒置超過 15 分鐘被回收，冷啟動中                        | 等一下就好，不是壞掉                                            |
+| 完全沒有回應                                   | 先看 traces 判斷請求有沒有抵達                          | 見 [Lab 3 步驟八](03-lab3-deploy.md#步驟八看-traces)            |
+| 回應內容像是舊版本                             | 舊 session 綁在舊 agent 版本                            | `azd ai agent sessions delete <id>`；只開新對話不夠             |
+| 在頻道 `@` 它沒反應                            | **不支援**頻道提及                                      | 改用 1:1 私訊                                                   |
 
 ---
 
-## 你完成了什麼
+## 完成內容
 
-從一個在 portal 手動點出來的單一 agent，到四個 agent 的交接系統，
-再到 Azure 上的託管服務，最後到 Teams 裡可以直接對話的助理。
+從一個在 Foundry portal 手動建立的單一 agent，到四個 agent 的交接系統，
+再到 Azure 上的託管服務，最後到 Teams 裡可直接對話的助理。
 
-中間每一步的核心程式碼都沒有重寫——變的只是外面那一圈。
+核心程式碼沒有重寫，改變的是對外的執行與發布方式。
 
 ---
 

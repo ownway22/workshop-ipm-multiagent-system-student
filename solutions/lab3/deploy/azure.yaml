@@ -10,7 +10,7 @@
 #
 # 1. `host: azure.ai.agent` 取自 azd 官方 schema 的 host 列舉。
 # 2. **protocol 不在本檔**，宣告在同目錄的 `agent.yaml`（AgentSchema 的 ContainerAgent）。
-# 3. **服務名稱 MUST 等於 `agent.yaml` 的 `name`**。不同時部署會成功，但 postdeploy hook
+# 3. **服務名稱必須等於 `agent.yaml` 的 `name`**。不同時部署會成功，但 postdeploy hook
 #    與 `azd ai agent show/invoke/monitor` 都以服務名稱查 agent，會得到 404。
 # 4. `infra.provider` **不能**設成 azd schema 的範例值 `microsoft.foundry`——那個 provider
 #    不是本擴充提供的（`extension.yaml` 只註冊 service-target）。留空即用預設的 bicep。
@@ -46,7 +46,7 @@ services:
       remoteBuild: true
     config:
       container:
-        # ⚠️ 本區塊會**覆蓋** `agent.yaml` 的 `resources`，兩處 MUST 一致。
+        # ⚠️ 本區塊會**覆蓋** `agent.yaml` 的 `resources`，兩處必須一致。
         # azd 若自行補上此區塊，預設是 0.25 / 0.5Gi，需改回下列值。
         resources:
           cpu: "0.5"

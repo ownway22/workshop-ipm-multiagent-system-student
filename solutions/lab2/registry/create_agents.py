@@ -1,24 +1,23 @@
 """建立 workshop 需要的持久化 agent（Lab 2 步驟一）。
 
-執行方式（cwd MUST 為 `src`）：
+執行方式（cwd 必須是 `src`）：
 
     cd src && uv run python -m registry.create_agents
 
 ## 這支腳本做什麼
 
-1. 確認 Lab 1 在 portal 手動建立的 `qvn-coding-agent` **存在**——不存在就報錯並指向 Lab 1，
-   **MUST NOT** 自動補建（FR-053）。
-2. 冪等地建立 `qvn-primary-agent`、`qvn-architect-agent`、`qvn-spec-agent`（FR-054）。
+1. 確認 Lab 1 在 portal 手動建立的 `qvn-coding-agent` **存在**。不存在就報錯並指向 Lab 1，
+   **不會**自動補建。
+2. 冪等地建立 `qvn-primary-agent`、`qvn-architect-agent`、`qvn-spec-agent`。
 
 ## 設計重點
 
-**定義檔是唯一事實來源**（FR-061）。四個 agent 的 instructions 與 description 都來自
-`src/agents/`，同一份內容餵給兩條路徑：這裡建立**持久化 agent**（portal 可見、清理辨識），
-`src/workflows/handoff.py` 建立**執行期參與者**。兩邊 MUST NOT 各自維護一份會分歧的內容。
+**定義檔是唯一事實來源。** 四個 agent 的 instructions 與 description 都來自 `src/agents/`，
+同一份內容餵給兩條路徑：這裡建立**持久化 agent**（portal 可見、方便清理辨識），
+`src/workflows/handoff.py` 建立**執行期參與者**。兩邊不可各自維護一份會分歧的內容。
 
 **為什麼不從服務端讀回 Lab 1 的定義**：portal 建立 agent 時**沒有** description 欄位，
-讀回來會是空字串；而 description 是 agent discovery 的唯一依據（FR-012）。
-（2026-07-27 實測）
+讀回來會是空字串；而 description 是 agent discovery 的唯一依據（2026-07-27 實測）。
 """
 
 import asyncio
@@ -42,7 +41,7 @@ class PrecheckError(RuntimeError):
 
 
 def _build_credential():
-    """建立開發者憑證（FR-005）。MUST NOT 使用 API key。"""
+    """建立開發者憑證。不可使用 API key。"""
     from azure.identity.aio import AzureCliCredential
 
     return AzureCliCredential()
@@ -53,7 +52,7 @@ def _build_agent(role: AgentRole, endpoint: str, deployment_name: str, credentia
 
     `to_prompt_agent()` 只吃 client 為 `FoundryChatClient` 的 `Agent`，且 model、
     instructions、response_format 全部從 `agent.default_options` 取值，因此這裡
-    MUST 把定義檔的內容完整交給 `as_agent()`，不可只傳一部分。
+    必須把定義檔的內容完整交給 `as_agent()`，不可只傳一部分。
     """
     from agent_framework.foundry import FoundryChatClient
 
@@ -94,12 +93,12 @@ async def _get_agent_or_none(project_client, agent_name: str):
 async def _assert_lab1_agent_exists(
     project_client, coding_agent_name: str, endpoint: str
 ) -> None:
-    """前置檢查：`qvn-coding-agent` MUST 已存在（FR-053）。
+    """前置檢查：`qvn-coding-agent` 必須已存在。
 
-    這是「Lab 1 → Lab 2 沿用」的執行點。Lab 2 MUST NOT 自動補建 Lab 1 的 agent，
+    這是「Lab 1 → Lab 2 沿用」的執行點。Lab 2 刻意不自動補建 Lab 1 的 agent，
     否則學員會誤以為兩個 Lab 之間沒有關聯，也就看不出 portal 手動建立與程式碼建立的差別。
 
-    失敗訊息 MUST 同時陳列「查的是哪個專案」與「該專案實際有哪些 agent」。
+    失敗訊息必須同時陳列「查的是哪個專案」與「該專案實際有哪些 agent」。
     2026-07-27 實測踩到的真實情境：portal 上建在 A 專案、`.env` 指向 B 專案，
     光看「找不到 agent」會讓人以為 Lab 1 失敗，而不是想到專案選錯。
     """
@@ -143,10 +142,10 @@ async def _assert_lab1_agent_exists(
 async def _upsert_agent(project_client, role: AgentRole, definition) -> tuple[str, str]:
     """建立或更新單一持久化 agent，回傳 `(狀態符號, 說明)`。
 
-    冪等性（FR-054）：agent **名稱**是穩定識別碼。已存在時走 `create_version()` 建立
+    冪等性：agent **名稱**是穩定識別碼。已存在時走 `create_version()` 建立
     新版本，agent 本身不會變成第二個，因此重複執行的 agent 總數恆定。
 
-    比對時 MUST 同時涵蓋 definition 與 description——`description` 不在 definition 內，
+    比對時必須同時涵蓋 definition 與 description——`description` 不在 definition 內，
     它是 `create_version()` 的獨立參數，只比 definition 會漏掉描述變更。
     """
     existing = await _get_agent_or_none(project_client, role.agent_name)
@@ -171,7 +170,7 @@ async def _upsert_agent(project_client, role: AgentRole, definition) -> tuple[st
 
 
 async def _list_prefixed_agents(project_client, prefix: str) -> list[str]:
-    """列出專案中所有以指定前置詞開頭的 agent 名稱（FR-009 的清理也依此判定）。"""
+    """列出專案中所有以指定前置詞開頭的 agent 名稱（清理也依此判定）。"""
     return sorted(
         [agent.name async for agent in project_client.agents.list() if agent.name.startswith(prefix)]
     )

@@ -3,7 +3,7 @@
 // ## 範圍刻意極小
 //
 // 只建立**映像儲存**（ACR）與它必要的三項授權／接線。
-// MUST NOT 佈建 Foundry 專案或模型部署——那兩者是學員的既有資產，由前置作業準備好，
+// 不佈建 Foundry 專案或模型部署——那兩者是學員的既有資產，由前置作業準備好，
 // 誤佈建會覆寫學員環境。hosted agent 本身也不在這裡建立：它由 `azd deploy` 經
 // `azure.ai.agents` 擴充建立，cpu／memory 來自 `azure.yaml` 的 `config.container.resources`。
 //
@@ -44,10 +44,10 @@ param principalId string
 @allowed(['User', 'ServicePrincipal'])
 param principalType string = 'User'
 
-@description('既有 Foundry 帳戶（AI Services account）名稱。MUST NOT 由本檔建立。')
+@description('既有 Foundry 帳戶（AI Services account）名稱。不由本檔建立。')
 param aiServicesAccountName string
 
-@description('既有 Foundry 專案名稱。MUST NOT 由本檔建立。')
+@description('既有 Foundry 專案名稱。不由本檔建立。')
 param aiProjectName string
 
 @description('套用到所有資源的標籤。')

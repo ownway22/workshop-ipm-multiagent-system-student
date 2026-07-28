@@ -1,55 +1,54 @@
-"""Lab 2 的本機進入點（DevUI 與 Responses 兩種模式）。
+"""Lab 2 的本機進入點，提供 DevUI 與 Responses 兩種模式。
 
-執行方式（cwd MUST 為 `src`）：
+執行方式（cwd 必須是 `src`）：
 
     cd src && uv run python main.py              # DevUI：有畫面，看得到交接
     cd src && uv run python main.py --responses  # Responses：純 API，與 Lab 3 部署後相同
 
 ## 兩種模式的關係
 
-兩者包的是**同一套**拓撲，差別只在對外的外皮：
+兩者包的是**同一套**拓撲，差別只在對外的那層外皮：
 
-| 模式      | 包裝方式                                        | 用途                     |
-| --------- | ----------------------------------------------- | ------------------------ |
-| DevUI     | `serve(entities=[agent 實體, workflow 實體])`     | 開發時觀察交接           |
-| Responses | `ResponsesHostServer(workflow.as_agent(...))`   | 與 Lab 3 託管後相同的協定 |
+| 模式      | 包裝方式                                      | 用途                |
+| --------- | --------------------------------------------- | ------------------- |
+| DevUI     | `serve(entities=[agent 實體, workflow 實體])` | 開發時觀察交接      |
+| Responses | `ResponsesHostServer(workflow.as_agent(...))` | 與 Lab 3 部署後相同 |
 
-`--responses` 存在的理由：通訊協定的選擇 MUST 在**寫程式碼的階段**就確立，
-不是部署時才耐。先在本機用 Responses 跑起來，Lab 3 的部署才不會出現「跨協定的意外」。
+`--responses` 存在的理由：通訊協定的選擇必須在**寫程式碼的階段**就確立，不是部署時才改。
+先在本機用 Responses 跑起來，Lab 3 部署時才不會出現跨協定的意外。
 
 ## DevUI 會看到兩個實體
 
-同一套四代理 Handoff 拓撲在 DevUI 上會出現**兩次**，分別屬於不同類別：
+同一套四代理 Handoff 拓撲在 DevUI 上會出現**兩次**，分屬不同類別：
 
-| 實體名稱                  | DevUI 類別  | 它是什麼                             |
-| ------------------------- | ---------- | ------------------------------------ |
-| `qvn-ipm-review`          | `agent`    | 整套工作流包成一個 agent（與 Lab 3 相同） |
-| `qvn-ipm-review-workflow` | `workflow` | 未包裝的工作流本體               |
+| 實體名稱                  | DevUI 類別 | 它是什麼                 |
+| ------------------------- | ---------- | ------------------------ |
+| `qvn-ipm-review`          | `agent`    | 整套工作流包成一個 agent |
+| `qvn-ipm-review-workflow` | `workflow` | 未包裝的工作流本體       |
 
-目的是讓學員看到 DevUI **同時支援 agent 與 workflow 兩種類別**。
-兩者來自同一份 `src/agents/` 定義檔，但 MUST 是**兩個獨立建構的實例**：
-共用同一個 `Workflow` 物件時，只要一邊還在串流、另一邊就會撞上框架的併發防護。
+`qvn-ipm-review` 就是 Lab 3 部署後對外呈現的樣子。同時註冊兩個實體的目的，
+是讓學員看到 DevUI **同時支援 agent 與 workflow 兩種類別**。
 
-> ⚠️ workflow 類別實體的**每一次送出都是新的一輪**，不是交接續接；
-> 且狀態會跨對話殘留。詳見 `docs/02-lab2-multi-agent.md` 的說明與
-> `references/known-gaps.md`。
+兩者來自同一份 `src/agents/` 定義檔，但必須是**兩個獨立建構的實例**：
+共用同一個 `Workflow` 物件時，只要一邊還在串流，另一邊就會撞上框架的併發防護。
 
-> 本交付包 MUST NOT 引入 Invocations、WebSocket 或 A2A 端點。
-> `WorkflowAgent` 並非 `Agent` 子類，但 `ResponsesHostServer` 接受的是 `SupportsAgentRun`
-> protocol，因此可直接包裝（research.md R06 實測）。
+> ⚠️ workflow 類別實體的**每一次送出都是新的一輪**，不是交接續接，而且狀態會跨對話殘留。
+> 詳見 `docs/02-lab2-multi-agent.md` 與 `references/known-gaps.md`。
 
-## 兩處 MUST 明確指定、不可依賴預設值的設定（research.md R09）
+> 本專案不提供 Invocations、WebSocket 或 A2A 端點。`WorkflowAgent` 並非 `Agent` 子類，
+> 但 `ResponsesHostServer` 接受的是 `SupportsAgentRun` protocol，因此可直接包裝（實測）。
+
+## 兩處必須明確指定、不可依賴預設值的設定
 
 **`port`**：`agent_framework_devui.serve()` 的套件預設是 `8080`。講義與驗收標準都寫死了
-連接埠，所以這裡 MUST 明確傳入 `settings.devui_port`——否則套件哪天改預設值，
+連接埠，所以這裡必須明確傳入 `settings.devui_port`——否則套件哪天改了預設值，
 現場三十個人會同時開錯網址。
 
 **`auth_enabled`**：套件預設是 `True`，未給 token 時會**自動產生**一組，
-學員得先回終端機找 token 才能發第一則訊息。本 workshop 一律以 `False` 啟動。
+學員得先回終端機找 token 才能送出第一則訊息。本 workshop 一律以 `False` 啟動。
 
-> ⚠️ `auth_enabled=False` 是 **workshop 的權宜做法，不是生產建議**。
-> 正式環境 MUST 保留驗證。這裡關掉是因為 DevUI 只綁在你自己機器的 loopback 位址上，
-> 且是三十個人同時操作的教學場景。
+> ⚠️ `auth_enabled=False` 是 **workshop 的權宜做法，不是生產建議**，正式環境必須保留驗證。
+> 這裡關掉，是因為 DevUI 只繫結在你自己機器的 loopback 位址上，且是三十人同時操作的教學場景。
 
 ## 繫結位址與驗證是綁在一起的
 
@@ -65,8 +64,8 @@
 | 備援 | `uv run python main.py --forward` | `0.0.0.0`   | 開啟（需 token） |
 
 備援路徑用於連接埠轉發（例如 Codespaces）導致主要路徑回 400 時。
-實測 UI 首頁**不需** token 即可載入，token 只在 API 呼叫時檢查——
-所以可以先開頁面，再把終端機印出的 token 貼進 DevUI 設定對話框的 `devui_auth_token` 欄位。
+實測 UI 首頁**不需** token 即可載入，token 只在 API 呼叫時檢查，所以可以先開頁面，
+再把終端機印出的 token 貼進 DevUI 設定對話框的 `devui_auth_token` 欄位。
 """
 
 import argparse
@@ -100,7 +99,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--responses",
         action="store_true",
-        help="以 Responses 通訊協定啟動（無 UI），與 Lab 3 託管部署後相同",
+        help="以 Responses 通訊協定啟動（沒有 UI），與 Lab 3 部署後相同",
     )
     parser.add_argument(
         "--forward",
@@ -111,7 +110,7 @@ def _parse_args() -> argparse.Namespace:
         "--host",
         default=None,
         help=(
-            "覆寫繫結位址。預設 loopback；容器內 MUST 傳 0.0.0.0（見 `deploy/Dockerfile`）。"
+            "覆寫繫結位址。預設 loopback；容器內必須傳 0.0.0.0（見 `deploy/Dockerfile`）。"
             "DevUI 模式請改用 --forward，不要用本參數"
         ),
     )
@@ -124,7 +123,7 @@ def _parse_args() -> argparse.Namespace:
 def _resolve_port(explicit: int | None, settings_port: int) -> int:
     """決定連接埠：命令列 > `PORT` 環境變數 > `.env`。
 
-    `PORT` 這一層是給**容器**用的——托管平台以它告知應用該聽哪一個埠。
+    `PORT` 這一層是給**容器**用的——託管平台以它告知應用該聽哪一個埠。
     本機開發通常沒有這個變數，會落到 `.env` 的值。
     """
     if explicit is not None:
@@ -136,7 +135,7 @@ def _resolve_port(explicit: int | None, settings_port: int) -> int:
 def _resolve_auth(forward: bool) -> tuple[str, bool, str | None]:
     """決定 `(host, auth_enabled, auth_token)`。
 
-    這三個值 MUST 一起決定：`auth_enabled=False` 只在 loopback 位址上合法，
+    這三個值必須一起決定：`auth_enabled=False` 只在 loopback 位址上合法，
     分開設定必然會組出啟動就失敗的搭配。
     """
     if not forward:
@@ -147,17 +146,17 @@ def _resolve_auth(forward: bool) -> tuple[str, bool, str | None]:
 
 
 def _serve_responses(workflow, host: str, port: int) -> None:
-    """以 Responses 通訊協定啟動（FR-022、research.md R06）。
+    """以 Responses 通訊協定啟動。
 
     `workflow.as_agent()` 回傳的 `WorkflowAgent` **並非** `Agent` 子類（實測
     `isinstance(...) is False`），但 `ResponsesHostServer` 接受的是 `SupportsAgentRun`
-    protocol，因此可以直接包裝——這是「整個多代理系統對外看起來就像一個 agent」的落點。
+    protocol，因此可以直接包裝——這就是「整個多代理系統對外看起來就像一個 agent」的落點。
 
     `ResponsesHostServer` 本身**就是** ASGI 應用（Starlette 子類），並自帶 `run()`。
-    MUST NOT 去取 `.app` 屬性再交給 uvicorn——那個屬性不存在。
+    不可去取 `.app` 屬性再交給 uvicorn——那個屬性不存在。
 
-    `run()` 的預設是 `0.0.0.0`；本檔一律**明確傳入** host，不依賴那個預設值。
-    本機開發繫 loopback（避免把一個免驗證的模型端點暴露到局域網），容器內才繫 `0.0.0.0`。
+    `run()` 的預設是 `0.0.0.0`，本檔一律**明確傳入** host，不依賴那個預設值：
+    本機開發繫 loopback（避免把一個免驗證的模型端點暴露到區域網路），容器內才繫 `0.0.0.0`。
 
     來源 M14（Foundry Hosted Agents，Agent Framework 側 hosting 文件）：
     https://learn.microsoft.com/en-us/agent-framework/hosting/foundry-hosted-agent
@@ -177,10 +176,10 @@ def main() -> None:
 
     from azure.identity.aio import AzureCliCredential
 
-    # 伺服器自己管理事件迴圈，因此這裡 MUST NOT 用 `async with` 包 credential
+    # 伺服器自己管理事件迴圈，因此這裡不可用 `async with` 包 credential
     # ——那樣 credential 會在伺服器開始前就被關閉。交給行程結束時回收即可。
     #
-    # 容器內沒有 `az login`，但 `AzureCliCredential` 這一行不用改：托管環境會以
+    # 容器內沒有 `az login`，但 `AzureCliCredential` 這一行不用改：託管環境會以
     # 受控識別提供權杖，並自動注入 `FOUNDRY_PROJECT_ENDPOINT`。
     credential = AzureCliCredential()
 
@@ -188,22 +187,22 @@ def main() -> None:
     print(f"模型部署　　：{settings.model_deployment_name}")
 
     if args.responses:
-        # Responses 模式對外**只暴露一個**實體，與 Lab 3 託管部署後完全一致。
+        # Responses 模式對外**只暴露一個**實體，與 Lab 3 部署後完全一致。
         workflow = create_workflow(
             settings.foundry_project_endpoint,
             settings.model_deployment_name,
             credential,
         )
         host = args.host or DEFAULT_DEVUI_HOST
-        print(f"Responses　　：http://{host}:{port}/responses")
-        print("註：此模式無 UI，請以 curl 或 SDK 呼叫；與 Lab 3 託管部署後的協定相同。")
+        print(f"Responses　 ：http://{host}:{port}/responses")
+        print("註：此模式沒有 UI，請以 curl 或 SDK 呼叫；協定與 Lab 3 部署後相同。")
         print()
         _serve_responses(workflow, host, port)
         return
 
     from agent_framework_devui import serve
 
-    # DevUI 模式註冊**兩個**實體：同一套拓撲的兩種呈現（spec 002 的 FR-101）。
+    # DevUI 模式註冊**兩個**實體：同一套拓撲的兩種呈現。
     agent_entity, workflow_entity = create_devui_entities(
         settings.foundry_project_endpoint,
         settings.model_deployment_name,

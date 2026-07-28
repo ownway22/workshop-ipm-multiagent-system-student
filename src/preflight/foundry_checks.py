@@ -1,10 +1,10 @@
 """前置檢查 5–6：專案端點可達性與模型能力實測。
 
-檢查 6 是整份前置檢查中**最關鍵**的一項：它 MUST 以**實際呼叫**驗證 tool calling 與
-structured outputs 兩項能力，MUST NOT 只檢查部署是否存在（FR-006）。
+檢查 6 是整份前置檢查中**最關鍵**的一項：它必須以**實際呼叫**驗證 tool calling 與
+structured outputs 兩項能力，不可只檢查部署是否存在。
 
-不鎖定型號（FR-007）：`gpt-5.4-mini` 只是前置作業文件中的**建議**型號，唯一判定依據是
-下方兩項能力實測。本模組 MUST NOT 出現任何寫死的模型型號。
+不鎖定型號：`gpt-5.4-mini` 只是前置作業文件中的**建議**型號，唯一判定依據是
+下方兩項能力實測。本模組不可出現任何寫死的模型型號。
 """
 
 import asyncio
@@ -31,7 +31,7 @@ class _CapabilityProbe(BaseModel):
 def check_project_endpoint(endpoint: str, deployment_name: str) -> CheckResult:
     """檢查 5：以開發者憑證連線專案端點。
 
-    MUST 使用 `AzureCliCredential`，MUST NOT 使用 API key（FR-005、憲章原則 I 的過時訊號）。
+    必須使用 `AzureCliCredential`，不可使用 API key。
     """
     try:
         asyncio.run(_probe_endpoint(endpoint, deployment_name))
@@ -50,20 +50,20 @@ def check_project_endpoint(endpoint: str, deployment_name: str) -> CheckResult:
 
 def _endpoint_remediation(message: str) -> list[str]:
     """依實際錯誤內容給出對症的修復步驟。"""
-    # 企業租戶常見情形：Conditional Access 的 authentication flows 政策讓 az login 取得的
+    # 企業租用戶常見情形：Conditional Access 的 authentication flows 政策讓 az login 取得的
     # refresh token 對 https://ai.azure.com 這個 scope 永遠無效，錯誤碼固定為 AADSTS530036。
     # 一般的「重新登入」救不了，必須帶 --scope 重新登入（2026-07-27 實測確認）。
     if "AADSTS530036" in message or "Conditional Access" in message:
         return [
-            "你的租戶套用了 Conditional Access 的 authentication flows 政策，",
-            "一般的 az login 取得的權杖對 AI 端點永遠無效。MUST 帶 --scope 重新登入：",
+            "你的租用戶套用了 Conditional Access 的 authentication flows 政策，",
+            "一般的 az login 取得的權杖對 AI 端點永遠無效。必須帶 --scope 重新登入：",
             "    az logout",
             '    az login --scope "https://ai.azure.com/.default"',
-            "（若你有多個租戶，再加上 --tenant <你的 tenant ID>）",
+            "（若你有多個租用戶，再加上 --tenant <你的 tenant ID>）",
         ]
     return [
         "確認 .env 的 FOUNDRY_PROJECT_ENDPOINT 與 portal 上的「專案端點」逐字相同。",
-        "確認登入的租戶與專案所在租戶一致：az account show --query tenantId",
+        "確認登入的租用戶與專案所在租用戶一致：az account show --query tenantId",
         "重新登入：az login --use-device-code",
     ]
 
@@ -134,7 +134,7 @@ def check_model_capabilities(endpoint: str, deployment_name: str) -> CheckResult
 
 
 def _deployment_remediation(deployment_name: str) -> list[str]:
-    """模型部署相關失敗的共用修復指引（編號步驟，FR-006）。"""
+    """模型部署相關失敗的共用修復指引（編號步驟）。"""
     return [
         f"目前 .env 指定的部署名稱是「{deployment_name}」。請確認它存在且支援上述能力。",
         "改用另一個部署的步驟：",
@@ -150,8 +150,8 @@ def _deployment_remediation(deployment_name: str) -> list[str]:
 def _build_credential():
     """建立開發者憑證。
 
-    本機執行一律使用開發者身分憑證（FR-005），hosted agent 執行期則由平台指派的
-    managed identity 接手。MUST NOT 使用 API key（憲章原則 I 的過時訊號）。
+    本機執行一律使用開發者身分憑證，hosted agent 執行期則由平台指派的
+    managed identity 接手。不可使用 API key。
     """
     # 延後匯入：讓「環境變數缺漏」這類失敗能更快回報，不必先付出載入 SDK 的時間成本。
     from azure.identity.aio import AzureCliCredential

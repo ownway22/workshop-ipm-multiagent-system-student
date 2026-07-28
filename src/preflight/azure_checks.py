@@ -1,6 +1,6 @@
 """前置檢查 1–4：登入的訂閱、資源區域、provider 註冊、角色指派。
 
-全部以 Azure CLI 的開發者身分執行（FR-005），MUST NOT 使用 API key。
+全部以 Azure CLI 的開發者身分執行，不使用 API key。
 """
 
 from dataclasses import dataclass
@@ -30,7 +30,7 @@ class ProjectLocation:
 
     @property
     def project_scope(self) -> str:
-        """專案範圍的 scope 字串（contracts/preflight-contract.md 第 9.2 節）。"""
+        """專案範圍的 scope 字串。"""
         return f"{self.account_id}/projects/{self.project_name}"
 
     @property
@@ -134,8 +134,8 @@ def check_region(location: ProjectLocation | AzCliError) -> CheckResult:
     """檢查 2：資源區域。
 
     判準是 Foundry hosted agents 的**官方支援區域清單**（`ALLOWED_REGIONS`，查證日 2026-07-27）。
-    區域錯誤是**現場無法修復**的問題：換區域等同重建整個 Foundry 專案與模型部署
-    （FR-008、FR-051）。台灣場次最常踩到的是 **East Asia 不在官方清單內**。
+    區域錯誤是**現場無法修復**的問題：換區域等同重建整個 Foundry 專案與模型部署。
+    台灣場次最常踩到的是 **East Asia 不在官方清單內**。
     """
     recommended = "、".join(ALLOWED_REGIONS[slug] for slug in RECOMMENDED_REGIONS)
 
@@ -230,7 +230,7 @@ def check_providers() -> CheckResult:
 def check_role_assignments(location: ProjectLocation | AzCliError) -> CheckResult:
     """檢查 4：角色指派。
 
-    查詢方式依 T016a 的官方來源查證結果（contracts/preflight-contract.md 第 9 節）：
+    查詢方式依 2026-07-27 的官方來源查證結果：
 
     - 以**角色定義 ID（GUID）**而非顯示名稱比對，因為 Foundry 的 RBAC 角色近期更名，
       更名推行期間顯示名稱可能不一致，但 ID 不變。

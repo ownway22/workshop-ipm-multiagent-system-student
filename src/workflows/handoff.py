@@ -2,7 +2,7 @@
 
 由 `src/main.py` 匯入；本模組不自行啟動任何伺服器。
 
-## 拓撲（research.md R05）
+## 拓撲
 
 以 Primary 為起點的**單層星狀**：Primary ↔ 三位專家，專家之間**沒有**直接邊。
 
@@ -16,7 +16,7 @@
               └──▶ qvn-spec-agent ──────┘
 ```
 
-這是 FR-016「複合需求逐次交接、禁止平行分派」的**結構性**保證——不是靠 instructions
+這是「複合需求逐次交接、禁止平行分派」的**結構性**保證——不是靠 instructions
 拜託模型照做，而是圖上根本不存在「專家 A → 專家 B」的路徑。
 
 ## 為什麼參與者要重新建構，而不是沿用持久化 agent
@@ -25,7 +25,7 @@
 可依前置詞清理）。`HandoffBuilder` 需要的則是**執行期參與者**：它會 clone 參與者、
 注入交接工具、掛上 middleware，因此要求參與者支援本地工具呼叫。
 
-兩者由同一份定義檔（`src/agents/`）產生，內容一致但物件不同（FR-061）。
+兩者由同一份定義檔（`src/agents/`）產生，內容一致但物件不同。
 `.env` 換一個專案端點，這裡就會連到另一個專案，不需要改任何程式碼。
 """
 
@@ -48,9 +48,9 @@ SPECIALIST_KEYS: tuple[str, ...] = ("coding", "architect", "spec")
 #: Workflow 名稱。與 Lab 3 的 hosted agent 名稱一致，方便對照兩者是同一套拓撲。
 WORKFLOW_NAME = "qvn-ipm-review"
 
-#: DevUI 上「workflow 類別」實體的顯示名稱（spec 002 的 FR-103）。
+#: DevUI 上「workflow 類別」實體的顯示名稱。
 #:
-#: MUST 與 `WORKFLOW_NAME` 不同：DevUI 的實體名稱直接取自物件的 `.name`，兩者同名時
+#: 必須與 `WORKFLOW_NAME` 不同：DevUI 的實體名稱直接取自物件的 `.name`，兩者同名時
 #: 清單上會出現兩個一模一樣的項目，學員無法分辨自己正在跟哪一個對話。
 #: `WORKFLOW_NAME` 本身**不能**改——它同時綁定 `deploy/agent.yaml` 的 `name` 與 azd 的
 #: 服務名稱，三者不一致會讓部署後的查詢與呼叫全部 404。
@@ -58,22 +58,22 @@ WORKFLOW_ENTITY_NAME = f"{WORKFLOW_NAME}-workflow"
 
 #: workflow 類別實體的入口節點 id。
 #:
-#: 這個節點只接受 `str`，作用是讓 DevUI 產生**單一文字輸入框**而不是 `Message` 的六欄表單。
+#: 這個範點只接受 `str`，作用是讓 DevUI 產生**單一文字輸入框**而不是 `Message` 的六欄表單。
 #: 詳細理由見 `_build_workflow_entity()` 的說明。
 WORKFLOW_ENTRY_EXECUTOR_ID = "user-input"
 
 #: 單一 agent 單次執行的逾時（秒）。
 #:
-#: FR-021 要求「MUST NOT 崩潰或**長時間無回應**」——後半句只靠 try/except 是達不到的：
+#: 降級機制要求「不崩潰、也不長時間無回應」——後半句只靠 try/except 是達不到的：
 #: 服務端沒回應時連線可以掛很久。因此逾時本身就是降級條件之一。
 AGENT_TIMEOUT_SECONDS = 180
 
 
 def _degraded_text(agent_name: str, reason: str, remediation: str) -> str:
-    """組出降級回覆的文字（FR-021）。
+    """組出降級回覆的文字。
 
     刻意寫成「講給使用者聽」而不是拋堆疊：學員在 DevUI 看到的應該是一段看得懂的說明，
-    而不是紅色的 traceback。同時 MUST 說清楚**哪一位**專家不可用——否則使用者會誤以為
+    而不是紅色的 traceback。同時必須說清楚**哪一位**專家不可用，否則使用者會誤以為
     整個系統壞了。
     """
     return (
@@ -87,7 +87,7 @@ def _degraded_text(agent_name: str, reason: str, remediation: str) -> str:
     )
 
 
-#: HTTP 狀態碼 → `(原因, 修復建議)`。涵蓋 FR-021 明列的三種情境。
+#: HTTP 狀態碼 → `(原因, 修復建議)`。涵蓋三種常見的不可用情境。
 _STATUS_REASONS: dict[int, tuple[str, str]] = {
     401: (
         "驗證失敗（HTTP 401）",
@@ -136,7 +136,7 @@ def _unwrap(error: BaseException) -> list[BaseException]:
 def _classify(error: BaseException) -> tuple[str, str]:
     """把例外歸類成 `(原因, 修復建議)`。
 
-    分類 MUST 以型別與 HTTP 狀態碼判斷，MUST NOT 比對錯誤訊息字串——訊息會隨服務端改版變動。
+    分類必須以型別與 HTTP 狀態碼判斷，不可比對錯誤訊息字串——訊息會隨服務端改版變動。
     """
     from azure.core.exceptions import ClientAuthenticationError, ResourceNotFoundError
 
@@ -182,14 +182,14 @@ def _degraded_update(agent_name: str, error: BaseException):
 
 
 def build_degraded_reply_middleware(agent_name: str):
-    """建立單一 agent 的降級 middleware（FR-021、data-model.md 1.4 節狀態轉移）。
+    """建立單一 agent 的降級 middleware。
 
     掛上之後，`handed_off(X)` 遇到 X 不可用時會走 `degraded_reply → idle`：
     工作流照常收束、發出 `request_info` 等使用者，而不是整條 workflow 拋例外中斷。
 
     **為什麼串流與非串流要分開處理**：`await call_next()` 在串流模式下**很快就返回**，
-    此時 `context.result` 只是一個尚未消費的 `ResponseStream`，真正的錯誤要等到迭代時才發生
-    ——那已經在 middleware 之外了。因此串流路徑 MUST 另外包一層，在迭代時攔截。
+    此時 `context.result` 只是一個尚未消費的 `ResponseStream`，真正的錯誤要等到疊代時才發生
+    ——那已經在 middleware 之外了。因此串流路徑必須另外包一層，在疊代時攬截。
     """
     from agent_framework import AgentResponse, ResponseStream, agent_middleware
 
@@ -217,7 +217,7 @@ def build_degraded_reply_middleware(agent_name: str):
 
         if context.stream and isinstance(context.result, ResponseStream):
             # `ResponseStream` 本身就是 AsyncIterable，直接迭代即可。
-            # MUST NOT 用 `.updates` —— 那是「已收集的更新」串列，不是可迭代來源。
+            # 不可用 `.updates`——那是「已收集的更新」串列，不是可疊代來源。
             inner = context.result
             context.result = ResponseStream(
                 _guard(inner), finalizer=AgentResponse.from_updates
@@ -227,15 +227,14 @@ def build_degraded_reply_middleware(agent_name: str):
 
 
 def build_participants(client, roles: dict[str, AgentRole]) -> dict[str, object]:
-    """依定義檔建構四個 Handoff 執行期參與者（FR-061）。
+    """依定義檔建構四個 Handoff 執行期參與者。
 
     `require_per_service_call_history_persistence=True` 是**必要**的：漏掉任何一個，
-    `HandoffBuilder.build()` 會直接以 `ValueError` 失敗，訊息會列出缺少設定的 agent
-    （research.md R04 的實測證據）。這個旗標讓本機保存的對話歷史，與服務端在交接工具呼叫
-    短路後的狀態保持一致。
+    `HandoffBuilder.build()` 會直接以 `ValueError` 失敗，訊息會列出缺少設定的 agent。
+    這個旗標讓本機保存的對話歷史，與服務端在交接工具呼叫短路後的狀態保持一致。
 
     `response_format` 一律取自定義檔（Primary 為 `None`，三位專家為 `SpecialistReview`）。
-    這裡 MUST NOT 另外指定，否則就多出一份會與定義檔分歧的設定。
+    這裡不可另外指定，否則就多出一份會與定義檔分歧的設定。
 
     來源 M04（microsoft/agent-framework 官方 handoff sample 與原始碼）：
     https://github.com/microsoft/agent-framework
@@ -263,22 +262,22 @@ def build_workflow(
     name: str = WORKFLOW_NAME,
     checkpoint_storage: "CheckpointStorage | None" = None,
 ):
-    """以 `HandoffBuilder` 建立單層星狀拓撲（FR-012、FR-016、FR-017）。
+    """以 `HandoffBuilder` 建立單層星狀拓撲。
 
     Args:
         participants: `build_participants()` 產生的四個執行期參與者。
         name: workflow 名稱。DevUI 的實體顯示名稱直接取自它，因此同一個行程要註冊兩個實體時
-            MUST 各自給不同的名稱（spec 002 的 FR-103）。
+            必須各自給不同的名稱。
         checkpoint_storage: 建構期的 checkpoint 儲存體。給值才會**真的產生** checkpoint。
 
-    **checkpoint 為什麼一定要在建構期給**（spec 002 research.md R04 實測）：
+    **checkpoint 為什麼一定要在建構期給**（2026-07-28 實測）：
     DevUI 執行 workflow 類別實體時，會替每一段對話配一份 storage 並在 `run()` 時當成
     runtime override 傳入。但只有 runtime override 是**不夠**的——實測第一輪跑完後
     checkpoint 數為 `0`；建構期啟用後才變成 `4`。而 DevUI 的續接分支沒有 checkpoint 就
     直接回錯誤字串，所以漏掉這個參數的症狀不是「慢」，是「一送出就報錯」。
 
-    `add_handoff` MUST 明確呼叫。省略的話每位參與者的可交接目標會變成**全連通（mesh）**，
-    專家之間互相可達，FR-016 的結構性保證就沒了。2026-07-27 實測對照：
+    `add_handoff` 必須明確呼叫。省略的話，每位參與者的可交接目標會變成**全連通（mesh）**，
+    專家之間互相可達，「禁止平行分派」的結構性保證就沒了。2026-07-27 實測對照：
 
         # 有明確 add_handoff
         qvn-coding-agent -> {'qvn-primary-agent'}
@@ -287,8 +286,9 @@ def build_workflow(
 
     **限制落在哪裡**：在 `HandoffAgentExecutor._handoff_targets`——它決定框架替該 agent
     注入哪幾個交接工具。`workflow.edge_groups` 則**無論如何都是全連通**，那只是訊息傳遞的
-    底層線路，不代表可交接的對象。驗證拓撲 MUST 看 `_handoff_targets`，看 `edge_groups`
+    底層線路，不代表可交接的對象。驗證拓撲要看 `_handoff_targets`，看 `edge_groups`
     會得到「怎麼都是 mesh」的錯誤結論。
+
     來源 M03（Microsoft Agent Framework Workflows，協調模式的概念文件）：
     https://learn.microsoft.com/en-us/agent-framework/workflows/
     —— 說明 handoff 與 sequential、concurrent、magentic 的差別；本專案只實作 handoff。
@@ -302,11 +302,11 @@ def build_workflow(
         HandoffBuilder(name=name)
         .participants([primary, *specialists])
         .with_start_agent(primary)
-        # Primary → 三位專家（FR-013）
+        # Primary → 三位專家
         .add_handoff(primary, specialists)
     )
-    # 每位專家只有一條出邊：交回 Primary（FR-017）。
-    # 專家之間不建邊，「同時分派給多位專家」因此在圖上不可能發生（FR-016）。
+    # 每位專家只有一條出邊：交回 Primary。
+    # 專家之間不建邊，「同時分派給多位專家」因此在圖上不可能發生。
     for specialist in specialists:
         builder = builder.add_handoff(specialist, [primary])
     if checkpoint_storage is not None:
@@ -331,7 +331,7 @@ def create_workflow(endpoint: str, model_deployment_name: str, credential):
     Args:
         endpoint: Foundry 專案端點。
         model_deployment_name: 模型部署名稱。
-        credential: 開發者憑證（FR-005；MUST NOT 使用 API key）。
+        credential: 開發者憑證；不可使用 API key。
     """
     client = _create_client(endpoint, model_deployment_name, credential)
     return build_workflow(build_participants(client, build_agent_roles()))
@@ -392,7 +392,7 @@ def _build_workflow_entity(
 
 
 def create_devui_entities(endpoint: str, model_deployment_name: str, credential):
-    """建立 DevUI 要註冊的兩個實體（spec 002 的 FR-101、FR-102、FR-106）。
+    """建立 DevUI 要註冊的兩個實體。
 
     Returns:
         `(agent_entity, workflow_entity)`——前者是「整套工作流包成單一 agent」，
@@ -400,7 +400,7 @@ def create_devui_entities(endpoint: str, model_deployment_name: str, credential)
         DevUI 以 duck typing 判定類別（有 `get_executors_list` 或 `executors` 就算 workflow），
         所以不需要任何額外參數。
 
-    **為什麼要建兩份，而不是同一份註冊兩次**（research.md R03 實測）：
+    **為什麼要建兩份，而不是同一份註冊兩次**（2026-07-28 實測）：
     `Workflow.run()` 有同步的併發防護，同一個實例正在跑時再跑一次會直接拋出
 
         WorkflowException: Workflow is already running; concurrent runs are not allowed
@@ -410,8 +410,8 @@ def create_devui_entities(endpoint: str, model_deployment_name: str, credential)
     `Workflow.clone()` 也不行——它的實作是 `copy.deepcopy()`，會連同聊天用戶端與憑證
     一起深拷貝；用同一份定義檔重新 build 一次反而更便宜（不發任何網路請求）也更好懂。
 
-    兩個實體共用同一份 `src/agents/` 定義檔（FR-102、延續 spec 001 的 FR-061），
-    因此四位 agent 的職責、instructions 與結構化輸出完全一致。
+    兩個實體共用同一份 `src/agents/` 定義檔，因此四位 agent 的職責、instructions 與
+    結構化輸出完全一致。
     """
     from agent_framework import InMemoryCheckpointStorage
 
@@ -426,7 +426,7 @@ def create_devui_entities(endpoint: str, model_deployment_name: str, credential)
         roles,
         name=WORKFLOW_ENTITY_NAME,
         # 只有 workflow 類別實體需要 checkpoint；agent 類別實體的執行路徑用不到，
-        # 不動它才能讓「既有行為不變」（FR-107）保持成立。
+        # 不動它才能讓既有行為保持不變。
         checkpoint_storage=InMemoryCheckpointStorage(),
     )
     return agent_entity, workflow_entity

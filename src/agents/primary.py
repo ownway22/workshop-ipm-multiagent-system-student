@@ -1,7 +1,7 @@
 """協調者（Primary Agent）的角色定義。
 
-此 agent 於 **Lab 2** 由學員執行交付包提供的建立腳本以程式碼建立。
-依 FR-012，orchestrator MUST 在程式碼中定義，MUST NOT 沿用 portal 手動建立的 agent。
+此 agent 在 **Lab 2** 由學員執行建立腳本、以程式碼建立。
+orchestrator 必須在程式碼中定義，不沿用 portal 手動建立的 agent。
 """
 
 from models.agent_role import AgentRole, compose_agent_name
@@ -65,23 +65,23 @@ INSTRUCTIONS = """\
 def build_role(prefix: str) -> AgentRole:
     """依前置詞組出完整的角色定義。
 
-    **Primary 刻意不指定 `response_format`**（2026-07-27 spike S3／T037 實測後定案）。
+    **Primary 刻意不指定 `response_format`**（2026-07-27 實測後定案）。
 
     原本的設計是讓 Primary 以 `PrimarySummary` 結構化輸出彙整結果。實測對照顯示，只要
     指定 `response_format`，**每一句**回覆都會被套進彙整的形狀，造成兩類問題：
 
-    1. FR-014 的釐清提問與 FR-015 的能力範圍說明被擠進 `open_questions` 與
-       `consolidated_findings`，失去對話感。
-    2. 更嚴重：模型會**捏造** `handled_by` 與 `source_agent`。實測 T09（完全沒有發生任何
-       交接）仍回傳 `handled_by: ["qvn-spec-agent"]`，直接違反 FR-020 的
-       「MUST NOT 補寫專家未提供的分析內容」。
+    1. 釐清提問與能力範圍說明被擠進 `open_questions` 與 `consolidated_findings`，
+       失去對話感。
+    2. 更嚴重的是，模型會**捏造** `handled_by` 與 `source_agent`。實測 T09（完全沒有
+       發生任何交接）仍回傳 `handled_by: ["qvn-spec-agent"]`，直接違反「不可補寫專家
+       未提供的分析內容」這條規則。
 
-    移除後三種行為都正確，且跨領域題的彙整仍逐項標示來源 agent（FR-020 由 instructions
-    的硬性規則達成，不依賴 schema）。FR-018 的結構化欄位只約束**專家 agent**，
-    因此本決定不牴觸規格。
+    移除後三種行為都正確，且跨領域題的彙整仍逐項標示來源 agent——這是由 instructions
+    的硬性規則達成，不依賴 schema。結構化輸出的要求只約束**專家 agent**，
+    因此這個決定不抵觸規格。
 
     `PrimarySummary` 仍保留為**彙整內容的文件契約**：它定義彙整該有哪些欄位，
-    供 instructions 對照與 T048a 比對四個檢查點時使用，但不作為 `response_format`。
+    供 instructions 對照、以及比對四個檢查點時當檢核清單，但不作為 `response_format`。
     """
     return AgentRole(
         key=KEY,

@@ -1,6 +1,6 @@
 # Lab 1 完成版：`qvn-coding-agent` 的設定
 
-本檔由 [src/agents/coding.py](../src/agents/coding.py) 產生，內容與程式碼**逐字一致**。
+本檔內容取自 [src/agents/coding.py](../src/agents/coding.py)，與程式碼**逐字一致**。
 若兩者不同，以 `src/agents/coding.py` 為準（它是唯一事實來源）。
 
 用途：Lab 1 卡住時直接複製下列內容貼進 portal，不必逐字重打。
@@ -32,7 +32,7 @@ Python 程式碼健檢：分析使用者貼上的 Python 程式碼或程式碼�
 
 貼進 portal 的 **Instructions** 欄位：
 
-````text
+```text
 你是 IPM 專案交付包健檢團隊的**程式碼健檢專家**。
 
 ## 你的職責
@@ -67,8 +67,7 @@ Python 程式碼健檢：分析使用者貼上的 Python 程式碼或程式碼�
 
 你的輸出會被彙整進交付包健檢報告。一項無法追溯來源的「發現」比沒有發現更糟，
 因為它會讓整份報告失去可信度。
-
-````
+```
 
 ---
 
@@ -90,4 +89,4 @@ uv run python -c "import json; from models.specialist_review import build_portal
 ## 驗收
 
 貼完後送出一段有問題的程式碼，回覆應該是含七個欄位的 JSON，
-且 `category` 為 `code`。詳見 [Lab 1 驗收標準](../docs/01-lab1-single-agent.md#驗收標準檢查點-1)。
+且 `category` 為 `code`。詳見 [Lab 1 驗收](../docs/01-lab1-single-agent.md#驗收)。

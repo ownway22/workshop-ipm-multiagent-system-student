@@ -1,15 +1,15 @@
 """Primary Agent 的整合輸出資料契約。
 
 僅在複合需求（`cross_domain`）完成逐次交接後產生。Primary 只負責彙整與標示來源，
-MUST NOT 補寫專家未提供的分析內容，也 MUST NOT 自行調整嚴重度（FR-020）。
+不可補寫專家未提供的分析內容，也不可自行調整嚴重度。
 
-⚠️ **本型別不作為 `response_format`**（2026-07-27 spike S3／T037 實測後改定）。
+⚠️ **本型別不作為 `response_format`**（2026-07-27 實測後改定）。
 實測發現對 Primary 指定 `response_format` 會讓**每一句**回覆都被套進彙整形狀，
-壓掉 FR-014 的釐清提問與 FR-015 的能力範圍說明，且模型會**捏造** `handled_by`。
+壓掉釐清提問與能力範圍說明，且模型會**捏造** `handled_by`。
 詳見 `src/agents/primary.py` 的 `build_role` docstring。
 
 保留本型別的用途是**彙整內容的文件契約**：它定義彙整該有哪些欄位與各欄的
-硬性規則，供 `INSTRUCTIONS` 對照、以及 T048a 比對四個檢查點的彙整品質時當檢核清單。
+硬性規則，供 `INSTRUCTIONS` 對照，以及比對四個檢查點的彙整品質時當檢核清單。
 """
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -24,17 +24,17 @@ class AttributedFinding(BaseModel):
 
     source_agent: str = Field(
         min_length=1,
-        description="產出此發現的專家 agent 名稱；MUST 出現在 PrimarySummary.handled_by 之中",
+        description="產出此發現的專家 agent 名稱；必須出現在 PrimarySummary.handled_by 之中",
     )
     finding: str = Field(
         min_length=1,
         description=(
-            "繁體中文的發現內容；MUST 逐字或語意等價地取自該專家的 findings，"
-            "MUST NOT 補寫專家未提供的內容"
+            "繁體中文的發現內容；必須逐字或語意等價地取自該專家的 findings，"
+            "不可補寫專家未提供的內容"
         ),
     )
     severity: Severity = Field(
-        description="MUST 與來源專家給的值相同，Primary MUST NOT 自行調整",
+        description="必須與來源專家給的值相同，Primary 不可自行調整",
     )
 
     @field_validator("source_agent", "finding")
@@ -56,7 +56,7 @@ class PrimarySummary(BaseModel):
     )
     consolidated_findings: list[AttributedFinding] = Field(
         min_length=1,
-        description="彙整後的發現；每一項 MUST 標示來源 agent",
+        description="彙整後的發現；每一項必須標示來源 agent",
     )
     open_questions: list[str] = Field(
         default_factory=list,
@@ -75,7 +75,7 @@ class PrimarySummary(BaseModel):
     def _source_agent_must_be_in_handled_by(self) -> "PrimarySummary":
         """確保每項發現的來源都真的參與過本次對話。
 
-        這是 FR-020「MUST NOT 補寫專家未提供的內容」在結構層的第一道防線：
+        這是「不可補寫專家未提供的內容」在結構層的第一道防線：
         若 Primary 憑空捏造一個沒接手過的 agent 當來源，這裡會直接失敗。
         """
         participants = set(self.handled_by)

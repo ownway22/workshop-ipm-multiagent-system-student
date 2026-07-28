@@ -1,6 +1,6 @@
 """規格健檢專家（Spec Agent）的角色定義。
 
-此 agent 於 **Lab 2** 由學員執行交付包提供的建立腳本以程式碼建立（FR-054）。
+此 agent 在 **Lab 2** 由學員執行建立腳本、以程式碼建立。
 """
 
 from models.agent_role import AgentRole, compose_agent_name
@@ -8,7 +8,7 @@ from models.specialist_review import SpecialistReview
 
 KEY = "spec"
 
-# 以「輸入材料的型態」區分職責，且把具區別力的名詞放在句首（FR-013）。
+# 以「輸入材料的型態」區分職責，並把具區別力的名詞放在句首。
 DESCRIPTION = (
     "規格文件健檢：審閱使用者附上的規格文件或交付清單節錄，找出需求描述與交付範圍的缺口。"
 )

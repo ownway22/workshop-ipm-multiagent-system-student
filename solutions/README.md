@@ -79,8 +79,8 @@ deploy/infra/         最小基礎設施（ACR 與授權）
 
 **完全相同的內容。** 它們是同一份程式碼的副本，方便你一行指令救回來。
 
-`solutions/lab1_prompt.md` 更嚴格：它由 `src/agents/coding.py` 產生，
-內容逐字一致。若兩者出現差異，以 `src/agents/coding.py` 為準。
+`solutions/lab1_prompt.md` 更嚴格：它的內容取自 `src/agents/coding.py`，
+逐字一致。若兩者出現差異，以 `src/agents/coding.py` 為準。
 
 ---
 

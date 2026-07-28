@@ -1,13 +1,13 @@
 # IPM 多代理 Workshop 的 Python 專案定義。
 #
-# 版本政策（憲章原則 II、FR-011）：
-#   每個相依都 MUST 釘死精確版本，MUST NOT 使用版本範圍，MUST NOT 追 main 分支。
-#   下列九個版本取自 2026-07-27 的 PyPI 實查與執行期反射（research.md 決策 R01），
-#   非記憶推測。升級任一 agent-framework 套件 MUST 重跑 Lab 2 → Lab 3 → Lab 4 全鏈路。
+# 版本政策：
+#   每個相依都釘死精確版本，不使用版本範圍，也不追 main 分支。
+#   下列九個版本取自 2026-07-27 的 PyPI 實查與執行期反射，非記憶推測。
+#   升級任一 agent-framework 套件後，需重跑 Lab 2 → Lab 3 → Lab 4 全鏈路。
 [project]
 name = "ipm-multiagent-workshop"
 version = "0.1.0"
-description = "IPM 專案交付包健檢：Microsoft Agent Framework 多代理 workshop 交付包"
+description = "IPM 專案交付包健檢：Microsoft Agent Framework 多代理 workshop"
 readme = "../README.md"
 requires-python = ">=3.13"
 
@@ -22,22 +22,22 @@ dependencies = [
     "python-dotenv==1.2.2",                   # load_dotenv()
 
     # ── prerelease：教學鏈路第二、三站目前只有 prerelease 實作 ──
-    # 兩者的成熟度 MUST 誠實揭露於 README 的「版本」一節（FR-046、research.md R10）。
+    # 兩者的成熟度需誠實揭露於 README 的「版本」一節。
     "agent-framework-devui==1.0.0b260721",           # Lab 2 本機 DevUI
     "agent-framework-foundry-hosting==1.0.0b260722", # Lab 3 Responses 主機
 ]
 
-# 交付包不需被安裝成套件，只需可執行。
+# 本專案不需被安裝成套件，只需可執行。
 [tool.uv]
 package = false
 
 [dependency-groups]
 # 單元測試只覆蓋資料契約、角色註冊表、題組與 preflight 的純函式；
-# agent 路由行為一律以 12 題題組重跑驗證，不模擬模型（plan.md Testing 決策）。
+# agent 路由行為一律以 12 題題組重跑驗證，不模擬模型。
 dev = ["pytest==9.1.1"]
 
 [tool.pytest.ini_options]
-# 測試放在 repository 根目錄的 tests/，不納入公開交付 repository（FR-059）。
+# 測試放在 repository 根目錄的 tests/，不納入公開交付的 repository。
 # 執行方式：cd src && uv run pytest
 testpaths = ["../tests/unit"]
 pythonpath = ["."]

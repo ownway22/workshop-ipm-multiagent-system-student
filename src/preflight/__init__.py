@@ -1,13 +1,11 @@
 """環境前置檢查的共用型別與工具。
 
-契約：[contracts/preflight-contract.md](../../specs/001-ipm-workshop-delivery/contracts/preflight-contract.md)
-
-設計要點（FR-006、FR-008）：
+設計要點：
 
 - 每一項檢查都回傳獨立的 `CheckResult`，**不早退**——某項失敗時仍繼續檢查其餘項目，
   一次呈現完整狀況。
-- 失敗項 MUST 附「可直接複製執行」的修復指令或編號步驟。
-- 現場無法修復的項目（區域、租戶、權限）MUST 明確標示，讓學員盡早改走觀摩路徑。
+- 失敗項必須附「可直接複製執行」的修復指令或編號步驟。
+- 現場無法修復的項目（區域、租用戶、權限）必須明確標示，讓學員盡早改走觀摩路徑。
 """
 
 import json
@@ -19,7 +17,7 @@ from dataclasses import dataclass, field
 #: 查證日期 **2026-07-27**，來源：
 #: https://learn.microsoft.com/en-us/azure/foundry/agents/concepts/hosted-agents#region-availability
 #: 官方註明「This list will be updated as additional regions become available.」，
-#: 因此本清單 MUST 定期重查；**East Asia 不在清單內**，這是台灣場次最常見的踩點。
+#: 因此本清單需定期重查；**East Asia 不在清單內**，這是台灣場次最常見的踩點。
 ALLOWED_REGIONS: dict[str, str] = {
     "australiaeast": "Australia East",
     "brazilsouth": "Brazil South",
@@ -57,15 +55,15 @@ ALLOWED_REGIONS: dict[str, str] = {
 #: 台灣場次的**建議**區域（延遲最低）。不在這兩個區域不算失敗，只是互動時延遲較高。
 RECOMMENDED_REGIONS: tuple[str, ...] = ("southeastasia", "japaneast")
 
-#: 需為 `Registered` 的資源提供者（憲章「平台硬性限制」）。
+#: 需為 `Registered` 的資源提供者。
 REQUIRED_PROVIDERS: tuple[str, ...] = (
     "Microsoft.CognitiveServices",
     "Microsoft.BotService",
 )
 
-#: 角色定義 ID。MUST 以 GUID 而非顯示名稱查詢：Foundry 的 RBAC 角色近期由
-#: `Azure AI *` 更名為 `Foundry *`，更名推行期間兩種名稱可能同時出現，但角色 ID 不變。
-#: 查證來源與完整說明見 contracts/preflight-contract.md 第 9 節（T016a，2026-07-27）。
+#: 角色定義 ID。必須以 GUID 而非顯示名稱查詢：Foundry 的 RBAC 角色近期由
+#: `Azure AI *` 更名為 `Foundry *`，更名推行期間兩種名稱可能同時出現，但角色 ID 不變
+#: （2026-07-27 查證）。
 ROLE_FOUNDRY_PROJECT_MANAGER = ("Foundry Project Manager", "eadc314b-1a2d-4efa-be10-5d325db5065e")
 ROLE_BOT_SERVICE_CONTRIBUTOR = (
     "Azure Bot Service Contributor Role",

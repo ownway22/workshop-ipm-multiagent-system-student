@@ -1,16 +1,16 @@
 """四個 agent 角色的註冊表。
 
-依 FR-061，本模組是 instructions 與 description 的**單一事實來源**，同時供兩條路徑使用：
+本模組是 instructions 與 description 的**單一事實來源**，同時供兩條路徑使用：
 
-- `src/registry/`：建立 Foundry 專案中的**持久化 agent**（portal 可見性、清理辨識）
+- `src/registry/`：建立 Foundry 專案中的**持久化 agent**（portal 可見、方便清理辨識）
 - `src/workflows/`：建構 **Handoff 執行期參與者**
 
-MUST NOT 在其他地方維護第二份會分歧的 instructions。
+不可在其他地方維護第二份會分歧的 instructions。
 
-命名（FR-055）：四個 agent 共用同一組固定前置詞（預設 `qvn-`），MUST NOT 每次執行隨機產生。
-完整名稱形式為 `<前置詞><key>-agent`（例如 `qvn-coding-agent`），組成邏輯集中於
-`models.agent_role.compose_agent_name()`。前置詞刻意選用無語意組合，降低與學員既有 agent
-撞名而在清理時誤刪的風險。
+命名規則：四個 agent 共用同一組固定前置詞（預設 `qvn-`），不每次執行隨機產生。
+完整名稱形式為 `<前置詞><key>-agent`，例如 `qvn-coding-agent`；組名邏輯集中在
+`models.agent_role.compose_agent_name()`。前置詞刻意選用無語意的字母組合，
+降低與學員既有 agent 撞名、清理時誤刪的風險。
 """
 
 import os

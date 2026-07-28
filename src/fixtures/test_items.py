@@ -1,6 +1,6 @@
 """12 題代表性測試題組。
 
-四個檢查點**共用**同一組題目（FR-036、FR-038），這樣「本機能跑通」與「Teams 也一致」
+四個檢查點**共用**同一組題目，這樣「本機能跑通」與「Teams 也一致」
 才是可比對的結論，而不是各自用不同題目各說各話。
 
 題目分布：六種意圖類型各 2 題，共 12 題。
@@ -89,7 +89,7 @@ TEST_ITEMS: tuple[TestItem, ...] = (
         ),
         expected_outcome=ExpectedOutcome.HANDOFF_ARCHITECT,
         # 檢查點 1 只有 Coding Agent，本題在該檢查點的用途是確認它會回覆「超出自身職責」
-        # 而不是硬答（FR-028、data-model.md 第 3.1 節）。
+        # 而不是硬答。
         checkpoint_scope=_ALL_CHECKPOINTS,
         material_refs=("azure_snapshot_01.md",),
     ),
@@ -193,7 +193,7 @@ def items_for_checkpoint(checkpoint: int) -> tuple[TestItem, ...]:
     """取得指定檢查點適用的題目。
 
     檢查點 1（portal playground）此時只有 Coding Agent，因此僅涵蓋 `code_review` 兩題
-    與用來確認職責邊界的非程式碼題（FR-038）。
+    與用來確認職責邊界的非程式碼題。
     """
     return tuple(item for item in TEST_ITEMS if checkpoint in item.checkpoint_scope)
 
@@ -215,8 +215,8 @@ def render_prompt(item: TestItem) -> str:
     """把題目中的「請貼上 …」指示換成材料的實際內容。
 
     `TestItem.prompt` 保留給**人手操作**的檢查點（1、3、4 要學員自己貼材料）；
-    自動化執行的檢查點 2 則需要完整內容。兩者 MUST 出自同一個 `TestItem`，
-    否則四個檢查點就不是在比同一件事（FR-036、FR-038）。
+    自動化執行的檢查點 2 則需要完整內容。兩者必須出自同一個 `TestItem`，
+    否則四個檢查點就不是在比同一件事。
     """
     head = _PASTE_INSTRUCTION.sub("", item.prompt).rstrip()
     if not item.material_refs:

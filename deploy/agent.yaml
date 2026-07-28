@@ -20,7 +20,7 @@
 
 kind: hosted
 
-# ⚠️ 這個名稱 MUST 與 `azure.yaml` 的**服務名稱**逐字相同。
+# ⚠️ 這個名稱必須與 `azure.yaml` 的**服務名稱**逐字相同。
 # 兩者不同時部署本身會成功，但 azd 的 postdeploy hook 以**服務名稱**去查 agent，
 # 得到「Agent <名稱> with version N not found」的 404。
 # `azd ai agent show` / `invoke` / `monitor` 同樣依服務名稱解析，也會一起失敗。
@@ -43,7 +43,7 @@ protocols:
   #   `agent.manifest.yaml` or `agent.yaml`, or downgrade the
   #   `agent-framework-foundry-hosting` package to `1.0.0a260625` or before to use 1.0.0.
   #
-  # 因此升級該套件版本時 MUST 一併確認此處的值。
+  # 因此升級該套件版本時必須一併確認此處的值。
   # AgentSchema 文件裡的 `v0.1.1` 只是格式範例，不是實際值。
   - protocol: responses
     version: "2.0.0"
@@ -53,7 +53,7 @@ resources:
   # 計費依所有 active session 累計，過度配置會被併發數倍乘。
   #
   # ⚠️ `azure.yaml` 的 `services.<name>.config.container.resources` 會**覆蓋**本區塊。
-  # 兩處 MUST 填一致的值，否則以 azure.yaml 為準、本檔被靜默忽略。
+  # 兩處必須填一致的值，否則以 azure.yaml 為準、本檔被靜默忽略。
   cpu: "0.5"
   memory: "1Gi"
 
