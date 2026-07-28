@@ -1,0 +1,53 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/main/schemas/v1.0/azure.yaml.json
+#
+# Lab 3：azd 專案定義
+#
+# ⚠️ **azd 會在每次 `azd deploy` 時重寫本檔並清掉所有註解**（實測，重複發生）。
+#    因此本檔的註解只是就近提示；若發現註解不見了，以版本控制中的本檔覆寫回來即可，
+#    設定值本身不受影響。
+#
+# ## 四個容易踩到的點
+#
+# 1. `host: azure.ai.agent` 取自 azd 官方 schema 的 host 列舉。
+# 2. **protocol 不在本檔**，宣告在同目錄的 `agent.yaml`（AgentSchema 的 ContainerAgent）。
+# 3. **服務名稱 MUST 等於 `agent.yaml` 的 `name`**。不同時部署會成功，但 postdeploy hook
+#    與 `azd ai agent show/invoke/monitor` 都以服務名稱查 agent，會得到 404。
+# 4. `infra.provider` **不能**設成 azd schema 的範例值 `microsoft.foundry`——那個 provider
+#    不是本擴充提供的（`extension.yaml` 只註冊 service-target）。留空即用預設的 bicep。
+
+requiredVersions:
+  extensions:
+    azure.ai.agents: ">=0.1.27-preview"
+
+name: qvn-ipm-review
+
+# 使用**既有**資源群組，不建新的。值由 azd 環境的 AZURE_RESOURCE_GROUP 提供。
+resourceGroup: ${AZURE_RESOURCE_GROUP}
+
+services:
+  # 服務名稱 = agent 名稱（見上方第 3 點）。
+  qvn-ipm-review:
+    project: .
+    host: azure.ai.agent
+    language: python
+    docker:
+      # path 與 context 都相對於 project。
+      # context 必須拉到 repository 根目錄，Dockerfile 才複製得到 `src/`。
+      path: ./Dockerfile
+      context: ..
+      # ⚠️ **不要**在 Dockerfile 的 FROM 加 `--platform=`：
+      # ACR Tasks 的相依掃描器看不懂該語法，遠端建置會直接失敗。平台單點指定在這裡即可。
+      platform: linux/amd64
+      # 在 Azure 上建置，不需要本機的 Docker daemon。
+      # 本機沒有 Docker 時 `azd provision` 會以
+      #   「ERROR: The container runtime (Docker/Podman) is not running.」失敗，
+      # 且 azd 自己建議的處置就是這個開關。Codespaces 內不保證有可用的 Docker daemon，
+      # 開著它可以少掉一整類現場故障。
+      remoteBuild: true
+    config:
+      container:
+        # ⚠️ 本區塊會**覆蓋** `agent.yaml` 的 `resources`，兩處 MUST 一致。
+        # azd 若自行補上此區塊，預設是 0.25 / 0.5Gi，需改回下列值。
+        resources:
+          cpu: "0.5"
+          memory: 1Gi

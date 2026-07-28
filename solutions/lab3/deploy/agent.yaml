@@ -1,0 +1,95 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/microsoft/AgentSchema/refs/heads/main/schemas/v1.0/ContainerAgent.yaml
+#
+# Lab 3：hosted agent 的 agent manifest
+#
+# ## 權威來源
+#
+# 欄位取自 Microsoft 官方的 AgentSchema：
+#   https://github.com/microsoft/AgentSchema
+#   schemas/v1.0/ContainerAgent.yaml、ContainerResources.yaml、ProtocolVersionRecord.yaml
+#
+# ## ⚠️ 兩處 schema 與實作不一致（2026-07-28 實測）
+#
+# 1. **欄位名稱是 `environment_variables`（snake_case），不是 schema 寫的
+#    `environmentVariables`（camelCase）**。用 camelCase 時部署會「成功」，但環境變數
+#    **靜默地不進入** agent 定義，容器隨後因缺少必要環境變數而轉為 FAILED。
+# 2. **值必須是 `{name, value}` 的清單**，不是對映表。schema 兩種都允許，實作只吃清單。
+#
+# 這兩點在錯誤訊息裡完全看不出來，只能從讀回的 agent 定義中發現 `environment_variables`
+# 整個消失。
+
+kind: hosted
+
+# ⚠️ 這個名稱 MUST 與 `azure.yaml` 的**服務名稱**逐字相同。
+# 兩者不同時部署本身會成功，但 azd 的 postdeploy hook 以**服務名稱**去查 agent，
+# 得到「Agent <名稱> with version N not found」的 404。
+# `azd ai agent show` / `invoke` / `monitor` 同樣依服務名稱解析，也會一起失敗。
+name: qvn-ipm-review
+
+displayName: IPM 交付包健檢團隊
+description: >-
+  IPM 專案交付包健檢的多代理團隊：Primary 分析意圖並逐次交接給程式碼、架構或規格三位專家。
+
+protocols:
+  # ⚠️ **protocol 版本是由 `agent-framework-foundry-hosting` 套件版本決定的**，
+  # 不是一個固定常數，也**不能**從別的 agent 抄。
+  #
+  # 本專案釘定的 `agent-framework-foundry-hosting==1.0.0b260722` 需要 **2.0.0**。
+  # 值填錯時部署與映像拉取都會成功、`/readiness` 也回 200，直到真的送出請求才會在
+  # 容器日誌看到：
+  #
+  #   RuntimeError: The hosted environment is running on protocol 1.0.0, but the agent
+  #   requires protocol 2.0.0. Please upgrade your agent protocol to 2.0.0 in
+  #   `agent.manifest.yaml` or `agent.yaml`, or downgrade the
+  #   `agent-framework-foundry-hosting` package to `1.0.0a260625` or before to use 1.0.0.
+  #
+  # 因此升級該套件版本時 MUST 一併確認此處的值。
+  # AgentSchema 文件裡的 `v0.1.1` 只是格式範例，不是實際值。
+  - protocol: responses
+    version: "2.0.0"
+
+resources:
+  # 成本模型：hosted agent 依 **session** 擴展而非 replica，這裡的值描述的是單一 session，
+  # 計費依所有 active session 累計，過度配置會被併發數倍乘。
+  #
+  # ⚠️ `azure.yaml` 的 `services.<name>.config.container.resources` 會**覆蓋**本區塊。
+  # 兩處 MUST 填一致的值，否則以 azure.yaml 為準、本檔被靜默忽略。
+  cpu: "0.5"
+  memory: "1Gi"
+
+dockerfilePath: ./Dockerfile
+
+environment_variables:
+  # ⚠️ **`FOUNDRY_*` 與 `AGENT_*` 前綴是平台保留字**，在此宣告會讓部署以
+  #   「Environment variable 'FOUNDRY_…' is reserved for platform use.
+  #     All FOUNDRY_* and AGENT_* variables are reserved per container-image-spec.」
+  # 直接失敗。
+  #
+  # 好消息是平台**自動注入**下列四個變數到容器內，不需要也不能自己宣告：
+  #   FOUNDRY_PROJECT_ENDPOINT、FOUNDRY_PROJECT_ARM_ID、FOUNDRY_AGENT_NAME、FOUNDRY_AGENT_VERSION
+  #
+  # 因此 `FOUNDRY_PROJECT_ENDPOINT` 在本機由 `.env` 提供、在容器內由平台提供，
+  # `src/config.py` 兩邊都不必改。反之，模型部署名稱**不在**注入清單內，
+  # 所以它叫 `MODEL_DEPLOYMENT_NAME` 而不是 `FOUNDRY_MODEL_DEPLOYMENT_NAME`
+  # ——後者會撞上保留前綴。
+  #
+  # `${VAR}` 由 azd 於部署時以 azd 環境的值替換，因此本檔不含任何實際值。
+  - name: MODEL_DEPLOYMENT_NAME
+    value: "${MODEL_DEPLOYMENT_NAME}"
+
+  # ⚠️ **不記錄對話內容的執行點。**
+  #
+  # `azure-ai-agentserver-core` 的 `_base.py` 把這個變數的預設值當成 `"true"`：
+  #
+  #     _env_val = os.environ.get("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "true")
+  #     _sensitive_data = _env_val.lower() not in ("false", "0")
+  #     configure_observability(..., enable_sensitive_data=_sensitive_data)
+  #
+  # 也就是說託管環境**預設會把使用者訊息與 agent 回覆逐字送進 Application Insights**，
+  # 而且它是主動覆蓋 `agent_framework` 那邊預設為 `False` 的 `enable_sensitive_data`。
+  # 實測確認：關閉前在 AppTraces／AppDependencies 都搜得到貼上的程式碼原文。
+  #
+  # 本機（DevUI）走 agent_framework 的預設值，不受影響——這是**本機與託管的行為落差**，
+  # 只看本機不會發現。
+  - name: OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT
+    value: "false"

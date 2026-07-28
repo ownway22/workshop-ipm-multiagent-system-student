@@ -1,0 +1,44 @@
+# 容器建置上下文的排除清單。
+#
+# 建置上下文是 repository 根目錄（見 `deploy/azure.yaml` 的 `docker.context`），
+# 因此本檔放在根目錄。
+
+# ── 必須排除，否則映像會壞掉 ─────────────────
+# 開發機的虛擬環境是宿主機架構（例如 arm64），混進 linux/amd64 映像會直接無法執行。
+src/.venv/
+.venv/
+
+# ── 機密 ──────────────────────────────────
+# 環境設定一律由部署時注入（`deploy/agent.yaml` 的 `environment_variables`），MUST NOT 打包進映像。
+.env
+.env.*
+!.env.template
+
+# ── 與執行無關，只會拖慢建置 ──────────────────────────────
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.git/
+.github/
+.devcontainer/
+.vscode/
+.specify/
+docs/
+specs/
+references/
+tests/
+solutions/
+*.md
+!README.md
+
+# 注意：**不要**排除 `deploy/`。遠端建置（ACR Tasks）是把整個上下文打包上傳後，
+# 再依 `docker.path` 於**上下文內**尋找 Dockerfile；排掉它會讓建置找不到檔案。
+
+# ── spike 本身 ─────────────────────────────
+# 例外：S4 的進入點與拓樸建構邏輯必須進入映像（spike 的 Dockerfile 明確 COPY 它們）。
+# 交付版（`deploy/Dockerfile`）只複製 `src/`，不依賴這兩行例外。
+spike/*
+!spike/s3_handoff_topology.py
+!spike/s4_hosted_deploy/
+spike/s4_hosted_deploy/*
+!spike/s4_hosted_deploy/main.py

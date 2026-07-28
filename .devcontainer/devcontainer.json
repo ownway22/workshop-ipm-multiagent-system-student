@@ -1,0 +1,55 @@
+{
+  // IPM 多代理 Workshop 的唯一權威環境定義（FR-010、憲章原則 II）。
+  // 學員一律以 GitHub Codespaces 開啟本 repository，不使用宿主機工具鏈。
+  "name": "IPM Multi-Agent Workshop",
+
+  // Python 3.13 為憲章下限。宿主機常見的 3.12 無法滿足，因此由映像自帶（research.md R12）。
+  "image": "mcr.microsoft.com/devcontainers/python:1-3.13-bookworm",
+
+  "features": {
+    // 本機執行一律使用開發者憑證（AzureCliCredential），不使用 API key（FR-005）。
+    "ghcr.io/devcontainers/features/azure-cli:1": {
+      "version": "latest"
+    },
+    // Lab 3 以 azd 部署 hosted agent。憲章要求 azd >= 1.25.3，且需具備 azd ai agent 指令。
+    // 實際子指令表面 MUST 由 tasks.md T038a 於本 devcontainer 內以 `azd ai agent --help` 重驗
+    // （research.md R08 是在低於下限的 azd 1.24.1 取得）。
+    "ghcr.io/azure/azure-dev/azd:0": {
+      "version": "latest"
+    }
+  },
+
+  // uv 由 Astral 官方安裝腳本取得並釘住版本，避免相依於社群 feature 的更新節奏。
+  // 來源：https://docs.astral.sh/uv/getting-started/installation/
+  "onCreateCommand": "curl -LsSf https://astral.sh/uv/0.9.25/install.sh | sh",
+
+  // 先確認工具版本符合憲章下限，再依 src/pyproject.toml 的釘定版本解析虛擬環境。
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+  "remoteEnv": {
+    "PATH": "${containerEnv:HOME}/.local/bin:${containerEnv:PATH}"
+  },
+
+  // DevUI 的連接埠。實際值由 src/.env.template 的 DEVUI_PORT 決定，程式碼一律明確傳入，
+  // MUST NOT 依賴套件預設（research.md R09）。
+  "forwardPorts": [8080],
+  "portsAttributes": {
+    "8080": {
+      "label": "Agent Framework DevUI",
+      "onAutoForward": "notify"
+    }
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-azuretools.vscode-azureresourcegroups"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "${workspaceFolder}/src/.venv/bin/python"
+      }
+    }
+  }
+}

@@ -1,0 +1,26 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+indent_style = space
+indent_size = 2
+trim_trailing_whitespace = true
+
+[*.py]
+indent_size = 4
+
+[*.{go,mod,sum}]
+indent_style = tab
+indent_size = 4
+
+# CSV 交付給學員以 Excel 開啟。缺少 BOM 時 Excel 會退回系統預設編碼解讀，中文變亂碼。
+[*.csv]
+charset = utf-8-bom
+
+[Makefile]
+indent_style = tab
+
+[*.md]
+trim_trailing_whitespace = false

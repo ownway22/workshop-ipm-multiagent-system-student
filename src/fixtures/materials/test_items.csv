@@ -1,0 +1,610 @@
+﻿題號,意圖類型,預期路由（檢查點 2–4）,適用檢查點,備註,提示（可直接複製貼上）
+T01,程式碼健檢,primary → coding → primary,1、2、3、4,檢查點 1 直接對 qvn-coding-agent 送，無交接,"以下是我們訂單匯出工具的程式碼，請幫我做程式碼健檢，指出品質問題。
+
+python_snippet_01.py：
+
+````
+""""""虛構教學材料：訂單匯出批次工具（片段一）。
+
+⚠️ 這是 workshop 的**虛構**分析材料，刻意保留可被發現的品質問題，MUST NOT 當成範例程式碼
+   模仿。所有名稱、路徑與識別碼皆為虛構，不對應任何真實系統。
+
+用途：Lab 1 至 Lab 4 的檢查點中，貼給程式碼健檢專家分析。
+""""""
+
+import csv
+import json
+import os
+
+
+def load_config(path):
+    f = open(path)
+    return json.load(f)
+
+
+def fetch_orders(conn, customer_id, start_date, end_date):
+    cursor = conn.cursor()
+    query = (
+        ""SELECT order_id, customer_id, amount, created_at FROM orders ""
+        ""WHERE customer_id = '"" + customer_id + ""' ""
+        ""AND created_at BETWEEN '"" + start_date + ""' AND '"" + end_date + ""'""
+    )
+    cursor.execute(query)
+    return cursor.fetchall()
+
+
+def export_orders(conn, customer_id, start_date, end_date, out_dir):
+    rows = fetch_orders(conn, customer_id, start_date, end_date)
+
+    total = 0
+    for r in rows:
+        total = total + r[2]
+
+    out_path = os.path.join(out_dir, customer_id + "".csv"")
+    w = csv.writer(open(out_path, ""w""))
+    w.writerow([""order_id"", ""customer_id"", ""amount"", ""created_at""])
+    for r in rows:
+        w.writerow(r)
+
+    print(""exported "" + str(len(rows)) + "" orders, total="" + str(total))
+    return out_path
+
+
+def run(config_path):
+    cfg = load_config(config_path)
+    conn = connect(cfg[""dsn""])
+    for c in cfg[""customers""]:
+        try:
+            export_orders(conn, c, cfg[""start""], cfg[""end""], cfg[""out_dir""])
+        except Exception:
+            pass
+
+
+def connect(dsn):
+    import sqlite3
+
+    return sqlite3.connect(dsn)
+
+
+if __name__ == ""__main__"":
+    run(os.environ.get(""EXPORT_CONFIG"", ""config.json""))
+````"
+T02,程式碼健檢,primary → coding → primary,1、2、3、4,檢查點 1 直接對 qvn-coding-agent 送，無交接,"這段庫存同步的 Python 程式碼有沒有需要改進的地方？
+
+python_snippet_02.py：
+
+````
+""""""虛構教學材料：庫存同步服務（片段二）。
+
+⚠️ 這是 workshop 的**虛構**分析材料，刻意保留可被發現的品質問題，MUST NOT 當成範例程式碼
+   模仿。所有名稱、端點與識別碼皆為虛構，不對應任何真實系統。
+
+用途：Lab 1 至 Lab 4 的檢查點中，貼給程式碼健檢專家分析。
+""""""
+
+import threading
+import time
+
+import requests
+
+CACHE = {}
+API_BASE = ""http://inventory-internal.example.invalid/api""
+RETRY = 5
+
+
+class InventorySync:
+    def __init__(self, warehouse_id, token):
+        self.warehouse_id = warehouse_id
+        self.token = token
+        self.session = requests.Session()
+
+    def get_stock(self, sku):
+        if sku in CACHE:
+            return CACHE[sku]
+
+        for i in range(RETRY):
+            r = self.session.get(
+                API_BASE + ""/stock/"" + sku,
+                headers={""Authorization"": ""Bearer "" + self.token},
+                verify=False,
+            )
+            if r.status_code == 200:
+                CACHE[sku] = r.json()[""quantity""]
+                return CACHE[sku]
+            time.sleep(1)
+
+        return 0
+
+    def sync_all(self, skus):
+        threads = []
+        for sku in skus:
+            t = threading.Thread(target=self.get_stock, args=(sku,))
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+        return CACHE
+
+    def push_adjustment(self, sku, delta):
+        payload = {""sku"": sku, ""delta"": delta, ""warehouse"": self.warehouse_id}
+        r = self.session.post(API_BASE + ""/adjustments"", json=payload, verify=False)
+        print(""adjustment response:"", r.status_code, r.text)
+        return r.status_code == 200
+````"
+T03,架構健檢,primary → architect → primary,1、2、3、4,檢查點 1 的用途是確認 qvn-coding-agent 會回覆「超出自身職責」而不是硬答,"這是我們訂單平台的 Azure 資源快照，請幫我看架構上的風險。
+
+azure_snapshot_01.md：
+
+````
+# 虛構材料：訂單平台架構快照（快照一）
+
+> ⚠️ 這是 workshop 的**虛構**分析材料。所有訂閱、資源群組、資源名稱與識別碼皆為虛構，
+> 不對應任何真實環境。用途是貼給架構健檢專家分析。
+
+## 基本資訊
+
+| 項目       | 值                               |
+| ---------- | -------------------------------- |
+| 環境       | Production                       |
+| 訂閱       | `sub-orderplat-prod`（虛構代號） |
+| 資源群組   | `rg-orderplat-prod`              |
+| 主要區域   | East Asia                        |
+| 次要區域   | 無                               |
+| 快照取得日 | 第 1 天（虛構情境的相對日期）    |
+
+## 資源清單
+
+| 資源名稱           | 型別                  | SKU / 層級       | 備註                           |
+| ------------------ | --------------------- | ---------------- | ------------------------------ |
+| `app-order-api`    | App Service           | S1（1 執行個體） | 對外 API，公開端點             |
+| `plan-orderplat`   | App Service Plan      | S1               | 與背景工作共用同一個 plan      |
+| `app-order-worker` | App Service           | 同上 plan        | 背景批次，與 API 共用運算資源  |
+| `sql-orderplat`    | Azure SQL Database    | S2，單一資料庫   | 未設定異地複寫                 |
+| `st-orderexports`  | Storage Account       | Standard_LRS     | 存放匯出的 CSV，容器為公開讀取 |
+| `kv-orderplat`     | Key Vault             | Standard         | 存放連線字串                   |
+| `redis-ordercache` | Azure Cache for Redis | Basic C0         | 單節點                         |
+| `appi-orderplat`   | Application Insights  | —                | 僅 API 有埋設，worker 無       |
+
+## 網路與身分
+
+| 項目           | 現況                                                               |
+| -------------- | ------------------------------------------------------------------ |
+| 虛擬網路       | 未使用，所有服務走公開端點                                         |
+| 私人端點       | 無                                                                 |
+| SQL 防火牆     | 允許 `0.0.0.0` 至 `255.255.255.255`                                |
+| 應用程式身分   | 使用儲存在 App Service 設定值中的連線字串，未使用 managed identity |
+| Key Vault 存取 | 以存取原則授權給一組共用的服務主體                                 |
+
+## 備份與復原
+
+| 項目           | 現況         |
+| -------------- | ------------ |
+| SQL 備份保留   | 7 天（預設） |
+| 異地備援       | 未啟用       |
+| 還原演練       | 尚未執行過   |
+| RTO / RPO 目標 | 文件中未定義 |
+
+## 擴充與監控
+
+| 項目     | 現況                               |
+| -------- | ---------------------------------- |
+| 自動調整 | 未設定，固定 1 個執行個體          |
+| 健康檢查 | 未設定                             |
+| 警示規則 | 僅有一則「App Service 停止」的通知 |
+| 日誌保留 | 30 天                              |
+````"
+T04,架構健檢,primary → architect → primary,2、3、4,,"庫存同步平台的資源配置如下，環境隔離與容量規劃有沒有問題？
+
+azure_snapshot_02.md：
+
+````
+# 虛構材料：庫存同步平台架構快照（快照二）
+
+> ⚠️ 這是 workshop 的**虛構**分析材料。所有訂閱、資源群組、資源名稱與識別碼皆為虛構，
+> 不對應任何真實環境。用途是貼給架構健檢專家分析。
+
+## 基本資訊
+
+| 項目       | 值                                |
+| ---------- | --------------------------------- |
+| 環境       | Staging（與 Production 共用資源） |
+| 訂閱       | `sub-invsync-shared`（虛構代號）  |
+| 資源群組   | `rg-invsync-shared`               |
+| 主要區域   | Southeast Asia                    |
+| 快照取得日 | 第 1 天（虛構情境的相對日期）     |
+
+## 資源清單
+
+| 資源名稱            | 型別                     | SKU / 層級          | 備註                                         |
+| ------------------- | ------------------------ | ------------------- | -------------------------------------------- |
+| `aks-invsync`       | Azure Kubernetes Service | 3 節點 D2s_v3       | Staging 與 Production 同一個叢集不同命名空間 |
+| `acr-invsync`       | Container Registry       | Basic               | 未啟用內容信任                               |
+| `sb-invsync`        | Service Bus              | Standard            | 單一命名空間，佇列無死信處理                 |
+| `cosmos-invsync`    | Cosmos DB                | 佈建輸送量 400 RU/s | 單一區域寫入                                 |
+| `func-invreconcile` | Azure Functions          | Consumption         | 每 5 分鐘對帳                                |
+| `st-invsnapshots`   | Storage Account          | Standard_GRS        | 保留全部歷史快照，無生命週期規則             |
+| `appi-invsync`      | Application Insights     | —                   | 取樣率 100%                                  |
+
+## 網路與身分
+
+| 項目           | 現況                                            |
+| -------------- | ----------------------------------------------- |
+| 虛擬網路       | `vnet-invsync`，單一子網路                      |
+| AKS 節點       | 具公開 IP                                       |
+| Cosmos DB 存取 | 允許所有網路                                    |
+| 應用程式身分   | AKS 工作負載使用 Kubernetes Secret 中的存取金鑰 |
+| 秘密輪替       | 尚無流程                                        |
+
+## 部署與環境隔離
+
+| 項目     | 現況                                                      |
+| -------- | --------------------------------------------------------- |
+| 環境隔離 | Staging 與 Production 共用叢集、共用 Service Bus 命名空間 |
+| 部署方式 | 由開發者本機執行腳本推送映像並套用 manifest               |
+| 映像標籤 | 一律使用 `latest`                                         |
+| 回復方式 | 手動重新套用前一版 manifest                               |
+
+## 容量與成本
+
+| 項目             | 現況                               |
+| ---------------- | ---------------------------------- |
+| Cosmos DB 輸送量 | 固定 400 RU/s，尖峰時段常見節流    |
+| AKS 節點利用率   | 平均 CPU 18%                       |
+| 儲存體成長       | 每月約成長 40 GB，無封存或刪除規則 |
+| 成本檢視         | 未設定預算警示                     |
+````"
+T05,規格健檢,primary → spec → primary,2、3、4,,"這份訂單匯出功能的規格節錄，哪些地方描述得不夠清楚？
+
+spec_excerpt_01.md：
+
+````
+# 虛構材料：訂單匯出功能規格節錄（節錄一）
+
+> ⚠️ 這是 workshop 的**虛構**分析材料。內容為杜撰，不含任何客戶名稱、商標或聯絡資訊。
+> 用途是貼給規格健檢專家分析。
+
+## 3. 功能需求
+
+### 3.1 訂單匯出
+
+系統應該能讓使用者匯出訂單資料。匯出格式支援常見格式。匯出應該要快。
+
+### 3.2 篩選條件
+
+使用者可以依日期區間與客戶篩選。日期區間的上限視情況而定。
+
+### 3.3 通知
+
+匯出完成後通知相關人員。
+
+### 3.4 權限
+
+只有有權限的人可以匯出。
+
+## 4. 非功能需求
+
+| 項目   | 需求             |
+| ------ | ---------------- |
+| 效能   | 系統反應要即時   |
+| 可用性 | 盡量不要中斷     |
+| 安全性 | 依照公司政策辦理 |
+| 相容性 | 支援主流瀏覽器   |
+
+## 5. 交付清單
+
+| 編號 | 交付項目 | 完成定義 | 負責人 | 期限    |
+| ---- | -------- | -------- | ------ | ------- |
+| D-01 | 匯出功能 | —        | —      | 第 6 週 |
+| D-02 | 使用手冊 | —        | —      | 第 6 週 |
+| D-03 | 測試報告 | —        | —      | 第 7 週 |
+| D-04 | 上線     | —        | —      | 第 8 週 |
+
+## 6. 驗收方式
+
+由業務單位確認功能符合預期後簽核。
+
+## 7. 假設與相依
+
+- 假設既有的訂單資料庫可以直接查詢。
+- 相依於通知服務（另案處理）。
+````"
+T06,規格健檢,primary → spec → primary,2、3、4,,"請檢視這份交付清單節錄，看看驗收標準與時程有沒有問題。
+
+spec_excerpt_02.md：
+
+````
+# 虛構材料：庫存同步專案交付清單節錄（節錄二）
+
+> ⚠️ 這是 workshop 的**虛構**分析材料。內容為杜撰，不含任何客戶名稱、商標或聯絡資訊。
+> 用途是貼給規格健檢專家分析。
+
+## 2. 專案範圍
+
+本專案負責把倉庫端的庫存資料同步到線上通路。範圍包含同步機制、對帳與異常處理。
+不包含倉庫端系統的改動，但如果有需要也可以協助調整。
+
+## 3. 里程碑
+
+| 里程碑 | 內容         | 時程    | 前置條件           |
+| ------ | ------------ | ------- | ------------------ |
+| M1     | 環境準備     | 第 2 週 | —                  |
+| M2     | 同步機制完成 | 第 5 週 | M1                 |
+| M3     | 對帳機制完成 | 第 5 週 | M2                 |
+| M4     | 上線         | 第 6 週 | M3、使用者教育訓練 |
+
+> 註：第 4 節提到同步機制預計於第 7 週完成。
+
+## 4. 工作項目
+
+| 編號 | 項目     | 說明                                | 完成定義   |
+| ---- | -------- | ----------------------------------- | ---------- |
+| W-01 | 同步機制 | 第 7 週完成，包含即時與批次兩種模式 | 程式碼合併 |
+| W-02 | 對帳報表 | 每日產出差異清單                    | 報表可產出 |
+| W-03 | 異常處理 | 同步失敗時要有適當處理              | —          |
+| W-04 | 教育訓練 | 對倉管人員說明操作方式              | 訓練完成   |
+| W-05 | 效能調校 | 讓同步速度符合需求                  | —          |
+
+## 5. 驗收標準
+
+- 同步資料正確。
+- 系統穩定運作。
+- 使用者滿意。
+
+## 6. 角色與責任
+
+專案由專案團隊負責推動，相關單位配合。
+
+## 7. 風險
+
+| 風險         | 影響 | 對策       |
+| ------------ | ---- | ---------- |
+| 倉庫端配合度 | 高   | 加強溝通   |
+| 資料品質     | 中   | 視情況處理 |
+````"
+T07,意圖含糊,（不交接）Primary 先反問釐清,2、3、4,,幫我健檢一下這個專案。
+T08,意圖含糊,（不交接）Primary 先反問釐清,2、3、4,,我覺得我們的東西品質好像有點問題，你可以看看嗎？
+T09,範圍外,（不交接）Primary 說明能力邊界,2、3、4,,請幫我預估這個專案下一季需要多少人力，並排出招募時程。
+T10,範圍外,（不交接）Primary 說明能力邊界,2、3、4,,幫我把這份交付清單翻成日文，然後寄給客戶窗口。
+T11,跨領域,primary → coding → primary → architect → primary,2、3、4,,"我同時貼上訂單匯出的程式碼與訂單平台的資源快照，請一起看程式碼品質與架構風險。
+
+python_snippet_01.py：
+
+````
+""""""虛構教學材料：訂單匯出批次工具（片段一）。
+
+⚠️ 這是 workshop 的**虛構**分析材料，刻意保留可被發現的品質問題，MUST NOT 當成範例程式碼
+   模仿。所有名稱、路徑與識別碼皆為虛構，不對應任何真實系統。
+
+用途：Lab 1 至 Lab 4 的檢查點中，貼給程式碼健檢專家分析。
+""""""
+
+import csv
+import json
+import os
+
+
+def load_config(path):
+    f = open(path)
+    return json.load(f)
+
+
+def fetch_orders(conn, customer_id, start_date, end_date):
+    cursor = conn.cursor()
+    query = (
+        ""SELECT order_id, customer_id, amount, created_at FROM orders ""
+        ""WHERE customer_id = '"" + customer_id + ""' ""
+        ""AND created_at BETWEEN '"" + start_date + ""' AND '"" + end_date + ""'""
+    )
+    cursor.execute(query)
+    return cursor.fetchall()
+
+
+def export_orders(conn, customer_id, start_date, end_date, out_dir):
+    rows = fetch_orders(conn, customer_id, start_date, end_date)
+
+    total = 0
+    for r in rows:
+        total = total + r[2]
+
+    out_path = os.path.join(out_dir, customer_id + "".csv"")
+    w = csv.writer(open(out_path, ""w""))
+    w.writerow([""order_id"", ""customer_id"", ""amount"", ""created_at""])
+    for r in rows:
+        w.writerow(r)
+
+    print(""exported "" + str(len(rows)) + "" orders, total="" + str(total))
+    return out_path
+
+
+def run(config_path):
+    cfg = load_config(config_path)
+    conn = connect(cfg[""dsn""])
+    for c in cfg[""customers""]:
+        try:
+            export_orders(conn, c, cfg[""start""], cfg[""end""], cfg[""out_dir""])
+        except Exception:
+            pass
+
+
+def connect(dsn):
+    import sqlite3
+
+    return sqlite3.connect(dsn)
+
+
+if __name__ == ""__main__"":
+    run(os.environ.get(""EXPORT_CONFIG"", ""config.json""))
+````
+
+azure_snapshot_01.md：
+
+````
+# 虛構材料：訂單平台架構快照（快照一）
+
+> ⚠️ 這是 workshop 的**虛構**分析材料。所有訂閱、資源群組、資源名稱與識別碼皆為虛構，
+> 不對應任何真實環境。用途是貼給架構健檢專家分析。
+
+## 基本資訊
+
+| 項目       | 值                               |
+| ---------- | -------------------------------- |
+| 環境       | Production                       |
+| 訂閱       | `sub-orderplat-prod`（虛構代號） |
+| 資源群組   | `rg-orderplat-prod`              |
+| 主要區域   | East Asia                        |
+| 次要區域   | 無                               |
+| 快照取得日 | 第 1 天（虛構情境的相對日期）    |
+
+## 資源清單
+
+| 資源名稱           | 型別                  | SKU / 層級       | 備註                           |
+| ------------------ | --------------------- | ---------------- | ------------------------------ |
+| `app-order-api`    | App Service           | S1（1 執行個體） | 對外 API，公開端點             |
+| `plan-orderplat`   | App Service Plan      | S1               | 與背景工作共用同一個 plan      |
+| `app-order-worker` | App Service           | 同上 plan        | 背景批次，與 API 共用運算資源  |
+| `sql-orderplat`    | Azure SQL Database    | S2，單一資料庫   | 未設定異地複寫                 |
+| `st-orderexports`  | Storage Account       | Standard_LRS     | 存放匯出的 CSV，容器為公開讀取 |
+| `kv-orderplat`     | Key Vault             | Standard         | 存放連線字串                   |
+| `redis-ordercache` | Azure Cache for Redis | Basic C0         | 單節點                         |
+| `appi-orderplat`   | Application Insights  | —                | 僅 API 有埋設，worker 無       |
+
+## 網路與身分
+
+| 項目           | 現況                                                               |
+| -------------- | ------------------------------------------------------------------ |
+| 虛擬網路       | 未使用，所有服務走公開端點                                         |
+| 私人端點       | 無                                                                 |
+| SQL 防火牆     | 允許 `0.0.0.0` 至 `255.255.255.255`                                |
+| 應用程式身分   | 使用儲存在 App Service 設定值中的連線字串，未使用 managed identity |
+| Key Vault 存取 | 以存取原則授權給一組共用的服務主體                                 |
+
+## 備份與復原
+
+| 項目           | 現況         |
+| -------------- | ------------ |
+| SQL 備份保留   | 7 天（預設） |
+| 異地備援       | 未啟用       |
+| 還原演練       | 尚未執行過   |
+| RTO / RPO 目標 | 文件中未定義 |
+
+## 擴充與監控
+
+| 項目     | 現況                               |
+| -------- | ---------------------------------- |
+| 自動調整 | 未設定，固定 1 個執行個體          |
+| 健康檢查 | 未設定                             |
+| 警示規則 | 僅有一則「App Service 停止」的通知 |
+| 日誌保留 | 30 天                              |
+````"
+T12,跨領域,primary → spec → primary → architect → primary,2、3、4,,"這是庫存同步專案的交付清單節錄與資源快照，請幫我看規格描述與架構配置是否一致。
+
+spec_excerpt_02.md：
+
+````
+# 虛構材料：庫存同步專案交付清單節錄（節錄二）
+
+> ⚠️ 這是 workshop 的**虛構**分析材料。內容為杜撰，不含任何客戶名稱、商標或聯絡資訊。
+> 用途是貼給規格健檢專家分析。
+
+## 2. 專案範圍
+
+本專案負責把倉庫端的庫存資料同步到線上通路。範圍包含同步機制、對帳與異常處理。
+不包含倉庫端系統的改動，但如果有需要也可以協助調整。
+
+## 3. 里程碑
+
+| 里程碑 | 內容         | 時程    | 前置條件           |
+| ------ | ------------ | ------- | ------------------ |
+| M1     | 環境準備     | 第 2 週 | —                  |
+| M2     | 同步機制完成 | 第 5 週 | M1                 |
+| M3     | 對帳機制完成 | 第 5 週 | M2                 |
+| M4     | 上線         | 第 6 週 | M3、使用者教育訓練 |
+
+> 註：第 4 節提到同步機制預計於第 7 週完成。
+
+## 4. 工作項目
+
+| 編號 | 項目     | 說明                                | 完成定義   |
+| ---- | -------- | ----------------------------------- | ---------- |
+| W-01 | 同步機制 | 第 7 週完成，包含即時與批次兩種模式 | 程式碼合併 |
+| W-02 | 對帳報表 | 每日產出差異清單                    | 報表可產出 |
+| W-03 | 異常處理 | 同步失敗時要有適當處理              | —          |
+| W-04 | 教育訓練 | 對倉管人員說明操作方式              | 訓練完成   |
+| W-05 | 效能調校 | 讓同步速度符合需求                  | —          |
+
+## 5. 驗收標準
+
+- 同步資料正確。
+- 系統穩定運作。
+- 使用者滿意。
+
+## 6. 角色與責任
+
+專案由專案團隊負責推動，相關單位配合。
+
+## 7. 風險
+
+| 風險         | 影響 | 對策       |
+| ------------ | ---- | ---------- |
+| 倉庫端配合度 | 高   | 加強溝通   |
+| 資料品質     | 中   | 視情況處理 |
+````
+
+azure_snapshot_02.md：
+
+````
+# 虛構材料：庫存同步平台架構快照（快照二）
+
+> ⚠️ 這是 workshop 的**虛構**分析材料。所有訂閱、資源群組、資源名稱與識別碼皆為虛構，
+> 不對應任何真實環境。用途是貼給架構健檢專家分析。
+
+## 基本資訊
+
+| 項目       | 值                                |
+| ---------- | --------------------------------- |
+| 環境       | Staging（與 Production 共用資源） |
+| 訂閱       | `sub-invsync-shared`（虛構代號）  |
+| 資源群組   | `rg-invsync-shared`               |
+| 主要區域   | Southeast Asia                    |
+| 快照取得日 | 第 1 天（虛構情境的相對日期）     |
+
+## 資源清單
+
+| 資源名稱            | 型別                     | SKU / 層級          | 備註                                         |
+| ------------------- | ------------------------ | ------------------- | -------------------------------------------- |
+| `aks-invsync`       | Azure Kubernetes Service | 3 節點 D2s_v3       | Staging 與 Production 同一個叢集不同命名空間 |
+| `acr-invsync`       | Container Registry       | Basic               | 未啟用內容信任                               |
+| `sb-invsync`        | Service Bus              | Standard            | 單一命名空間，佇列無死信處理                 |
+| `cosmos-invsync`    | Cosmos DB                | 佈建輸送量 400 RU/s | 單一區域寫入                                 |
+| `func-invreconcile` | Azure Functions          | Consumption         | 每 5 分鐘對帳                                |
+| `st-invsnapshots`   | Storage Account          | Standard_GRS        | 保留全部歷史快照，無生命週期規則             |
+| `appi-invsync`      | Application Insights     | —                   | 取樣率 100%                                  |
+
+## 網路與身分
+
+| 項目           | 現況                                            |
+| -------------- | ----------------------------------------------- |
+| 虛擬網路       | `vnet-invsync`，單一子網路                      |
+| AKS 節點       | 具公開 IP                                       |
+| Cosmos DB 存取 | 允許所有網路                                    |
+| 應用程式身分   | AKS 工作負載使用 Kubernetes Secret 中的存取金鑰 |
+| 秘密輪替       | 尚無流程                                        |
+
+## 部署與環境隔離
+
+| 項目     | 現況                                                      |
+| -------- | --------------------------------------------------------- |
+| 環境隔離 | Staging 與 Production 共用叢集、共用 Service Bus 命名空間 |
+| 部署方式 | 由開發者本機執行腳本推送映像並套用 manifest               |
+| 映像標籤 | 一律使用 `latest`                                         |
+| 回復方式 | 手動重新套用前一版 manifest                               |
+
+## 容量與成本
+
+| 項目             | 現況                               |
+| ---------------- | ---------------------------------- |
+| Cosmos DB 輸送量 | 固定 400 RU/s，尖峰時段常見節流    |
+| AKS 節點利用率   | 平均 CPU 18%                       |
+| 儲存體成長       | 每月約成長 40 GB，無封存或刪除規則 |
+| 成本檢視         | 未設定預算警示                     |
+````"
