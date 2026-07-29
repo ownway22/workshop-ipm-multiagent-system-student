@@ -25,10 +25,9 @@
 
 [src/agents/coding.py 第 25–58 行：coding agent 的 instructions](../src/agents/coding.py#L25-L58)
 
-點進去後編輯器會選取該段，直接按 `Ctrl+C`（macOS 為 `Cmd+C`）複製即可，約 820 字元。
+按 `Ctrl+C`（macOS 為 `Cmd+C`）複製選取內容。
 
-> ⚠️ 選取範圍前後兩行（`INSTRUCTIONS = """\` 與結尾的 `"""`）是 Python 字串語法，**勿**一起複製到 Foundry portal。
-> ℹ️ **從原始檔複製、而非講義的原因**：`src/agents/coding.py` 是這份 instructions 的**唯一來源**，Lab 2 也讀同一個檔案。若講義另抄一份，兩邊遲早不一致，且難以察覺 Lab 1 與 Lab 2 的 agent 行為為何不同。
+> **注意：** 不要複製前後的 Python 字串語法（`INSTRUCTIONS = """\` 與結尾的 `"""`）。原始檔是唯一來源，Lab 2 也會讀取它。
 
 ## 步驟二：在 Foundry portal 建立 agent
 
@@ -40,7 +39,7 @@
    qvn-coding-agent
    ```
 
-   > ⚠️ 名稱必須**逐字相同**，Lab 2 的腳本依此名稱尋找它。`qvn-` 是刻意選的無語意前置詞，收尾清理依它辨識本次 workshop 建立的 agent，以免誤刪你原有的資產。
+   > **注意：** 名稱必須逐字相同，Lab 2 會依此名稱尋找 agent；清理腳本也會依 `qvn-` 前置詞辨識課程資產，避免誤刪既有 agent。
 
 4. **Model** 選擇 Lab 0 確認過的模型部署（建議 `gpt-5.4-mini`）。
 5. **Instructions** 貼上步驟一複製的內容。
@@ -68,7 +67,7 @@ print(json.dumps(build_portal_response_format(), ensure_ascii=False, indent=2))
 6. 點對話框的 **Save**。
 7. 點頁面**右上角的 Save** 儲存 agent 版本（版本號 +1）。
 
-> ℹ️ 這份 JSON 由 `models/specialist_review.py` 的 `SpecialistReview` 產生，與 Lab 2 用的是**同一個資料契約**，同樣**勿手抄**。
+> **提示：** JSON 由 `models/specialist_review.py` 產生，與 Lab 2 共用同一個資料契約，請勿手抄。
 
 ## 步驟四：測試
 
@@ -119,7 +118,7 @@ def run(customer_id):
 - [ ] 回覆中**沒有**宣稱「已連線 Azure 查詢」
 - [ ] 回覆中**沒有**引用你沒有提供的檔案或系統
 
-> ℹ️ 最後三項是本 Lab 的重點。`limitations` 欄位是**結構性保險**：即使模型傾向宣稱看得很完整，也必須在同一份輸出裡說明自己沒看到什麼——這比在 instructions 寫「請勿誇大」有效得多。
+> **提示：** `limitations` 會要求模型明確說明未取得的資訊，是本 Lab 的重點。
 
 ---
 

@@ -24,13 +24,13 @@ cd src
 uv run python -m registry.create_agents
 ```
 
-預期輸出：
+輸出重點如下（省略狀態符號）：
 
 ```text
-[qvn-coding-agent]    ✅ 已存在（Lab 1 建立）— 其專家角色已依定義檔加入 Handoff
-[qvn-primary-agent]   ✅ 已建立（version 1）
-[qvn-architect-agent] ✅ 已建立（version 1）
-[qvn-spec-agent]      ✅ 已建立（version 1）
+[qvn-coding-agent]    已存在（Lab 1 建立）— 其專家角色已依定義檔加入 Handoff
+[qvn-primary-agent]   已建立（version 1）
+[qvn-architect-agent] 已建立（version 1）
+[qvn-spec-agent]      已建立（version 1）
 
 結果：Foundry 專案中共有 4 個 qvn- agent。
 下一步：啟動 DevUI 觀察交接
@@ -49,20 +49,18 @@ uv run python -m registry.create_agents
 uv run python -m registry.create_agents
 ```
 
+輸出重點如下（省略狀態符號）：
+
 ```text
-[qvn-coding-agent]    ✅ 已存在（Lab 1 建立）— 其專家角色已依定義檔加入 Handoff
-[qvn-primary-agent]   ⏭️  已是最新，略過（version 1）
-[qvn-architect-agent] ⏭️  已是最新，略過（version 1）
-[qvn-spec-agent]      ⏭️  已是最新，略過（version 1）
+[qvn-coding-agent]    已存在（Lab 1 建立）— 其專家角色已依定義檔加入 Handoff
+[qvn-primary-agent]   已是最新，略過（version 1）
+[qvn-architect-agent] 已是最新，略過（version 1）
+[qvn-spec-agent]      已是最新，略過（version 1）
 
 結果：Foundry 專案中共有 4 個 qvn- agent。
 ```
 
-**agent 總數沒有變。**
-
-agent 的**名稱**是穩定識別碼，重複執行只會在同一個 agent 底下建立新版本，不會產生第二個同名 agent。因此可放心改 `src/agents/` 的 instructions 再重跑。
-
-試著改一個字（例如在 `src/agents/architect.py` 的 `INSTRUCTIONS` 加一句話）再執行一次，該 agent 會變成 `✅ 已更新（version 2）`，其餘仍是 `⏭️`。
+agent 名稱是穩定識別碼。重複執行只會更新同名 agent 的版本，不會增加 agent 數量。修改 `src/agents/` 後可重跑，版本號會遞增。
 
 ---
 
@@ -78,7 +76,7 @@ uv run python main.py
 
 ### 關於 `auth_enabled=False`
 
-本 workshop 以 `auth_enabled=False` 啟動——**這是教學場景的權宜做法，不適用於正式環境**。
+本 workshop 為教學方便使用 `auth_enabled=False`，正式環境不應使用。
 
 ### 如果瀏覽器顯示 400 Bad Request
 
@@ -160,7 +158,7 @@ Handoff 的實作機制**就是**注入交接工具——框架以「呼叫一�
 | 對話跑到一半沒反應                      | 模型部署配額用盡或服務端壅塞             | 等一分鐘重試；持續發生就調高部署的 TPM 配額                                  |
 | 出現「觸發流量限制（HTTP 429）」        | 短時間送太多題，或全班同時操作同一個部署 | 等一分鐘再送；這是降級回覆而非崩潰                                           |
 | 連續快速送出多則，agent 只回答第一段    | 都落在同一 session，但處理順序不保證     | 貼材料**一次貼完**，不要拆成多則連發                                         |
-| 出現「⚠️ 我原本要把這一段交給…」        | 該專家目前不可用                         | **這是正常的降級行為**，訊息裡有修復步驟；系統不會崩潰                       |
+| 出現「我原本要把這一段交給…」           | 該專家目前不可用                         | 這是正常的降級行為；依訊息中的步驟修復                                       |
 | 改了 `src/agents/` 但行為沒變           | 沒重跑建立腳本，或 DevUI 沒重啟          | 重跑 `uv run python -m registry.create_agents`，再重啟 DevUI                 |
 | 專家回覆不是 JSON                       | 該 agent 的 `response_format` 沒生效     | 重跑建立腳本；若仍如此，回 Foundry portal 確認 Lab 1 的 response format 還在 |
 | 回覆旁出現「Unable to process request」 | 套件的已知缺陷（見下一節）               | 重新啟動服務再送下一題；這不是你的環境問題                                   |
@@ -169,12 +167,12 @@ Handoff 的實作機制**就是**注入交接工具——框架以「呼叫一�
 
 ## DevUI 已知限制
 
-Handoff 工作流的狀態（誰在主導、交接歷史）本應綁在單一對話上，但這一版套件**做不到**。下面兩件事都是 2026-07-28 實測確認：
+目前版本無法將 Handoff 狀態完整隔離在單一對話。2026-07-28 實測確認：
 
 1. **workflow 實體**：按「新對話」後，仍讀得到上一段對話的內容。
 2. **agent 實體**：第一輪交接結束後，繼續追問或開新對話都可能回 `Unexpected content type while awaiting request info responses.`
 
-**要得到乾淨環境，唯一可靠的做法是重新啟動服務**（`Ctrl+C` 後重跑 `uv run python main.py`）。這不是你的環境或操作問題，而是 `agent-framework-devui`（仍為 prerelease）目前的行為。講師手上有完整根因與現場替代方案，收尾時會說明。
+唯一可靠的重置方式是按 `Ctrl+C`，再重跑 `uv run python main.py`。這是 `agent-framework-devui` prerelease 版本的已知行為，不是操作錯誤。
 
 ---
 

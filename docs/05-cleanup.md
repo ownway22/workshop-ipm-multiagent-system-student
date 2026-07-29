@@ -18,7 +18,7 @@ cd src
 uv run python -m registry.cleanup
 ```
 
-這是**乾跑**，什麼都不會刪。輸出長這樣：
+這是乾跑，不會刪除資源。輸出重點如下（省略狀態符號）：
 
 ```text
 Foundry 專案：https://<你的專案>.services.ai.azure.com/api/projects/<專案名稱>
@@ -27,23 +27,17 @@ Foundry 專案：https://<你的專案>.services.ai.azure.com/api/projects/<專�
     · my-existing-agent
 
 待刪除（5 個）：
-    ✗ qvn-architect-agent
-    ✗ qvn-coding-agent
-    ✗ qvn-ipm-review
-    ✗ qvn-primary-agent
-    ✗ qvn-spec-agent
+    qvn-architect-agent
+    qvn-coding-agent
+    qvn-ipm-review
+    qvn-primary-agent
+    qvn-spec-agent
 
 這是乾跑，什麼都沒有刪除。確認清單無誤後執行：
     cd src && uv run python -m registry.cleanup --confirm
 ```
 
-**兩份清單都要看。**
-
-「保留」是你原本就有的 agent——確認它們**沒有**被列進待刪清單。
-「待刪除」應該只有 `qvn-` 開頭的，數量是 4 個（Lab 1–2）或 5 個（做完 Lab 3 會多一個）。
-
-腳本只認 `qvn-` 前置詞，不帶前置詞的一律不碰。
-但**你自己確認一次**還是值得——刪除不可逆。
+確認「保留」清單包含既有 agent；「待刪除」清單只能有 `qvn-` 開頭的 4 或 5 個 agent。刪除不可逆，請先核對。
 
 ---
 
@@ -53,12 +47,14 @@ Foundry 專案：https://<你的專案>.services.ai.azure.com/api/projects/<專�
 uv run python -m registry.cleanup --confirm
 ```
 
+輸出重點如下（省略狀態符號）：
+
 ```text
-    ✅ 已刪除 qvn-architect-agent
-    ✅ 已刪除 qvn-coding-agent
-    ✅ 已刪除 qvn-ipm-review
-    ✅ 已刪除 qvn-primary-agent
-    ✅ 已刪除 qvn-spec-agent
+    已刪除 qvn-architect-agent
+    已刪除 qvn-coding-agent
+    已刪除 qvn-ipm-review
+    已刪除 qvn-primary-agent
+    已刪除 qvn-spec-agent
 
 完成：已刪除 5 個 agent。
 ```
@@ -95,8 +91,7 @@ azd down
 - [ ] 沒有本課程建立的 Azure Bot
 - [ ] **你原本就有的 Foundry 專案、模型部署與 agent 都還在**
 
-最後一項最重要。清理**不應該**動到你的既有資產——
-如果發現有東西不見了，那是出問題了，不是預期行為。
+清理不應影響既有資產。若有既有資產消失，請立即停止後續操作。
 
 ---
 
@@ -106,23 +101,11 @@ azd down
 
 ### 1. 可觀測性：預設會記錄對話內容
 
-託管環境**預設**把使用者訊息與 agent 回覆逐字送進 Application Insights。
-本課程用 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: "false"` 關掉了它。
-
-**本機不會有這個行為**——只在自己機器上測，永遠不會發現。
-
-要放到工作環境前，先問：誰有權限看那些 traces？裡面會出現什麼內容？
-留存多久？符不符合你們的資料處理規範？
+託管環境預設會將訊息與回覆逐字送進 Application Insights，本機則不會。本課程以 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: "false"` 關閉內容記錄。正式部署前，請確認 traces 的存取權、內容與保留期限符合規範。
 
 ### 2. 成本：依 active session 累計，不是依 replica
 
-hosted agent 的計費模型與一般 web 應用**不同**：
-它依**同時存在的 session 數**擴展，不是依副本數。
-
-所以 `agent.yaml` 裡那個 `cpu: 0.5 / memory: 1Gi` 描述的是**單一 session**，
-會被併發數倍乘。三十個人同時用，就是三十份。
-
-過度配置在這個模型下的代價，比一般服務放大得多。
+hosted agent 與一般 web 應用不同，依同時存在的 session 數擴展。`agent.yaml` 的 `cpu: 0.5 / memory: 1Gi` 是單一 session 的配置；過度配置的成本會隨併發數放大。
 
 ### 3. 治理與身分：課程用的是最寬鬆的設定
 
@@ -132,13 +115,11 @@ hosted agent 的計費模型與一般 web 應用**不同**：
 - Teams 發布用的是 **「Just you」**，沒有經過任何核准流程
 - 權限是直接指派給你個人
 
-正式環境要處理的是完全不同的問題：誰可以部署、誰可以呼叫、
-用什麼身分呼叫、以及組織範圍發布需要的管理員核准流程。
+正式環境需另外設計部署者、呼叫者、執行身分與管理員核准流程。
 
 ### 4. 網路：課程完全沒有碰
 
-課程用的是公開端點。實際的企業環境通常需要私人端點、
-輸出流量控管、以及與既有網路架構的整合——這些本課程**一項都沒有示範**。
+本課程使用公開端點，未涵蓋私人端點、輸出流量控管與企業網路整合。
 
 ---
 
@@ -157,10 +138,7 @@ hosted agent 的計費模型與一般 web 應用**不同**：
 
 ## 這套東西目前還做不到什麼
 
-離開前值得花幾分鐘把這件事想清楚：**你剛剛跑完的鏈路，不是每一層都是穩定版**。
-服務本身已 GA、框架核心是穩定版，但把它接到託管與本機工具的那幾層
-（`agent-framework-devui`、`agent-framework-foundry-hosting`、`azure-ai-agentserver-*`、
-`azd ai agent` 擴充）還在 prerelease、beta 或 preview。分級見 [README](../README.md#版本)。
+服務與框架核心為穩定版，但 `agent-framework-devui`、`agent-framework-foundry-hosting`、`azure-ai-agentserver-*` 與 `azd ai agent` 擴充仍為 prerelease、beta 或 preview。分級見 [README](../README.md#版本)。
 
 另外三件本場刻意簡化、**不是生產建議**的事：
 

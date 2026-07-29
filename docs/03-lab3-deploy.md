@@ -83,7 +83,7 @@ azd provision
 | Foundry Project Manager            | 專案     | 建立／呼叫 agent   |
 | Azure Bot Service Contributor Role | 資源群組 | Lab 4 發布到 Teams |
 
-> ⚠️ 若 `azd provision` 回報權限錯誤，通常是缺 `Foundry Project Manager`（專案範圍）。訂閱的 Owner **不包含**此角色，Lab 0 的 preflight 會檢查它。
+> **注意：** `azd provision` 回報權限錯誤時，請確認是否具備專案範圍的 `Foundry Project Manager`。訂閱 Owner 不包含此角色。
 
 ---
 
@@ -93,9 +93,9 @@ azd provision
 azd deploy
 ```
 
-執行後映像會在 Azure 雲端建置（本機不需安裝 Docker），接著推送、建立 agent 版本並啟動容器，全程需要數分鐘。請保持命令執行，完成後再繼續下一步。
+映像會在 Azure 建置並推送，再建立 agent 版本與啟動容器，需數分鐘。完成前不要中斷命令。
 
-> ⚠️ `azd deploy` 每次執行都會**重寫 `azure.yaml` 並清掉所有註解**。這是 azd 的行為，非你弄壞的。設定值本身不受影響；要找回註解，從版本控制還原該檔即可。
+> **注意：** `azd deploy` 會重寫 `azure.yaml` 並移除註解，但不影響設定值。需要註解時可從版本控制還原。
 
 ---
 
@@ -121,7 +121,7 @@ azd ai agent show
 
 到 Foundry portal → 你的專案 → Agents → `qvn-ipm-review` → **Playground**。
 
-送出**與 Lab 2 完全相同**的 12 題。
+送出與 Lab 2 相同的 12 題。
 
 要取得某一題的完整內容（含要貼上的材料）：
 
@@ -132,7 +132,7 @@ uv run python -c "from fixtures.test_items import TEST_ITEMS, render_prompt; pri
 
 把索引 `[0]` 換成 `[1]`⋯`[11]` 即可取得第 2 到第 12 題。
 
-要一次看完十二題，開 `src/fixtures/materials/test_items.csv`，內容與上述指令相同。
+也可開啟 `src/fixtures/materials/test_items.csv` 一次查看 12 題。
 
 ### 至少要送這一題
 
@@ -153,7 +153,7 @@ uv run python -c "from fixtures.test_items import TEST_ITEMS, render_prompt; pri
 
 ### 全部 12 題的預期
 
-**這一步的重點是「一致」，不是「會動」。** 交接路由結果應與你在 DevUI 看到的相同：
+交接路由應與 DevUI 的結果一致：
 
 | 題號    | 預期路由                                        |
 | ------- | ----------------------------------------------- |
@@ -166,7 +166,7 @@ uv run python -c "from fixtures.test_items import TEST_ITEMS, render_prompt; pri
 
 如果結果不一致，**通常是環境變數沒帶上去**（例如 `MODEL_DEPLOYMENT_NAME` 在 azd 環境的值與 `src/.env` 不同）。
 
-另注意：在 Playground 中，你是跟**整個多代理系統**對話，而非單一 agent。這是 `workflow.as_agent()` 的效果——四個 agent 對外看起來就是一個。
+Playground 對話的對象是整個多代理系統；`workflow.as_agent()` 讓四個 agent 對外呈現為一個。
 
 ---
 
@@ -176,7 +176,7 @@ uv run python -c "from fixtures.test_items import TEST_ITEMS, render_prompt; pri
 azd ai agent invoke --message "請幫我看這段程式碼有沒有問題：result = eval(user_input)"
 ```
 
-這證明它是**可由程式呼叫的端點**，而非只能在 Foundry portal 操作。
+確認端點可由程式呼叫。
 
 ---
 
@@ -236,4 +236,4 @@ AppTraces
 
 進入 [Lab 4：發布到 Teams](04-lab4-publish-teams.md)。
 
-> ⚠️ 若在此休息超過十五分鐘，Lab 4 的第一則訊息會明顯較慢——那是冷啟動，不是壞掉，稍候即可。
+> **提示：** 閒置超過 15 分鐘後，Lab 4 的第一則訊息可能因冷啟動而較慢。

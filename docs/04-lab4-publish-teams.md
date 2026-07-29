@@ -15,21 +15,19 @@
 
 ## 限制與範圍
 
-**能做到**：
+支援：
 
-- ✅ 在 Teams 裡與 agent **1:1 私訊**
-- ✅ 完整的交接對話（與 Playground 一樣）
+- 在 Teams 裡與 agent 1:1 私訊
+- 完整的交接對話
 
-**做不到**（框架目前的限制，不是你設定錯）：
+目前不支援：
 
-- ❌ **頻道提及**（在團隊頻道 `@` 這個 agent）
-- ❌ **群組聊天**
+- 頻道提及
+- 群組聊天
 
-所以待會兒不要試著把它拉進頻道——不會動，而且你會花時間找一個不存在的設定。
+這是框架限制，不是設定錯誤；請使用 1:1 私訊。
 
-**組織範圍發布**（讓整個公司的人都能用）本課程**只作概念說明，不實際操作**。
-那需要 Teams 系統管理員核准，流程與時程都不在課程可控範圍內。
-今天用的是 **Direct publish + 「Just you」**——只有你自己看得到。
+本課程使用 **Direct publish +「Just you」**。組織範圍發布需要 Teams 系統管理員核准，不在本課程內。
 
 ---
 
@@ -53,18 +51,17 @@ Foundry portal → 你的專案 → Agents → `qvn-ipm-review` → **Publish**
 
 ## 步驟三：填必填中繼資料
 
-| 欄位               | 說明                    |
-| ------------------ | ----------------------- |
-| Agent name         | 顯示在 Teams 裡的名稱   |
-| Short description  | 一句話說明              |
-| Long description   | 幾句話說明用途          |
-| **Developer name** | ⚠️ **不得超過 32 字元** |
-| Website URL        | 你公司的網址即可        |
-| Privacy policy URL | 同上                    |
-| Terms of use URL   | 同上                    |
+| 欄位               | 說明                  |
+| ------------------ | --------------------- |
+| Agent name         | 顯示在 Teams 裡的名稱 |
+| Short description  | 一句話說明            |
+| Long description   | 幾句話說明用途        |
+| **Developer name** | **不得超過 32 字元**  |
+| Website URL        | 你公司的網址即可      |
+| Privacy policy URL | 同上                  |
+| Terms of use URL   | 同上                  |
 
-> ⚠️ **Developer name 超過 32 字元是最常見的卡關點**，而錯誤訊息不一定指得很清楚。
-> 先數一下再填。中文字也算字元。
+> **注意：** Developer name 不得超過 32 字元，中文字也算字元。
 
 三個 URL 欄位在「Just you」的發布範圍下不會被實際檢視，
 但**格式必須是合法的網址**才過得了驗證。
@@ -75,7 +72,7 @@ Foundry portal → 你的專案 → Agents → `qvn-ipm-review` → **Publish**
 
 Publish options → **Direct publish**。
 
-> ℹ️ 另一個選項會走系統管理員核准流程，本課程不使用。
+> **提示：** 另一個選項需要系統管理員核准，本課程不使用。
 
 ---
 
@@ -91,8 +88,7 @@ Publish options → **Direct publish**。
 
 開啟 Teams → 左側 **Apps** → **Your agents**（或搜尋你剛才填的 Agent name）。
 
-> ⚠️ 你的 Teams 帳號必須與 Azure 訂閱**在同一個 Entra 租戶**。
-> 不同租戶的話，「Just you」發布的 agent 不會出現在你的 Teams 裡。
+> **注意：** Teams 帳號必須與 Azure 訂閱位於同一個 Entra 租戶，否則 agent 不會出現在「Your agents」。
 
 找到後開啟 1:1 對話。
 
@@ -153,10 +149,7 @@ Teams 端的 session 邊界對應 **Teams 原生的對話識別碼**：
 
 ## 完成內容
 
-從一個在 Foundry portal 手動建立的單一 agent，到四個 agent 的交接系統，
-再到 Azure 上的託管服務，最後到 Teams 裡可直接對話的助理。
-
-核心程式碼沒有重寫，改變的是對外的執行與發布方式。
+你已將單一 agent 擴充為四個 agent 的交接系統，部署至 Azure，並發布到 Teams。核心程式碼不變，只有執行與發布方式不同。
 
 ---
 
