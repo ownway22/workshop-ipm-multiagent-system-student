@@ -41,16 +41,22 @@ cd deploy
 azd env new ipm-workshop
 ```
 
-設定四個值（把角括號換成你自己的）：
+直接沿用 Lab 0 已驗證過的 `src/.env`，不需再回 Azure portal 或 Foundry portal 複製值：
 
 ```bash
-azd env set AZURE_RESOURCE_GROUP <你的資源群組名稱>
-azd env set AZURE_AI_ACCOUNT_NAME <你的 Foundry 帳戶名稱>
-azd env set AZURE_AI_PROJECT_NAME <你的 Foundry 專案名稱>
-azd env set MODEL_DEPLOYMENT_NAME <你的模型部署名稱>
+uv run --project ../src python scripts/configure_azd_env.py
 ```
 
-前三個可從 `.env` 的專案端點推得，或回 Foundry portal 複製；第四個與 `src/.env` 的 `MODEL_DEPLOYMENT_NAME` 相同。
+這支工具會先確認 `az login` 目前選取的訂閱，再查證專案與模型部署確實存在；任何值不一致時會停止，**不會**寫入部分設定。
+
+工具會依來源自動寫入下列值：
+
+- `az account show`：`AZURE_SUBSCRIPTION_ID`、`AZURE_TENANT_ID`
+- 專案端點及 Azure 資源查詢：`AZURE_LOCATION`、`AZURE_RESOURCE_GROUP`、`AZURE_AI_ACCOUNT_NAME`、`AZURE_AI_PROJECT_NAME`、`AZURE_AI_PROJECT_ID`
+- `src/.env` 的專案端點：`AZURE_AI_PROJECT_ENDPOINT`、`FOUNDRY_PROJECT_ENDPOINT`
+- `src/.env` 的 `MODEL_DEPLOYMENT_NAME`：`AZURE_AI_MODEL_DEPLOYMENT_NAME`、`MODEL_DEPLOYMENT_NAME`
+
+`AZURE_ENV_NAME` 已由 `azd env new` 建立；`AZURE_PRINCIPAL_ID` 與 `AZURE_PRINCIPAL_TYPE` 會由 azd 依目前登入身分自動解析。這些值都不需要手動設定。
 
 確認：
 

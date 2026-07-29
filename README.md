@@ -164,14 +164,13 @@ asyncio.run(main())
 ```bash
 cd deploy
 azd env new ipm-workshop
-azd env set AZURE_RESOURCE_GROUP <資源群組>
-azd env set AZURE_AI_ACCOUNT_NAME <Foundry 帳戶>
-azd env set AZURE_AI_PROJECT_NAME <Foundry 專案>
-azd env set MODEL_DEPLOYMENT_NAME <模型部署名稱>
+uv run --project ../src python scripts/configure_azd_env.py
 azd provision
 azd deploy
 azd ai agent show
 ```
+
+匯入工具會從已驗證的 `src/.env` 取得專案端點與模型部署名稱，再透過目前的 Azure CLI 登入自動查出訂閱、租戶、資源群組、區域、Foundry 帳戶、專案名稱及 ARM ID；不需回 portal 手動抄值。
 
 完整步驟與常見失敗見 [Lab 3](docs/03-lab3-deploy.md)。
 

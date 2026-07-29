@@ -117,10 +117,7 @@ uv run python main.py
 cp -r solutions/lab3/deploy/* deploy/
 cd deploy
 azd env new ipm-workshop
-azd env set AZURE_RESOURCE_GROUP <你的資源群組>
-azd env set AZURE_AI_ACCOUNT_NAME <你的 Foundry 帳戶>
-azd env set AZURE_AI_PROJECT_NAME <你的 Foundry 專案>
-azd env set MODEL_DEPLOYMENT_NAME <你的模型部署名稱>
+uv run --project ../src python scripts/configure_azd_env.py
 azd provision
 azd deploy
 azd ai agent show

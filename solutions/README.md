@@ -67,6 +67,7 @@ deploy/Dockerfile     容器映像定義
 deploy/azure.yaml     azd 服務宣告
 deploy/agent.yaml     agent manifest
 deploy/infra/         最小基礎設施（ACR 與授權）
+deploy/scripts/       azd 環境自動匯入工具
 ```
 
 覆蓋後接著跑 [Lab 3 步驟二](../docs/03-lab3-deploy.md#步驟二初始化-azd-環境)。
