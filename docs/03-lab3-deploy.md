@@ -36,6 +36,49 @@
 
 ## 步驟二：初始化 azd 環境
 
+### 尚未有 Foundry 專案：建立在新的資源群組
+
+已有專案的學員跳過本節。`deploy/prerequisites.bicep` 是**選用**的前置部署：
+建立新的資源群組、Foundry 帳戶／專案、模型、Application Insights 與 Log Analytics。
+原本 `infra/main.bicep` 仍只建立 ACR 與接線，不會改為自動建立 Foundry。
+
+先用 `az account show` 確認帳號及訂閱，再於 `deploy/` 執行下列 Bash 指令。
+`RG` 必須是未使用的新名稱；先檢查區域支援 Hosted Agent，且模型有足夠配額。
+
+```bash
+SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+PRINCIPAL_ID=$(az ad signed-in-user show --query id -o tsv)
+ENV_NAME=ipm-workshop
+RG=rg-ipm-workshop-new
+LOCATION=southeastasia
+
+az deployment sub what-if --subscription "$SUBSCRIPTION_ID" \
+  --location "$LOCATION" --template-file prerequisites.bicep \
+  --parameters environmentName="$ENV_NAME" resourceGroupName="$RG" \
+    location="$LOCATION" principalId="$PRINCIPAL_ID"
+
+# 確認資源與費用後才執行；此步開始產生 Azure 費用。
+az deployment sub create --subscription "$SUBSCRIPTION_ID" \
+  --name "$ENV_NAME-prerequisites" --location "$LOCATION" \
+  --template-file prerequisites.bicep \
+  --parameters environmentName="$ENV_NAME" resourceGroupName="$RG" \
+    location="$LOCATION" principalId="$PRINCIPAL_ID" \
+  --query properties.outputs
+```
+
+把輸出的 `AZURE_AI_PROJECT_ENDPOINT.value` 寫入不進版控的 `src/.env` 的 `FOUNDRY_PROJECT_ENDPOINT`，
+並將 `MODEL_DEPLOYMENT_NAME.value` 寫入 `MODEL_DEPLOYMENT_NAME`，再繼續下方的 azd 初始化與匯入步驟。
+範本預設 `gpt-4.1-mini`（`2025-04-14`）、Global Standard、50K TPM；
+Global Standard 推論不保證留在資源所在區域。可用範本參數指定已確認支援的模型、
+版本與容量；不要只改模型名稱而未檢查版本與配額。
+
+此路徑停用 Foundry 金鑰驗證，以 Entra 身分存取公開端點。
+Log Analytics 每日收集上限設定為 0.1 GB；這**不是整體 Azure 費用上限**，
+超過時可能缺少 traces。模型 token、active session 運算、ACR 與建置另行計費。
+測試結束時，只有在確認該資源群組完全屬於本次測試後，才刪除整個新資源群組。
+
+### 初始化與匯入
+
 ```bash
 cd deploy
 azd env new ipm-workshop

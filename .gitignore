@@ -1,4 +1,6 @@
 # Local environment and secrets
+.copilot-azure/
+deploy/.azure/
 .env
 .env.*
 !.env.example
@@ -48,3 +50,4 @@ playwright-report/
 
 # agent-framework 在本機執行時產生的 checkpoint 快照（含對話內容，MUST NOT 進版控）
 .checkpoints/
+.azure/
