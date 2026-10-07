@@ -17,7 +17,7 @@ var suffix = uniqueString(subscription().id, resourceGroup().id)
 var accountName = 'ai-ipm-${suffix}'
 var projectManagerRoleId = 'eadc314b-1a2d-4efa-be10-5d325db5065e'
 
-// Follow the basic Foundry setup: hosted sessions manage their own storage.
+// 比照 Foundry 基本設定：託管 session 自行管理儲存，不另建 Storage／Cosmos DB／AI Search。
 resource account 'Microsoft.CognitiveServices/accounts@2025-06-01' = {
   name: accountName
   location: location
@@ -112,8 +112,9 @@ resource insights 'Microsoft.Insights/components@2020-02-02' = {
   }
 }
 
-// Foundry injects this connection into the hosted runtime; do not put it in source .env files.
-resource insightsConnection 'Microsoft.CognitiveServices/accounts/projects/connections@2025-04-01-preview' = {
+// Foundry 會把此 connection 注入託管 runtime；不要放進原始碼的 .env。
+// API version 與其他 CognitiveServices 資源一致使用 GA 的 2025-06-01（已支援 accounts/projects/connections）。
+resource insightsConnection 'Microsoft.CognitiveServices/accounts/projects/connections@2025-06-01' = {
   parent: project
   name: insights.name
   properties: {
