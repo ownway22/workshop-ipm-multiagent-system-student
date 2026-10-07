@@ -10,8 +10,12 @@ param resourceGroupName string
 
 param location string
 
-@description('Object ID of the deploying user.')
+@description('取得 Foundry 專案管理權限的主體 objectId（使用者、服務主體或群組）。')
 param principalId string
+
+@description('principalId 的主體型別。互動式部署為 User，CI／服務主體為 ServicePrincipal，以群組授權時為 Group。')
+@allowed(['User', 'ServicePrincipal', 'Group'])
+param principalType string = 'User'
 
 param projectName string = 'ipm-workshop'
 param modelName string = 'gpt-4.1-mini'
@@ -38,6 +42,7 @@ module prerequisites 'infra/prerequisites-resources.bicep' = {
     location: location
     tags: tags
     principalId: principalId
+    principalType: principalType
     projectName: projectName
     modelName: modelName
     modelVersion: modelVersion

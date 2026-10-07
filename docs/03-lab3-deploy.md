@@ -66,6 +66,18 @@ az deployment sub create --subscription "$SUBSCRIPTION_ID" \
   --query properties.outputs
 ```
 
+以上指令假設你以**使用者**身分 `az login`（`principalType` 預設 `User`）。若在 CI 或以服務主體登入，
+`az ad signed-in-user show` 會失敗，且角色指派的 `principalType` 必須相符，否則部署會在角色指派步驟失敗。
+改用服務主體的 objectId（不是 appId／client ID），並在兩個指令的 `--parameters` 加上 `principalType=ServicePrincipal`：
+
+```bash
+PRINCIPAL_ID=$(az ad sp show --id "$AZURE_CLIENT_ID" --query id -o tsv)
+# 兩個 az deployment sub 指令的 --parameters 後面再加上：
+#   principalType=ServicePrincipal
+```
+
+以 Entra 群組授權時，`PRINCIPAL_ID` 改用群組 objectId，並傳入 `principalType=Group`。
+
 把輸出的 `AZURE_AI_PROJECT_ENDPOINT.value` 寫入不進版控的 `src/.env` 的 `FOUNDRY_PROJECT_ENDPOINT`，
 並將 `MODEL_DEPLOYMENT_NAME.value` 寫入 `MODEL_DEPLOYMENT_NAME`，再繼續下方的 azd 初始化與匯入步驟。
 範本預設 `gpt-4.1-mini`（`2025-04-14`）、Global Standard、50K TPM；

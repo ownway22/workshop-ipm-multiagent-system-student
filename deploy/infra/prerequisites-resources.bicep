@@ -3,6 +3,11 @@ targetScope = 'resourceGroup'
 param location string
 param tags object
 param principalId string
+
+@description('部署者的主體型別。互動式部署為 User，CI／服務主體為 ServicePrincipal，以群組授權時為 Group。')
+@allowed(['User', 'ServicePrincipal', 'Group'])
+param principalType string = 'User'
+
 param projectName string
 param modelName string
 param modelVersion string
@@ -76,7 +81,7 @@ resource projectManager 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: project
   properties: {
     principalId: principalId
-    principalType: 'User'
+    principalType: principalType
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', projectManagerRoleId)
   }
 }
