@@ -32,12 +32,12 @@ dependencies = [
 package = false
 
 [dependency-groups]
-# 單元測試只覆蓋資料契約、角色註冊表、題組與 preflight 的純函式；
+# 單元測試覆蓋資料契約、角色註冊表、題組、preflight 與 Responses/Handoff 續接；
 # agent 路由行為一律以 12 題題組重跑驗證，不模擬模型。
 dev = ["pytest==9.1.1"]
 
 [tool.pytest.ini_options]
-# 測試放在 repository 根目錄的 tests/，不納入公開交付的 repository。
+# 測試放在 repository 根目錄的 tests/。
 # 執行方式：cd src && uv run pytest
 testpaths = ["../tests/unit"]
 pythonpath = ["."]

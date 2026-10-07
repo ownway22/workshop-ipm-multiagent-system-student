@@ -9,6 +9,10 @@ src/.venv/
 .venv/
 
 # ── 機密 ──────────────────────────────────
+.copilot-azure/
+.azure/
+**/.azure/
+**/.handoff-checkpoints/
 # 環境設定一律由部署時注入（`deploy/agent.yaml` 的 `environment_variables`），MUST NOT 打包進映像。
 .env
 .env.*

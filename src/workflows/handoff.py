@@ -226,7 +226,40 @@ def build_degraded_reply_middleware(agent_name: str):
     return degraded_reply
 
 
-def build_participants(client, roles: dict[str, AgentRole]) -> dict[str, object]:
+def build_checkpoint_safe_middleware():
+    """Drop provider debug objects, not message/tool data, before persistence."""
+    from agent_framework import AgentResponse, AgentResponseUpdate, ResponseStream, agent_middleware
+
+    def clear_raw(response: AgentResponse | AgentResponseUpdate) -> None:
+        response.raw_representation = None
+        messages = response.messages if isinstance(response, AgentResponse) else [response]
+        for message in messages:
+            message.raw_representation = None
+            for content in message.contents:
+                content.raw_representation = None
+
+    @agent_middleware
+    async def checkpoint_safe(context, call_next):
+        await call_next()
+        if context.stream and isinstance(context.result, ResponseStream):
+            inner = context.result
+
+            async def updates():
+                async for update in inner:
+                    if isinstance(update, AgentResponseUpdate):
+                        clear_raw(update)
+                    yield update
+
+            context.result = ResponseStream(updates(), finalizer=AgentResponse.from_updates)
+        elif isinstance(context.result, AgentResponse):
+            clear_raw(context.result)
+
+    return checkpoint_safe
+
+
+def build_participants(
+    client, roles: dict[str, AgentRole], *, checkpoint_safe: bool = False
+) -> dict[str, object]:
     """依定義檔建構四個 Handoff 執行期參與者。
 
     `require_per_service_call_history_persistence=True` 是**必要**的：漏掉任何一個，
@@ -251,7 +284,10 @@ def build_participants(client, roles: dict[str, AgentRole]) -> dict[str, object]
             instructions=role.instructions,
             default_options=default_options or None,
             require_per_service_call_history_persistence=True,
-            middleware=[build_degraded_reply_middleware(role.agent_name)],
+            middleware=[
+                *([build_checkpoint_safe_middleware()] if checkpoint_safe else []),
+                build_degraded_reply_middleware(role.agent_name),
+            ],
         )
     return participants
 
@@ -335,6 +371,18 @@ def create_workflow(endpoint: str, model_deployment_name: str, credential):
     """
     client = _create_client(endpoint, model_deployment_name, credential)
     return build_workflow(build_participants(client, build_agent_roles()))
+
+
+def create_workflow_factory(endpoint: str, model_deployment_name: str, credential):
+    """Reuse one model client, but isolate executor state for every hosted turn."""
+    client = _create_client(endpoint, model_deployment_name, credential)
+
+    def factory():
+        return build_workflow(
+            build_participants(client, build_agent_roles(), checkpoint_safe=True)
+        )
+
+    return factory
 
 
 def _build_workflow_entity(
