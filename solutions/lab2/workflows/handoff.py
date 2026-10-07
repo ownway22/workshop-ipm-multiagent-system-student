@@ -226,7 +226,45 @@ def build_degraded_reply_middleware(agent_name: str):
     return degraded_reply
 
 
-def build_participants(client, roles: dict[str, AgentRole]) -> dict[str, object]:
+def build_checkpoint_safe_middleware():
+    """在寫進 checkpoint 前，清掉 SDK 附帶的 `raw_representation` 除錯物件。
+
+    `raw_representation` 是模型供應商的原始回應物件，不一定能序列化，留著可能讓 checkpoint
+    寫入失敗。這裡只清掉它，文字、工具呼叫與結構化結果都保留。
+    只用在 Responses 主機（`create_workflow_factory()`）；DevUI 的行為不變。
+    """
+    from agent_framework import AgentResponse, AgentResponseUpdate, ResponseStream, agent_middleware
+
+    def clear_raw(response: AgentResponse | AgentResponseUpdate) -> None:
+        response.raw_representation = None
+        messages = response.messages if isinstance(response, AgentResponse) else [response]
+        for message in messages:
+            message.raw_representation = None
+            for content in message.contents:
+                content.raw_representation = None
+
+    @agent_middleware
+    async def checkpoint_safe(context, call_next):
+        await call_next()
+        if context.stream and isinstance(context.result, ResponseStream):
+            inner = context.result
+
+            async def updates():
+                async for update in inner:
+                    if isinstance(update, AgentResponseUpdate):
+                        clear_raw(update)
+                    yield update
+
+            context.result = ResponseStream(updates(), finalizer=AgentResponse.from_updates)
+        elif isinstance(context.result, AgentResponse):
+            clear_raw(context.result)
+
+    return checkpoint_safe
+
+
+def build_participants(
+    client, roles: dict[str, AgentRole], *, checkpoint_safe: bool = False
+) -> dict[str, object]:
     """依定義檔建構四個 Handoff 執行期參與者。
 
     `require_per_service_call_history_persistence=True` 是**必要**的：漏掉任何一個，
@@ -251,7 +289,10 @@ def build_participants(client, roles: dict[str, AgentRole]) -> dict[str, object]
             instructions=role.instructions,
             default_options=default_options or None,
             require_per_service_call_history_persistence=True,
-            middleware=[build_degraded_reply_middleware(role.agent_name)],
+            middleware=[
+                *([build_checkpoint_safe_middleware()] if checkpoint_safe else []),
+                build_degraded_reply_middleware(role.agent_name),
+            ],
         )
     return participants
 
@@ -335,6 +376,23 @@ def create_workflow(endpoint: str, model_deployment_name: str, credential):
     """
     client = _create_client(endpoint, model_deployment_name, credential)
     return build_workflow(build_participants(client, build_agent_roles()))
+
+
+def create_workflow_factory(endpoint: str, model_deployment_name: str, credential):
+    """建立工作流工廠，給 `src/main.py` 的 Responses 模式使用。
+
+    聊天用戶端只建一次、共用；工作流則**每一輪重新建立**，讓不同使用者與不同對話的
+    executor 狀態互不干擾，也避免共用實例時撞上「Workflow is already running」。
+    建構工作流不發任何網路請求，所以每輪重建的成本很低。
+    """
+    client = _create_client(endpoint, model_deployment_name, credential)
+
+    def factory():
+        return build_workflow(
+            build_participants(client, build_agent_roles(), checkpoint_safe=True)
+        )
+
+    return factory
 
 
 def _build_workflow_entity(

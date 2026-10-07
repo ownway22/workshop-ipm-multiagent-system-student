@@ -171,12 +171,29 @@ Responses 端點，使用公開的 `response_handler` 與 `Workflow.run(response
 把「繼續」等文字交回正在等待的 Handoff 請求，而不是要求 Playground 傳送工具回傳值。
 
 每輪重新建立工作流，並依使用者與 conversation 還原 checkpoint；不共用上一輪的 executor
-記憶體狀態。checkpoint 僅額外允許 Handoff 請求、`list[Message]` 型別描述與 Azure role enum，
-不關閉反序列化限制。本機 checkpoint 位於忽略版控的 `.handoff-checkpoints/`。
-託管時寫入 `$HOME/.handoff-checkpoints/`，讓 session 停止後仍能還原；容器根目錄不是
-持久儲存。保存前移除 SDK 的 `raw_representation` 除錯物件，保留文字、工具資料與結構化
-結果；若最後一輪 checkpoint 無法保存，回傳失敗而非假裝可以繼續對話。
-這個端點接受文字訊息；程式碼與架構材料請直接貼成文字，不使用附件或外部工具回傳值。
+記憶體狀態，不同對話也不必互相排隊（同一個 conversation 的追問才會依序處理）。
+checkpoint 僅額外允許 Handoff 請求、`list[Message]` 型別描述與 Azure role enum，
+不關閉反序列化限制。保存前移除 SDK 的 `raw_representation` 除錯物件，保留文字、
+工具資料與結構化結果；若最後一輪 checkpoint 無法保存，回傳失敗而非假裝可以繼續對話。
+
+checkpoint 存在哪裡、留多久：
+
+| 環境 | 位置                             | 保留期限                                            |
+| ---- | -------------------------------- | --------------------------------------------------- |
+| 本機 | `src/.handoff-checkpoints/`      | 直到你手動刪除（已排除於版控與容器映像）            |
+| 託管 | `$HOME/.handoff-checkpoints/`    | 跟著 session，最長 30 天；容器根目錄不是持久儲存    |
+
+每一輪只保留最後一份 checkpoint，續接時只讀這一份，不會隨對話變長而變慢。
+檔案內含完整對話內容，請當成機密資料看待。
+
+> ⚠️ **用 `previous_response_id` 續接時，託管環境必須一併帶上同一個 `agent_session_id`。**
+> 沒帶的話，平台會把請求分到新的 sandbox，看不到上一輪的 checkpoint，回應會以
+> `invalid_prompt` 失敗。改用 `conversation` 則會自動綁定同一個 session，不必另外處理。
+> 來源：[Manage hosted agent sessions](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/manage-hosted-sessions)
+
+這個端點只接受文字訊息；程式碼與架構材料請直接貼成文字，不使用附件或外部工具回傳值。
+輸入有問題（空白訊息、附件、找不到可續接的 checkpoint）時，回應狀態為 `failed`、
+error code 為 `invalid_prompt`，訊息會說明原因；其他錯誤一律是 `server_error`，細節只寫在 log。
 
 ---
 

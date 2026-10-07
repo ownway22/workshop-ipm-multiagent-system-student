@@ -227,7 +227,12 @@ def build_degraded_reply_middleware(agent_name: str):
 
 
 def build_checkpoint_safe_middleware():
-    """Drop provider debug objects, not message/tool data, before persistence."""
+    """在寫進 checkpoint 前，清掉 SDK 附帶的 `raw_representation` 除錯物件。
+
+    `raw_representation` 是模型供應商的原始回應物件，不一定能序列化，留著可能讓 checkpoint
+    寫入失敗。這裡只清掉它，文字、工具呼叫與結構化結果都保留。
+    只用在 Responses 主機（`create_workflow_factory()`）；DevUI 的行為不變。
+    """
     from agent_framework import AgentResponse, AgentResponseUpdate, ResponseStream, agent_middleware
 
     def clear_raw(response: AgentResponse | AgentResponseUpdate) -> None:
@@ -374,7 +379,12 @@ def create_workflow(endpoint: str, model_deployment_name: str, credential):
 
 
 def create_workflow_factory(endpoint: str, model_deployment_name: str, credential):
-    """Reuse one model client, but isolate executor state for every hosted turn."""
+    """建立工作流工廠，給 `src/main.py` 的 Responses 模式使用。
+
+    聊天用戶端只建一次、共用；工作流則**每一輪重新建立**，讓不同使用者與不同對話的
+    executor 狀態互不干擾，也避免共用實例時撞上「Workflow is already running」。
+    建構工作流不發任何網路請求，所以每輪重建的成本很低。
+    """
     client = _create_client(endpoint, model_deployment_name, credential)
 
     def factory():

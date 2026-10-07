@@ -1,6 +1,7 @@
 import asyncio
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,7 +21,7 @@ from agent_framework import (
 from agent_framework.orchestrations import HandoffAgentUserRequest
 from azure.ai.agentserver.responses.models import CreateResponse, ItemMessage
 
-from workflows.responses import HandoffResponsesHost
+from workflows.responses import HandoffRequestError, HandoffResponsesHost
 from workflows.handoff import build_checkpoint_safe_middleware
 
 
@@ -48,7 +49,7 @@ def workflow():
     ).build()
 
 
-def context(text, conversation="conversation-a", user="user-a", response="resp_test"):
+def context(text, conversation="conversation-a", user="user-a", response=None):
     async def get_input_items():
         return [ItemMessage(role="user", content=text)]
 
@@ -59,7 +60,8 @@ def context(text, conversation="conversation-a", user="user-a", response="resp_t
         get_input_items=get_input_items,
         get_history=get_history,
         conversation_id=conversation,
-        response_id=response,
+        # 與實際平台一致：每一輪都有不同的 response_id。
+        response_id=response or f"resp_{uuid.uuid4().hex}",
         platform_context=SimpleNamespace(user_id_key=user, call_id="test-call"),
     )
 
@@ -111,12 +113,65 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_missing_previous_response_fails(self):
-        with self.assertRaisesRegex(ValueError, "no Handoff checkpoint"):
+        with self.assertRaisesRegex(HandoffRequestError, "previous_response_id"):
             await self.turn("continue", previous="resp_missing", conversation=None)
 
     async def test_empty_input_fails(self):
-        with self.assertRaisesRegex(ValueError, "nonempty"):
+        with self.assertRaisesRegex(HandoffRequestError, "非空白"):
             await self.turn(" ")
+
+    async def test_previous_response_after_conversation_turn(self):
+        # 前一輪用 conversation 送出，下一輪改用 previous_response_id 也要接得上。
+        await self.turn("first", conversation="conversation-x", response="resp_conv_1")
+        self.assertEqual(
+            await self.turn("second", previous="resp_conv_1", conversation=None),
+            "first -> second",
+        )
+
+    async def test_each_turn_keeps_only_latest_checkpoint(self):
+        for text in ("first", "second", "third"):
+            await self.turn(text)
+        response_dirs = list(self.root.glob("*/responses/*"))
+        self.assertEqual(len(response_dirs), 3)
+        for directory in response_dirs:
+            self.assertEqual(len(list(directory.glob("*.json"))), 1, directory)
+
+    async def test_other_conversations_are_not_blocked(self):
+        key = self.host._lock_key("user-a", "conversation-a")
+        lock = self.host._lock(key)
+        async with lock:
+            # conversation-a 被佔住時，conversation-b 仍應立即完成。
+            result = await asyncio.wait_for(
+                self.turn("independent", conversation="conversation-b"), timeout=10
+            )
+        self.assertEqual(result, "independent")
+
+    async def test_invalid_input_reports_reason_not_server_error(self):
+        events = [
+            event.as_dict()
+            async for event in self.host._respond(
+                CreateResponse(input=" ", stream=True), context(" "), asyncio.Event()
+            )
+        ]
+        self.assertEqual(events[-1]["type"], "response.failed")
+        error = events[-1]["response"]["error"]
+        self.assertEqual(error["code"], "invalid_prompt")
+        self.assertIn("非空白", error["message"])
+
+    async def test_server_errors_stay_generic(self):
+        def broken_factory():
+            raise RuntimeError("secret internal detail")
+
+        host = HandoffResponsesHost(broken_factory, checkpoint_root=self.root)
+        events = [
+            event.as_dict()
+            async for event in host._respond(
+                CreateResponse(input="hello", stream=True), context("hello"), asyncio.Event()
+            )
+        ]
+        error = events[-1]["response"]["error"]
+        self.assertEqual(error["code"], "server_error")
+        self.assertNotIn("secret", error["message"])
 
     async def test_provider_raw_objects_are_not_retained(self):
         import pickle
