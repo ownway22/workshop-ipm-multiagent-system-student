@@ -80,9 +80,17 @@ PRINCIPAL_ID=$(az ad sp show --id "$AZURE_CLIENT_ID" --query id -o tsv)
 
 把輸出的 `AZURE_AI_PROJECT_ENDPOINT.value` 寫入不進版控的 `src/.env` 的 `FOUNDRY_PROJECT_ENDPOINT`，
 並將 `MODEL_DEPLOYMENT_NAME.value` 寫入 `MODEL_DEPLOYMENT_NAME`，再繼續下方的 azd 初始化與匯入步驟。
-範本預設 `gpt-4.1-mini`（`2025-04-14`）、Global Standard、50K TPM；
-Global Standard 推論不保證留在資源所在區域。可用範本參數指定已確認支援的模型、
-版本與容量；不要只改模型名稱而未檢查版本與配額。
+
+範本預設 `gpt-5.4-mini`（`2026-03-17`）、Global Standard、50K TPM，與 Lab 0／Lab 1 建議的模型一致；
+Global Standard 推論不保證留在資源所在區域。可用範本參數 `modelName`、`modelVersion`、`modelCapacity`
+指定已確認支援的模型、版本與容量；不要只改模型名稱而未檢查版本與配額。
+用下列唯讀指令查詢該區域支援的版本與 SKU（須包含 `GlobalStandard`），並對照 Microsoft Learn 的
+Model retirement schedule 避開已 Deprecated 的版本：
+
+```bash
+az cognitiveservices model list -l "$LOCATION" \
+  --query "[?model.name=='gpt-5.4-mini'].{version:model.version, skus:model.skus[].name}" -o json
+```
 
 此路徑停用 Foundry 金鑰驗證，以 Entra 身分存取公開端點。
 Log Analytics 每日收集上限設定為 0.1 GB；這**不是整體 Azure 費用上限**，

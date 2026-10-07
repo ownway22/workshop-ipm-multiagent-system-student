@@ -18,8 +18,13 @@ param principalId string
 param principalType string = 'User'
 
 param projectName string = 'ipm-workshop'
-param modelName string = 'gpt-4.1-mini'
-param modelVersion string = '2025-04-14'
+// 與 Lab 0／Lab 1 及 preflight 建議的模型一致。版本依 Microsoft Learn「Foundry Models sold by Azure」
+// 與「Model retirement schedule」查證：gpt-5.4-mini 2026-03-17 為 GA。改用其他模型時須一併確認版本與 SKU。
+@description('模型名稱，同時作為部署名稱（MODEL_DEPLOYMENT_NAME）。')
+param modelName string = 'gpt-5.4-mini'
+
+@description('模型版本。可用 az cognitiveservices model list -l <location> 查詢該區域支援的版本與 SKU。')
+param modelVersion string = '2026-03-17'
 
 @minValue(1)
 param modelCapacity int = 50
