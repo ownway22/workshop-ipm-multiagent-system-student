@@ -36,6 +36,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import shutil
 import uuid
 import weakref
 from collections.abc import AsyncIterator, Callable
@@ -234,6 +235,7 @@ class HandoffResponsesHost(ResponsesAgentServerHost):
         async with self._lock(lock_key):
             workflow = self._workflow_factory()
             checkpoint = None
+            write_dir = self._response_dir(user_id, context.response_id)
             restore_dir = await self._restore_dir(request, context, user_id)
             if restore_dir is not None:
                 checkpoint = await self._latest_checkpoint(restore_dir)
@@ -245,9 +247,15 @@ class HandoffResponsesHost(ResponsesAgentServerHost):
                     raise HandoffRequestError(
                         "這段對話的 checkpoint 屬於其他工作流，無法續接。請開新的 conversation。"
                     )
+                # 還原本身也會寫出一份 checkpoint。先把前一輪的 checkpoint 複製到這一輪的目錄
+                # 再從這裡還原，前一輪的目錄因此維持唯讀：從同一個 response 分岔的請求
+                # 互不干擾，也不會改寫歷史。
+                write_dir.mkdir(parents=True, exist_ok=True)
+                file_name = f"{checkpoint.checkpoint_id}.json"
+                shutil.copyfile(restore_dir / file_name, write_dir / file_name)
                 await workflow.run(
                     checkpoint_id=checkpoint.checkpoint_id,
-                    checkpoint_storage=self._storage(restore_dir),
+                    checkpoint_storage=self._storage(write_dir),
                 )
 
             responses = None
@@ -264,7 +272,6 @@ class HandoffResponsesHost(ResponsesAgentServerHost):
 
             produced_text = False
             pending_request_id = None
-            write_dir = self._response_dir(user_id, context.response_id)
             async for event in workflow.run(
                 message=messages if responses is None else None,
                 responses=responses,

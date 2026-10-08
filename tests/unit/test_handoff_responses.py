@@ -136,6 +136,19 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         for directory in response_dirs:
             self.assertEqual(len(list(directory.glob("*.json"))), 1, directory)
 
+    async def test_forks_from_same_response_leave_it_untouched(self):
+        await self.turn("root", conversation=None, response="resp_root")
+        root_dir = next(self.root.glob("*/responses/*"))
+        before = {path.name: path.read_bytes() for path in root_dir.glob("*.json")}
+        self.assertEqual(
+            await self.turn("left", previous="resp_root", conversation=None), "root -> left"
+        )
+        self.assertEqual(
+            await self.turn("right", previous="resp_root", conversation=None), "root -> right"
+        )
+        after = {path.name: path.read_bytes() for path in root_dir.glob("*.json")}
+        self.assertEqual(before, after)
+
     async def test_other_conversations_are_not_blocked(self):
         key = self.host._lock_key("user-a", "conversation-a")
         lock = self.host._lock(key)
