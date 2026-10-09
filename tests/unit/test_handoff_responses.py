@@ -1,17 +1,25 @@
 import asyncio
+import json
 import tempfile
 import unittest
 import uuid
+from collections.abc import Awaitable, Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Never
+from typing import Any, Never
 
 from httpx import ASGITransport, AsyncClient
 from agent_framework import (
     AgentResponse,
     AgentResponseUpdate,
+    BaseChatClient,
+    ChatMiddlewareLayer,
+    ChatResponse,
+    ChatResponseUpdate,
     Content,
     Executor,
+    FunctionInvocationLayer,
+    FunctionTool,
     Message,
     ResponseStream,
     WorkflowBuilder,
@@ -20,7 +28,7 @@ from agent_framework import (
     handler,
     response_handler,
 )
-from agent_framework.orchestrations import HandoffAgentUserRequest, HandoffSentEvent
+from agent_framework.orchestrations import HandoffAgentUserRequest, HandoffBuilder, HandoffSentEvent
 from azure.ai.agentserver.responses.models import CreateResponse, ItemMessage
 
 from workflows.responses import HandoffRequestError, HandoffResponsesHost
@@ -96,6 +104,68 @@ def logging_workflow(*, intermediate=False):
         output_from=[] if intermediate else [executor],
         intermediate_output_from=[executor] if intermediate else [],
     ).build()
+
+
+class ScriptedHandoffClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatClient):
+    """Replace only the model; framework middleware still handles the handoff tools."""
+
+    def __init__(
+        self, name: str, script: Sequence[tuple[tuple[str, ...], str | None]]
+    ) -> None:
+        super().__init__()
+        self.name = name
+        self.script = list(script)
+        self.calls = 0
+
+    def _inner_get_response(
+        self,
+        *,
+        messages: Sequence[Message],
+        stream: bool,
+        options: Mapping[str, Any],
+        **kwargs: Any,
+    ) -> Awaitable[ChatResponse] | ResponseStream[ChatResponseUpdate, ChatResponse]:
+        if self.calls >= len(self.script):
+            raise AssertionError(f"Unexpected model call for {self.name}")
+        chunks, target = self.script[self.calls]
+        self.calls += 1
+        message_id = f"{self.name}-{self.calls}"
+        updates = [
+            ChatResponseUpdate(
+                contents=[Content.from_text(text)],
+                role="assistant",
+                author_name=self.name,
+                message_id=message_id,
+            )
+            for text in chunks
+        ]
+        if target is not None:
+            tool_name = f"handoff_to_{target}"
+            if not any(
+                isinstance(tool, FunctionTool) and tool.name == tool_name
+                for tool in options.get("tools", [])
+            ):
+                raise AssertionError(f"Framework did not inject {tool_name}")
+            updates.append(ChatResponseUpdate(
+                contents=[Content.from_function_call(
+                    call_id=message_id, name=tool_name, arguments={}
+                )],
+                role="assistant",
+                author_name=self.name,
+                message_id=message_id,
+            ))
+
+        async def generate():
+            for update in updates:
+                yield update
+
+        if stream:
+            return ResponseStream(generate(), finalizer=ChatResponse.from_updates)
+
+        async def complete():
+            return ChatResponse.from_updates(updates)
+
+        return complete()
 
 
 def context(text, conversation="conversation-a", user="user-a", response=None):
@@ -434,6 +504,129 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("code reviewed -> no, go ahead", second.text)
             self.assertIn("response.completed", second.text)
             self.assertNotIn("response.failed", second.text)
+
+    async def test_http_preserves_real_handoff_specialist_text(self):
+        primary_name = "qvn-primary-agent"
+        coding_name = "qvn-coding-agent"
+        preface = "<<<PRIMARY_PREFACE>>>\n"
+        summary = "<<<PRIMARY_SUMMARY>>>\nSummary: offline fixture reviewed.\n"
+        coding_text = (
+            "<<<CODING_BEGIN_OUTPUT_CONTRACT>>>\n"
+            "Synthetic specialist review.\n"
+            '{"category":"code","summary":"offline fixture"}\n'
+            "```python\n"
+            'value = {"fixture": True}\n'
+            "```\n"
+            "<<<CODING_END_OUTPUT_CONTRACT>>>\n"
+        )
+        coding_chunks = (
+            "<<<CODING_BEGIN_OUTPUT_CONTRACT>>>\nSynthetic specialist review.\n",
+            '{"category":"code",',
+            '"summary":"offline fixture"}\n```py',
+            'thon\nvalue = {"fixture": True}\n',
+            "```\n<<<CODING_END_OUTPUT_CONTRACT>>>\n",
+        )
+        expected_text = preface + coding_text + summary
+        clients: list[tuple[ScriptedHandoffClient, ScriptedHandoffClient]] = []
+
+        def factory():
+            primary_client = ScriptedHandoffClient(
+                primary_name, [((preface,), coding_name), ((summary,), None)]
+            )
+            coding_client = ScriptedHandoffClient(
+                coding_name, [(coding_chunks, primary_name)]
+            )
+            clients.append((primary_client, coding_client))
+            primary = primary_client.as_agent(
+                name=primary_name, id=primary_name,
+                require_per_service_call_history_persistence=True,
+            )
+            coding = coding_client.as_agent(
+                name=coding_name, id=coding_name,
+                require_per_service_call_history_persistence=True,
+            )
+            return (
+                HandoffBuilder(name="offline-output-contract")
+                .participants([primary, coding])
+                .with_start_agent(primary)
+                .add_handoff(primary, [coding])
+                .add_handoff(coding, [primary])
+                .build()
+            )
+
+        for stream in (True, False):
+            with self.subTest(stream=stream):
+                host = HandoffResponsesHost(
+                    factory,
+                    checkpoint_root=self.root / f"output-contract-{stream}",
+                    configure_observability=None,
+                )
+                async with AsyncClient(
+                    transport=ASGITransport(app=host), base_url="http://localhost"
+                ) as client:
+                    with self.assertLogs("workflows.responses", level="INFO") as captured:
+                        response = await client.post(
+                            "/responses",
+                            json={
+                                "input": "Synthetic output-contract fixture input.",
+                                "conversation": f"conv_offline_contract_{stream}",
+                                "stream": stream,
+                            },
+                        )
+                self.assertEqual(response.status_code, 200, response.text)
+                transitions = [
+                    record.args for record in captured.records
+                    if record.msg == "Handoff transition: source=%s target=%s"
+                ]
+                self.assertEqual(transitions, [
+                    (primary_name, coding_name), (coding_name, primary_name)
+                ])
+                waiting = [
+                    record.args[0] for record in captured.records
+                    if record.msg == "Handoff waiting for user input: source=%s request_id=%s"
+                ]
+                self.assertEqual(waiting, [primary_name])
+                primary_client, coding_client = clients[-1]
+                self.assertEqual((primary_client.calls, coding_client.calls), (2, 1))
+
+                if stream:
+                    events = [
+                        json.loads(line.removeprefix("data: "))
+                        for line in response.text.splitlines() if line.startswith("data: {")
+                    ]
+                    self.assertFalse(any(
+                        event["type"] == "response.failed" for event in events
+                    ))
+                    self.assertEqual(events[-1]["type"], "response.completed")
+                    deltas = "".join(
+                        event["delta"] for event in events
+                        if event["type"] == "response.output_text.delta"
+                    )
+                    done = "".join(
+                        event["text"] for event in events
+                        if event["type"] == "response.output_text.done"
+                    )
+                    self.assertEqual(deltas, expected_text)
+                    self.assertEqual(done, deltas)
+                    payload = events[-1]["response"]
+                else:
+                    payload = response.json()
+
+                self.assertEqual(payload["status"], "completed")
+                self.assertIsNone(payload.get("error"))
+                actual_text = "".join(
+                    part["text"]
+                    for item in payload["output"] if item["type"] == "message"
+                    for part in item["content"] if part["type"] == "output_text"
+                )
+                self.assertEqual(actual_text, expected_text)
+                self.assertEqual(actual_text.count(coding_text), 1)
+                self.assertEqual(actual_text.count("<<<CODING_BEGIN_OUTPUT_CONTRACT>>>"), 1)
+                self.assertEqual(actual_text.count("<<<CODING_END_OUTPUT_CONTRACT>>>"), 1)
+
+        self.assertEqual(len(clients), 2)
+        self.assertIsNot(clients[0][0], clients[1][0])
+        self.assertIsNot(clients[0][1], clients[1][1])
 
 
 if __name__ == "__main__":
