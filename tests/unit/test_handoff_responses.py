@@ -4,6 +4,7 @@ import unittest
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Never
 
 from httpx import ASGITransport, AsyncClient
 from agent_framework import (
@@ -15,10 +16,11 @@ from agent_framework import (
     ResponseStream,
     WorkflowBuilder,
     WorkflowContext,
+    WorkflowEvent,
     handler,
     response_handler,
 )
-from agent_framework.orchestrations import HandoffAgentUserRequest
+from agent_framework.orchestrations import HandoffAgentUserRequest, HandoffSentEvent
 from azure.ai.agentserver.responses.models import CreateResponse, ItemMessage
 
 from workflows.responses import HandoffRequestError, HandoffResponsesHost
@@ -46,6 +48,53 @@ class Confirmation(Executor):
 def workflow():
     return WorkflowBuilder(
         name="confirmation-test", start_executor=Confirmation(id="confirm")
+    ).build()
+
+
+class LoggedConfirmation(Confirmation):
+    @handler
+    async def start(
+        self,
+        messages: list[Message],
+        ctx: WorkflowContext[Never, AgentResponseUpdate | AgentResponse | dict[str, str]],
+    ) -> None:
+        await ctx.add_event(WorkflowEvent(
+            "handoff_sent",
+            data=HandoffSentEvent(source="qvn-primary-agent", target="qvn-coding-agent"),
+        ))
+        await ctx.add_event(WorkflowEvent(
+            "handoff_sent", data={"source": messages[0].text, "token": "private-token"}
+        ))
+        await ctx.yield_output({"body": "private-unrecognized-output"})
+        for text in ("private-coding-first", "private-coding-second"):
+            await ctx.yield_output(AgentResponseUpdate(
+                contents=[Content.from_text(text)],
+                role="assistant",
+                author_name="qvn-coding-agent",
+                agent_id="ignored-stream-agent",
+                response_id="private-provider-response",
+            ))
+        await ctx.add_event(WorkflowEvent(
+            "handoff_sent",
+            data=HandoffSentEvent(source="qvn-coding-agent", target="qvn-primary-agent"),
+        ))
+        reply = AgentResponse(
+            messages=[Message(
+                "assistant", ["private-primary-summary"], author_name="ignored-message-author"
+            )],
+            agent_id="qvn-primary-agent",
+        )
+        await ctx.yield_output(reply)
+        await ctx.request_info(HandoffAgentUserRequest(reply), list[Message])
+
+
+def logging_workflow(*, intermediate=False):
+    executor = LoggedConfirmation(id="logged-confirm")
+    return WorkflowBuilder(
+        name="logging-test",
+        start_executor=executor,
+        output_from=[] if intermediate else [executor],
+        intermediate_output_from=[executor] if intermediate else [],
     ).build()
 
 
@@ -82,6 +131,121 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                 request, context(text, **kwargs), asyncio.Event()
             )
         ])
+
+    def test_handoff_log_source_priority(self):
+        cases = (
+            (AgentResponseUpdate(author_name="author", agent_id="agent"), "author"),
+            (AgentResponseUpdate(author_name="", agent_id="agent"), "agent"),
+            (AgentResponseUpdate(), "unknown"),
+            (AgentResponse(
+                agent_id="agent",
+                messages=[Message("assistant", ["private-body"], author_name="author")],
+            ), "agent"),
+            (AgentResponse(messages=[
+                Message("assistant", ["private-body"]),
+                Message("assistant", ["private-body"], author_name=""),
+                Message("assistant", ["private-body"], author_name="first-author"),
+                Message("assistant", ["private-body"], author_name="second-author"),
+            ]), "first-author"),
+            (AgentResponse(), "unknown"),
+            (Message("assistant", ["private-body"], author_name="author"), "author"),
+            (Message("assistant", ["private-body"]), "unknown"),
+            ({"body": "private-body"}, "unknown"),
+        )
+        for data, expected in cases:
+            with self.subTest(data_type=type(data).__name__, expected=expected):
+                self.assertEqual(self.host._event_source(data), expected)
+
+    async def test_handoff_logs_are_metadata_only_for_output_and_intermediate(self):
+        for intermediate in (False, True):
+            with self.subTest(intermediate=intermediate):
+                host = HandoffResponsesHost(
+                    lambda: logging_workflow(intermediate=intermediate),
+                    checkpoint_root=self.root,
+                )
+                with self.assertLogs("workflows.responses", level="INFO") as captured:
+                    result = await self.turn(
+                        "private-input-body",
+                        host=host,
+                        conversation=f"private-conversation-{intermediate}",
+                        user="private-user",
+                        response=f"private-response-{intermediate}",
+                    )
+                self.assertEqual(
+                    result, "private-coding-firstprivate-coding-secondprivate-primary-summary"
+                )
+                messages = [record.getMessage() for record in captured.records]
+                self.assertEqual(messages[:4], [
+                    "Handoff transition: source=qvn-primary-agent target=qvn-coding-agent",
+                    "Handoff output: source=qvn-coding-agent",
+                    "Handoff transition: source=qvn-coding-agent target=qvn-primary-agent",
+                    "Handoff output: source=qvn-primary-agent",
+                ])
+                self.assertEqual(len(messages), 5)
+                waiting = captured.records[-1]
+                self.assertEqual(
+                    waiting.msg, "Handoff waiting for user input: source=%s request_id=%s"
+                )
+                checkpoint = await host._latest_checkpoint(
+                    host._response_dir("private-user", f"private-response-{intermediate}")
+                )
+                self.assertIsNotNone(checkpoint)
+                self.assertEqual(
+                    waiting.args,
+                    ("qvn-primary-agent", next(iter(checkpoint.pending_request_info_events))),
+                )
+                self.assertTrue(all(record.levelname == "INFO" for record in captured.records))
+                for forbidden in (
+                    "private-input-body", "private-coding-first", "private-coding-second",
+                    "private-primary-summary", "private-unrecognized-output", "private-token",
+                    "private-provider-response", "private-user", "private-conversation",
+                    "private-response", str(self.root), ".handoff-checkpoints",
+                ):
+                    self.assertNotIn(forbidden, "\n".join(messages))
+
+    async def test_streaming_output_is_logged_once_per_source_per_turn(self):
+        host = HandoffResponsesHost(logging_workflow, checkpoint_root=self.root)
+        with self.assertLogs("workflows.responses", level="INFO") as captured:
+            for conversation in ("first-turn", "second-turn"):
+                await self.turn("private-input-body", host=host, conversation=conversation)
+        messages = [record.getMessage() for record in captured.records]
+        self.assertEqual(messages.count("Handoff output: source=qvn-coding-agent"), 2)
+        self.assertEqual(messages.count("Handoff output: source=qvn-primary-agent"), 2)
+
+    async def test_unattributed_output_and_waiting_log_unknown(self):
+        with self.assertLogs("workflows.responses", level="INFO") as captured:
+            self.assertEqual(await self.turn("private-input-body"), "private-input-body")
+        self.assertEqual(captured.records[0].getMessage(), "Handoff output: source=unknown")
+        self.assertEqual(captured.records[-1].args[0], "unknown")
+        self.assertNotIn("private-input-body", "\n".join(captured.output))
+
+    async def test_logging_keeps_responses_event_order_and_text(self):
+        host = HandoffResponsesHost(logging_workflow, checkpoint_root=self.root)
+        payloads = [
+            event.as_dict()
+            async for event in host._respond(
+                CreateResponse(input="private-input-body", stream=True),
+                context("private-input-body"),
+                asyncio.Event(),
+            )
+        ]
+        self.assertEqual([payload["type"] for payload in payloads], [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.output_text.delta",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+            "response.completed",
+        ])
+        self.assertEqual(
+            payloads[-1]["response"]["output"][0]["content"][0]["text"],
+            "private-coding-firstprivate-coding-secondprivate-primary-summary",
+        )
 
     async def test_plain_text_resumes_after_host_recreation(self):
         self.assertEqual(await self.turn("review architecture next"), "review architecture next")

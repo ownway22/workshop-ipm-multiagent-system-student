@@ -12,6 +12,9 @@
 本模組改用 `ResponsesAgentServerHost` 的公開 `response_handler` 接口：每一輪重新建立
 工作流、從 checkpoint 還原，再把使用者的文字交回正在等待的 `HandoffAgentUserRequest`。
 
+INFO log 只記錄交接 source／target、每輪各來源的首次 output 與等待請求，
+不記錄訊息本文或對話識別資料。
+
 ## checkpoint 的存放方式
 
 ```text
@@ -51,7 +54,7 @@ from agent_framework import (
     Workflow,
     WorkflowCheckpoint,
 )
-from agent_framework.orchestrations import HandoffAgentUserRequest
+from agent_framework.orchestrations import HandoffAgentUserRequest, HandoffSentEvent
 from azure.ai.agentserver.responses import ResponseContext, ResponseEventStream
 from azure.ai.agentserver.responses.hosting import ResponsesAgentServerHost
 from azure.ai.agentserver.responses.models import (
@@ -199,6 +202,19 @@ class HandoffResponsesHost(ResponsesAgentServerHost):
 
     # ── 請求處理 ───────────────────────────────────────────
 
+    @staticmethod
+    def _event_source(data: object) -> str:
+        if isinstance(data, AgentResponseUpdate):
+            return data.author_name or data.agent_id or "unknown"
+        if isinstance(data, AgentResponse):
+            return data.agent_id or next(
+                (message.author_name for message in data.messages if message.author_name),
+                "unknown",
+            )
+        if isinstance(data, Message):
+            return data.author_name or "unknown"
+        return "unknown"
+
     async def _input_messages(self, context: ResponseContext) -> list[Message]:
         messages = []
         for item in await context.get_input_items():
@@ -272,6 +288,7 @@ class HandoffResponsesHost(ResponsesAgentServerHost):
 
             produced_text = False
             pending_request_id = None
+            logged_sources: set[str] = set()
             async for event in workflow.run(
                 message=messages if responses is None else None,
                 responses=responses,
@@ -283,17 +300,32 @@ class HandoffResponsesHost(ResponsesAgentServerHost):
                 if event.type in ("output", "intermediate"):
                     data = event.data
                     if isinstance(data, (AgentResponseUpdate, AgentResponse, Message)):
+                        source = self._event_source(data)
+                        if source not in logged_sources:
+                            logger.info("Handoff output: source=%s", source)
+                            logged_sources.add(source)
                         if data.text:
                             produced_text = True
                             yield data.text
                     elif isinstance(data, str):
                         produced_text = produced_text or bool(data)
                         yield data
+                elif event.type == "handoff_sent" and isinstance(event.data, HandoffSentEvent):
+                    logger.info(
+                        "Handoff transition: source=%s target=%s",
+                        event.data.source,
+                        event.data.target,
+                    )
                 elif event.type == "error":
                     raise RuntimeError(f"Handoff workflow failed: {event.data}")
                 elif event.type == "request_info":
                     if not isinstance(event.data, HandoffAgentUserRequest):
                         raise RuntimeError("此端點只支援 Handoff 的使用者請求。")
+                    logger.info(
+                        "Handoff waiting for user input: source=%s request_id=%s",
+                        self._event_source(event.data.agent_response),
+                        event.request_id,
+                    )
                     pending_request_id = event.request_id
             if not produced_text:
                 raise RuntimeError("Handoff workflow 沒有產生任何回覆文字。")
