@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Never
+from unittest.mock import patch
 
 from httpx import ASGITransport, AsyncClient
 from agent_framework import (
@@ -25,14 +26,24 @@ from agent_framework import (
     WorkflowBuilder,
     WorkflowContext,
     WorkflowEvent,
+    agent_middleware,
+    chat_middleware,
+    function_middleware,
     handler,
     response_handler,
 )
 from agent_framework.orchestrations import HandoffAgentUserRequest, HandoffBuilder, HandoffSentEvent
 from azure.ai.agentserver.responses.models import CreateResponse, ItemMessage
 
+from agents import build_agent_roles
+from models.specialist_review import SpecialistReview
 from workflows.responses import HandoffRequestError, HandoffResponsesHost
-from workflows.handoff import build_checkpoint_safe_middleware
+from workflows.handoff import (
+    HandoffRoutingError,
+    build_checkpoint_safe_middleware,
+    build_participants,
+    build_workflow,
+)
 
 
 class Confirmation(Executor):
@@ -116,6 +127,10 @@ class ScriptedHandoffClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseCh
         self.name = name
         self.script = list(script)
         self.calls = 0
+        self.requests = []
+        self.options_seen = []
+        self.finalized_responses = []
+        self.hook_counts = {"finalizer": 0, "transform": 0, "result": 0, "cleanup": 0}
 
     def _inner_get_response(
         self,
@@ -129,6 +144,8 @@ class ScriptedHandoffClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseCh
             raise AssertionError(f"Unexpected model call for {self.name}")
         chunks, target = self.script[self.calls]
         self.calls += 1
+        self.requests.append([message.to_dict() for message in messages])
+        self.options_seen.append(dict(options))
         message_id = f"{self.name}-{self.calls}"
         updates = [
             ChatResponseUpdate(
@@ -159,13 +176,119 @@ class ScriptedHandoffClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseCh
             for update in updates:
                 yield update
 
+        def finalize(items):
+            self.hook_counts["finalizer"] += 1
+            response = ChatResponse.from_updates(
+                items, output_format_type=options.get("response_format")
+            )
+            response.additional_properties["synthetic_finalizer"] = self.name
+            self.finalized_responses.append(response)
+            return response
+
+        def transform(update):
+            self.hook_counts["transform"] += 1
+            return update
+
+        def result_hook(response):
+            self.hook_counts["result"] += 1
+            response.additional_properties["synthetic_result_hook"] = True
+            return response
+
+        def cleanup():
+            self.hook_counts["cleanup"] += 1
+
+        if stream:
+            return (
+                ResponseStream(generate(), finalizer=finalize)
+                .with_transform_hook(transform)
+                .with_result_hook(result_hook)
+                .with_cleanup_hook(cleanup)
+            )
+
+        async def complete():
+            return finalize(updates)
+
+        return complete()
+
+
+class ScriptedRoleClients:
+    def __init__(self, scripts, *, client_factory=None, middleware_factory=None):
+        self.scripts = scripts
+        self.clients = {}
+        self.agents = {}
+        self.client_factory = client_factory or ScriptedHandoffClient
+        self.middleware_factory = middleware_factory
+
+    def as_agent(self, **options):
+        name = options["name"]
+        client = self.client_factory(name, self.scripts.get(name, []))
+        self.clients[name] = client
+        if self.middleware_factory is not None:
+            options = dict(options)
+            options["middleware"] = [
+                *self.middleware_factory(name), *options.get("middleware", []),
+            ]
+        agent = client.as_agent(**options)
+        self.agents[name] = agent
+        return agent
+
+
+class FaultHandoffClient(ScriptedHandoffClient):
+    def __init__(self, name, script, fault):
+        super().__init__(name, script)
+        self.fault = fault
+
+    def _inner_get_response(self, *, messages, stream, options, **kwargs):
+        self.calls += 1
+        tool = next(item for item in options["tools"] if isinstance(item, FunctionTool))
+        if self.fault == "empty":
+            contents = []
+        elif self.fault == "unknown_tool":
+            contents = [Content.from_function_call(
+                call_id="fault-call", name="not_a_handoff", arguments={}
+            )]
+        elif self.fault == "invalid_arguments":
+            contents = [Content.from_function_call(
+                call_id="fault-call", name=tool.name, arguments={"unexpected": True}
+            )]
+        elif self.fault == "user_action":
+            contents = [Content(
+                "function_approval_request", id="synthetic-approval", user_input_request=True
+            )]
+        elif self.fault == "error_content":
+            contents = [Content("error", error_code="synthetic_error", message="Synthetic failure")]
+        else:
+            contents = [Content.from_text("SYNTHETIC-PARTIAL\n")]
+
+        async def generate():
+            if self.fault == "technical":
+                raise RuntimeError("Synthetic provider failure")
+            if self.fault == "timeout":
+                await asyncio.sleep(1)
+            if contents:
+                yield ChatResponseUpdate(
+                    contents=contents, role="assistant",
+                    finish_reason=(
+                        "length" if self.fault == "unfinished"
+                        else "cancelled" if self.fault == "cancel_reason" else None
+                    ),
+                )
+            if self.fault == "midstream":
+                raise RuntimeError("Synthetic midstream failure")
+            if self.fault == "cancel":
+                raise asyncio.CancelledError()
+
         if stream:
             return ResponseStream(generate(), finalizer=ChatResponse.from_updates)
 
         async def complete():
-            return ChatResponse.from_updates(updates)
+            return ChatResponse.from_updates([update async for update in generate()])
 
         return complete()
+
+
+class ServiceDefaultHandoffClient(ScriptedHandoffClient):
+    STORES_BY_DEFAULT = True
 
 
 def context(text, conversation="conversation-a", user="user-a", response=None):
@@ -201,6 +324,38 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                 request, context(text, **kwargs), asyncio.Event()
             )
         ])
+
+    def production_host(
+        self, scripts, *, suffix="production", client_factory=None, middleware_factory=None
+    ):
+        roles = build_agent_roles("policy-")
+        sources = []
+
+        def factory():
+            named_scripts = {
+                roles[key].agent_name: [
+                    (chunks, roles[target].agent_name if target is not None else None)
+                    for chunks, target in steps
+                ]
+                for key, steps in scripts.items()
+            }
+            source = ScriptedRoleClients(
+                named_scripts, client_factory=client_factory,
+                middleware_factory=middleware_factory,
+            )
+            sources.append(source)
+            return build_workflow(
+                build_participants(source, roles, checkpoint_safe=True),
+                name="production-policy-test",
+            )
+
+        return (
+            HandoffResponsesHost(
+                factory, checkpoint_root=self.root / suffix, configure_observability=None
+            ),
+            roles,
+            sources,
+        )
 
     def test_handoff_log_source_priority(self):
         cases = (
@@ -506,8 +661,9 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("response.failed", second.text)
 
     async def test_http_preserves_real_handoff_specialist_text(self):
-        primary_name = "qvn-primary-agent"
-        coding_name = "qvn-coding-agent"
+        roles = build_agent_roles("contract-")
+        primary_name = roles["primary"].agent_name
+        coding_name = roles["coding"].agent_name
         preface = "<<<PRIMARY_PREFACE>>>\n"
         summary = "<<<PRIMARY_SUMMARY>>>\nSummary: offline fixture reviewed.\n"
         coding_text = (
@@ -530,29 +686,13 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         clients: list[tuple[ScriptedHandoffClient, ScriptedHandoffClient]] = []
 
         def factory():
-            primary_client = ScriptedHandoffClient(
-                primary_name, [((preface,), coding_name), ((summary,), None)]
-            )
-            coding_client = ScriptedHandoffClient(
-                coding_name, [(coding_chunks, primary_name)]
-            )
-            clients.append((primary_client, coding_client))
-            primary = primary_client.as_agent(
-                name=primary_name, id=primary_name,
-                require_per_service_call_history_persistence=True,
-            )
-            coding = coding_client.as_agent(
-                name=coding_name, id=coding_name,
-                require_per_service_call_history_persistence=True,
-            )
-            return (
-                HandoffBuilder(name="offline-output-contract")
-                .participants([primary, coding])
-                .with_start_agent(primary)
-                .add_handoff(primary, [coding])
-                .add_handoff(coding, [primary])
-                .build()
-            )
+            source = ScriptedRoleClients({
+                primary_name: [((preface,), coding_name), ((summary,), None)],
+                coding_name: [(coding_chunks, None)],
+            })
+            participants = build_participants(source, roles, checkpoint_safe=True)
+            clients.append((source.clients[primary_name], source.clients[coding_name]))
+            return build_workflow(participants, name="offline-output-contract")
 
         for stream in (True, False):
             with self.subTest(stream=stream):
@@ -627,6 +767,526 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(clients), 2)
         self.assertIsNot(clients[0][0], clients[1][0])
         self.assertIsNot(clients[0][1], clients[1][1])
+
+    async def test_production_return_policy_for_all_specialists(self):
+        roles = build_agent_roles("routing-")
+        primary_name = roles["primary"].agent_name
+        for key in ("coding", "architect", "spec"):
+            for already_returned in (False, True):
+                with self.subTest(specialist=key, already_returned=already_returned):
+                    specialist_name = roles[key].agent_name
+                    source = ScriptedRoleClients({
+                        primary_name: [(("PREFACE\n",), specialist_name), (("SUMMARY\n",), None)],
+                        specialist_name: [
+                            (("REVIEW-BEGIN\n", "REVIEW-END\n"), primary_name if already_returned else None)
+                        ],
+                    })
+                    participants = build_participants(source, roles, checkpoint_safe=True)
+                    host = HandoffResponsesHost(
+                        lambda: build_workflow(participants, name="production-routing-test"),
+                        checkpoint_root=self.root / f"{key}-{already_returned}",
+                        configure_observability=None,
+                    )
+                    with self.assertLogs("workflows.responses", level="INFO") as captured:
+                        self.assertEqual(
+                            await self.turn("Synthetic review input.", host=host),
+                            "PREFACE\nREVIEW-BEGIN\nREVIEW-END\nSUMMARY\n",
+                        )
+                    transitions = [
+                        record.args for record in captured.records
+                        if record.msg == "Handoff transition: source=%s target=%s"
+                    ]
+                    self.assertEqual(transitions, [
+                        (primary_name, specialist_name), (specialist_name, primary_name)
+                    ])
+                    self.assertEqual(captured.records[-1].args[0], primary_name)
+                    self.assertEqual(source.clients[specialist_name].calls, 1)
+                    self.assertEqual(source.clients[primary_name].calls, 2)
+
+    async def test_production_return_policy_composite_sequences(self):
+        for first in ("coding", "spec"):
+            with self.subTest(first=first):
+                host, roles, sources = self.production_host({
+                    "primary": [
+                        (("START\n",), first),
+                        (("NEXT\n",), "architect"),
+                        (("SUMMARY\n",), None),
+                    ],
+                    first: [(("FIRST-REVIEW\n",), None)],
+                    "architect": [(("ARCHITECT-REVIEW\n",), None)],
+                }, suffix=first)
+                with self.assertLogs("workflows.responses", level="INFO") as captured:
+                    text = await self.turn("Synthetic composite material.", host=host)
+                self.assertEqual(
+                    text, "START\nFIRST-REVIEW\nNEXT\nARCHITECT-REVIEW\nSUMMARY\n"
+                )
+                primary = roles["primary"].agent_name
+                first_name = roles[first].agent_name
+                architect = roles["architect"].agent_name
+                self.assertEqual([
+                    record.args for record in captured.records
+                    if record.msg == "Handoff transition: source=%s target=%s"
+                ], [
+                    (primary, first_name), (first_name, primary),
+                    (primary, architect), (architect, primary),
+                ])
+                self.assertEqual(captured.records[-1].args[0], primary)
+                self.assertEqual(sources[0].clients[primary].calls, 3)
+                self.assertEqual(sources[0].clients[first_name].calls, 1)
+                self.assertEqual(sources[0].clients[architect].calls, 1)
+
+    async def test_production_return_policy_fresh_factory_continuation_and_history(self):
+        host, roles, sources = self.production_host({
+            "primary": [
+                (("START\n",), "coding"), (("SUMMARY\n",), None),
+                (("NEXT-START\n",), "coding"), (("NEXT-SUMMARY\n",), None),
+            ],
+            "coding": [(("REVIEW\n",), None), (("NEXT-REVIEW\n",), None)],
+        })
+        self.assertEqual(await self.turn("Synthetic first turn.", host=host), "START\nREVIEW\nSUMMARY\n")
+        # 新 factory 的 script 只表示下一輪必要呼叫，不重播前輪文字。
+        host2, _, restarted_sources = self.production_host({
+            "primary": [(("NEXT-START\n",), "coding"), (("NEXT-SUMMARY\n",), None)],
+            "coding": [(("NEXT-REVIEW\n",), None)],
+        })
+        with self.assertLogs("workflows.responses", level="INFO") as captured:
+            text = await self.turn("Synthetic follow-up.", host=host2)
+        self.assertEqual(text, "NEXT-START\nNEXT-REVIEW\nNEXT-SUMMARY\n")
+        self.assertEqual(captured.records[-1].args[0], roles["primary"].agent_name)
+        primary = roles["primary"].agent_name
+        coding = roles["coding"].agent_name
+        self.assertIsNot(sources[0].clients[coding], restarted_sources[0].clients[coding])
+        for name in (primary, coding):
+            messages = restarted_sources[0].clients[name].requests[0]
+            calls = [
+                part["call_id"] for message in messages for part in message["contents"]
+                if part["type"] == "function_call"
+            ]
+            results = [
+                part["call_id"] for message in messages for part in message["contents"]
+                if part["type"] == "function_result"
+            ]
+            self.assertTrue(calls)
+            self.assertEqual(set(calls), set(results))
+        self.assertEqual(restarted_sources[0].clients[coding].calls, 1)
+        self.assertEqual(restarted_sources[0].clients[primary].calls, 2)
+
+    async def test_production_return_policy_nonstream_agent_path(self):
+        roles = build_agent_roles("nonstream-")
+        primary = roles["primary"].agent_name
+        coding = roles["coding"].agent_name
+        source = ScriptedRoleClients({
+            primary: [(("PREFACE\n",), coding), (("SUMMARY\n",), None)],
+            coding: [(("CODING\n",), None)],
+        })
+        workflow = build_workflow(build_participants(source, roles, checkpoint_safe=True))
+        result = await workflow.run("Synthetic nonstream material.")
+        self.assertEqual([
+            (event.data.source, event.data.target)
+            for event in result if event.type == "handoff_sent"
+        ], [(primary, coding), (coding, primary)])
+        self.assertEqual(
+            "".join(output.text for output in result.get_outputs()), "PREFACE\nCODING\nSUMMARY\n"
+        )
+        self.assertEqual(source.clients[coding].calls, 1)
+        self.assertEqual(source.clients[primary].calls, 2)
+
+    async def test_production_return_policy_primary_and_lab1_isolation(self):
+        for text in ("Synthetic clarification question?", "Synthetic capability boundary."):
+            with self.subTest(text=text):
+                host, roles, sources = self.production_host({
+                    "primary": [((text,), None)],
+                })
+                with self.assertLogs("workflows.responses", level="INFO") as captured:
+                    self.assertEqual(await self.turn("Synthetic request.", host=host), text)
+                self.assertFalse(any(
+                    record.msg == "Handoff transition: source=%s target=%s"
+                    for record in captured.records
+                ))
+                self.assertEqual(captured.records[-1].args[0], roles["primary"].agent_name)
+                self.assertEqual(
+                    sources[0].agents[roles["primary"].agent_name].default_options["instructions"],
+                    roles["primary"].instructions,
+                )
+                self.assertTrue(all(
+                    sources[0].clients[roles[key].agent_name].calls == 0
+                    for key in ("coding", "architect", "spec")
+                ))
+        roles = build_agent_roles("standalone-")
+        role = roles["coding"]
+        original = role.instructions
+        client = ScriptedHandoffClient(role.agent_name, [(("Synthetic standalone reply.",), None)])
+        agent = client.as_agent(
+            name=role.agent_name, instructions=role.instructions,
+            default_options={"response_format": role.response_format},
+        )
+        result = await agent.run("Synthetic standalone material.")
+        self.assertEqual(result.text, "Synthetic standalone reply.")
+        self.assertEqual(agent.default_options["instructions"], original)
+        self.assertEqual(role.instructions, original)
+        self.assertEqual(role.response_format, SpecialistReview)
+        self.assertFalse(client.options_seen[0].get("tools"))
+
+    async def test_production_return_policy_technical_failures_do_not_complete(self):
+        for fault in (
+            "empty", "unknown_tool", "invalid_arguments", "user_action",
+            "technical", "midstream", "timeout", "error_content", "unfinished",
+        ):
+            with self.subTest(fault=fault):
+                def client_factory(name, script):
+                    if name.endswith("-coding-agent"):
+                        return FaultHandoffClient(name, script, fault)
+                    return ScriptedHandoffClient(name, script)
+
+                host, roles, sources = self.production_host({
+                    "primary": [(("START\n",), "coding")],
+                    "coding": [],
+                }, suffix=fault, client_factory=client_factory)
+                with patch("workflows.handoff.AGENT_TIMEOUT_SECONDS", 0.05 if fault == "timeout" else 180):
+                    with self.assertLogs("workflows.responses", level="INFO") as captured:
+                        events = [
+                            event.as_dict() async for event in host._respond(
+                                CreateResponse(input="Synthetic failure material.", stream=True),
+                                context("Synthetic failure material."),
+                                asyncio.Event(),
+                            )
+                        ]
+                self.assertEqual(events[-1]["type"], "response.failed")
+                self.assertEqual(events[-1]["response"]["error"]["code"], "server_error")
+                self.assertFalse(any(event["type"] == "response.completed" for event in events))
+                self.assertEqual([
+                    record.args for record in captured.records
+                    if record.msg == "Handoff transition: source=%s target=%s"
+                ], [(roles["primary"].agent_name, roles["coding"].agent_name)])
+                self.assertFalse(any(
+                    record.msg == "Handoff waiting for user input: source=%s request_id=%s"
+                    for record in captured.records
+                ))
+                self.assertEqual(sources[0].clients[roles["coding"].agent_name].calls, 1)
+                self.assertEqual(sources[0].clients[roles["primary"].agent_name].calls, 1)
+
+    async def test_production_return_policy_cancellation_is_not_degraded(self):
+        for fault in ("cancel", "cancel_reason"):
+            with self.subTest(fault=fault):
+                def client_factory(name, script):
+                    return (
+                        FaultHandoffClient(name, script, fault)
+                        if name.endswith("-coding-agent") else ScriptedHandoffClient(name, script)
+                    )
+
+                host, roles, sources = self.production_host({
+                    "primary": [(("START\n",), "coding")],
+                }, suffix=fault, client_factory=client_factory)
+                with self.assertLogs("workflows.responses", level="INFO") as captured:
+                    with self.assertRaises(asyncio.CancelledError):
+                        await self.turn("Synthetic cancelled request.", host=host)
+                self.assertEqual([
+                    record.args for record in captured.records
+                    if record.msg == "Handoff transition: source=%s target=%s"
+                ], [(roles["primary"].agent_name, roles["coding"].agent_name)])
+                self.assertEqual(sources[0].clients[roles["coding"].agent_name].calls, 1)
+
+    async def test_production_return_policy_tool_failure_does_not_retry(self):
+        @function_middleware
+        async def failing_tool(context, call_next):
+            if context.function.name.endswith(roles["primary"].agent_name):
+                raise RuntimeError("Synthetic handoff tool failure")
+            await call_next()
+
+        def extra(name):
+            return [failing_tool] if name.endswith("-coding-agent") else []
+
+        host, roles, sources = self.production_host({
+            "primary": [(("START\n",), "coding")],
+            "coding": [(("REVIEW\n",), "primary")],
+        }, middleware_factory=extra)
+        with self.assertLogs("workflows.responses", level="INFO"):
+            events = [
+                event.as_dict() async for event in host._respond(
+                    CreateResponse(input="Synthetic tool failure.", stream=True),
+                    context("Synthetic tool failure."), asyncio.Event(),
+                )
+            ]
+        self.assertEqual(events[-1]["type"], "response.failed")
+        self.assertEqual(events[-1]["response"]["error"]["code"], "server_error")
+        self.assertEqual(sources[0].clients[roles["coding"].agent_name].calls, 1)
+
+    async def test_production_return_policy_preserves_hooks_value_and_metadata(self):
+        roles = build_agent_roles("hooks-")
+        primary = roles["primary"].agent_name
+        coding = roles["coding"].agent_name
+        review = {
+            "category": "code", "summary": "Synthetic review.",
+            "findings": ["Synthetic finding."], "severity": "LOW",
+            "evidence": ["Synthetic evidence."], "recommendations": ["Synthetic advice."],
+            "limitations": ["Synthetic offline-only data."],
+        }
+        coding_text = json.dumps(review, separators=(",", ":")) + "\n"
+        for stream in (True, False):
+            with self.subTest(stream=stream):
+                inner_results = []
+                outer_results = []
+
+                @agent_middleware
+                async def original_result(context, call_next):
+                    await call_next()
+
+                    def tagged(response):
+                        response.additional_properties["synthetic_agent_metadata"] = "kept"
+                        inner_results.append(response)
+                        return response
+
+                    if context.stream:
+                        context.result.with_result_hook(tagged)
+                    else:
+                        context.result = tagged(context.result)
+
+                @agent_middleware
+                async def observe_result(context, call_next):
+                    await call_next()
+                    if context.stream:
+                        context.result.with_result_hook(outer_results.append)
+                    else:
+                        outer_results.append(context.result)
+
+                class ObservedClients(ScriptedRoleClients):
+                    def as_agent(self, **options):
+                        if options["name"] == coding:
+                            options = dict(options)
+                            options["middleware"] = [
+                                observe_result, *options["middleware"], original_result,
+                            ]
+                        return super().as_agent(**options)
+
+                source = ObservedClients({
+                    primary: [(("PREFACE\n",), coding), (("SUMMARY\n",), None)],
+                    coding: [((coding_text[:40], coding_text[40:]), None)],
+                })
+                original_instructions = {key: role.instructions for key, role in roles.items()}
+                workflow = build_workflow(build_participants(source, roles, checkpoint_safe=True))
+                if stream:
+                    events = [
+                        event async for event in workflow.run("Synthetic hooks material.", stream=True)
+                    ]
+                else:
+                    events = await workflow.run("Synthetic hooks material.")
+                self.assertEqual([
+                    (event.data.source, event.data.target)
+                    for event in events if event.type == "handoff_sent"
+                ], [(primary, coding), (coding, primary)])
+                self.assertEqual(
+                    "".join(event.data.text for event in events if event.type == "output"),
+                    "PREFACE\n" + coding_text + "SUMMARY\n",
+                )
+                self.assertEqual(len(inner_results), 1)
+                self.assertEqual(len(outer_results), 1)
+                self.assertIs(outer_results[0], inner_results[0])
+                result = outer_results[0]
+                self.assertEqual(result.value, SpecialistReview.model_validate(review))
+                self.assertEqual(result.additional_properties["synthetic_agent_metadata"], "kept")
+                client = source.clients[coding]
+                self.assertEqual(client.hook_counts["finalizer"], 1)
+                self.assertEqual(client.finalized_responses[0].value, SpecialistReview.model_validate(review))
+                self.assertEqual(client.finalized_responses[0].additional_properties["synthetic_finalizer"], coding)
+                if stream:
+                    self.assertEqual(client.hook_counts, {
+                        "finalizer": 1, "transform": 2, "result": 1, "cleanup": 1,
+                    })
+                    self.assertTrue(client.finalized_responses[0].additional_properties["synthetic_result_hook"])
+                self.assertEqual(
+                    {key: role.instructions for key, role in roles.items()}, original_instructions
+                )
+                for key in ("coding", "architect", "spec"):
+                    self.assertEqual(
+                        source.agents[roles[key].agent_name].default_options["response_format"],
+                        roles[key].response_format,
+                    )
+
+    async def test_production_return_policy_rejects_nonunique_or_wrong_tool_binding(self):
+        for fault in ("missing", "duplicate", "wrong_description", "wrong_parameters"):
+            with self.subTest(fault=fault):
+                @chat_middleware
+                async def invalid_binding(context, call_next):
+                    tools = list(context.options.get("tools", []))
+                    original = next(tool for tool in tools if isinstance(tool, FunctionTool))
+                    context.options = dict(context.options)
+                    if fault == "missing":
+                        context.options["tools"] = []
+                    elif fault == "duplicate":
+                        context.options["tools"] = [original, original]
+                    else:
+                        context.options["tools"] = [FunctionTool(
+                            name=original.name,
+                            description="Wrong target binding." if fault == "wrong_description" else original.description,
+                            input_model={"type": "object", "properties": {"unexpected": {"type": "string"}}}
+                            if fault == "wrong_parameters" else {"type": "object", "properties": {}},
+                        )]
+                    await call_next()
+
+                def extra(name):
+                    return [invalid_binding] if name.endswith("-coding-agent") else []
+
+                host, roles, sources = self.production_host({
+                    "primary": [(("START\n",), "coding")],
+                    "coding": [(("REVIEW\n",), None)],
+                }, suffix=fault, middleware_factory=extra)
+                with self.assertLogs("workflows.responses", level="INFO"):
+                    events = [
+                        event.as_dict() async for event in host._respond(
+                            CreateResponse(input="Synthetic binding check.", stream=True),
+                            context("Synthetic binding check."), asyncio.Event(),
+                        )
+                    ]
+                self.assertEqual(events[-1]["type"], "response.failed")
+                self.assertEqual(events[-1]["response"]["error"]["code"], "server_error")
+                self.assertEqual(sources[0].clients[roles["coding"].agent_name].calls, 0)
+
+    async def test_production_return_policy_clarification_is_not_a_review(self):
+        question = "Synthetic specialist needs one missing detail."
+        host, roles, sources = self.production_host({
+            "primary": [(("START\n",), "coding"), (("Synthetic Primary clarification?",), None)],
+            "coding": [((question,), None)],
+        })
+        with self.assertLogs("workflows.responses", level="INFO") as captured:
+            actual = await self.turn("Synthetic partial material.", host=host)
+        self.assertEqual(actual, "START\n" + question + "Synthetic Primary clarification?")
+        self.assertEqual(captured.records[-1].args[0], roles["primary"].agent_name)
+        self.assertEqual(sources[0].clients[roles["coding"].agent_name].calls, 1)
+        self.assertNotIn('"category"', actual)
+
+    async def test_production_return_policy_conversations_do_not_share_state(self):
+        host, roles, sources = self.production_host({
+            "primary": [(("START\n",), "coding"), (("SUMMARY\n",), None)],
+            "coding": [(("REVIEW\n",), None)],
+        })
+        with self.assertLogs("workflows.responses", level="INFO") as captured:
+            results = await asyncio.gather(
+                self.turn("Synthetic first conversation.", host=host, conversation="first"),
+                self.turn("Synthetic second conversation.", host=host, conversation="second"),
+            )
+        self.assertEqual(results, ["START\nREVIEW\nSUMMARY\n"] * 2)
+        self.assertEqual(len(sources), 2)
+        for key in ("primary", "coding"):
+            name = roles[key].agent_name
+            self.assertIsNot(sources[0].clients[name], sources[1].clients[name])
+            self.assertEqual(
+                [source.clients[name].calls for source in sources], [2, 2] if key == "primary" else [1, 1]
+            )
+        self.assertEqual(sum(
+            record.msg == "Handoff transition: source=%s target=%s"
+            for record in captured.records
+        ), 4)
+
+    async def test_production_return_policy_nonstream_history_pairs(self):
+        roles = build_agent_roles("nonstream-history-")
+        primary = roles["primary"].agent_name
+        coding = roles["coding"].agent_name
+        source = ScriptedRoleClients({
+            primary: [
+                (("START\n",), coding), (("SUMMARY\n",), None),
+                (("NEXT\n",), coding), (("NEXT-SUMMARY\n",), None),
+            ],
+            coding: [(("REVIEW\n",), None), (("NEXT-REVIEW\n",), None)],
+        })
+        workflow = build_workflow(build_participants(source, roles))
+        first = await workflow.run("Synthetic first nonstream turn.")
+        requests = [event for event in first if event.type == "request_info"]
+        self.assertEqual(len(requests), 1)
+        second = await workflow.run(responses={
+            requests[0].request_id: HandoffAgentUserRequest.create_response("Synthetic next turn.")
+        })
+        self.assertEqual([
+            (event.data.source, event.data.target)
+            for event in second if event.type == "handoff_sent"
+        ], [(primary, coding), (coding, primary)])
+        for name in (primary, coding):
+            messages = source.clients[name].requests[2 if name == primary else 1]
+            calls = {
+                part["call_id"] for message in messages for part in message["contents"]
+                if part["type"] == "function_call"
+            }
+            results = {
+                part["call_id"] for message in messages for part in message["contents"]
+                if part["type"] == "function_result"
+            }
+            self.assertTrue(calls)
+            self.assertEqual(calls, results)
+        self.assertEqual(source.clients[coding].calls, 2)
+
+    async def test_production_return_policy_service_default_client_uses_local_history(self):
+        scripts = {
+            "primary": [(("START\n",), "coding"), (("SUMMARY\n",), None)],
+            "coding": [(("REVIEW\n",), None)],
+        }
+        host, roles, sources = self.production_host(
+            scripts, client_factory=ServiceDefaultHandoffClient
+        )
+        self.assertEqual(
+            await self.turn("Synthetic service-default first turn.", host=host),
+            "START\nREVIEW\nSUMMARY\n",
+        )
+        restarted, _, next_sources = self.production_host(
+            scripts, client_factory=ServiceDefaultHandoffClient
+        )
+        self.assertEqual(
+            await self.turn("Synthetic service-default follow-up.", host=restarted),
+            "START\nREVIEW\nSUMMARY\n",
+        )
+        coding = roles["coding"].agent_name
+        primary = roles["primary"].agent_name
+        for source in (sources[0], next_sources[0]):
+            effective = source.clients[coding].options_seen[0]
+            self.assertIs(effective["store"], False)
+            self.assertFalse(any(
+                effective.get(key)
+                for key in ("previous_response_id", "conversation", "conversation_id")
+            ))
+            self.assertNotIn("store", source.clients[primary].options_seen[0])
+        messages = next_sources[0].clients[coding].requests[0]
+        calls = {
+            part["call_id"] for message in messages for part in message["contents"]
+            if part["type"] == "function_call"
+        }
+        results = {
+            part["call_id"] for message in messages for part in message["contents"]
+            if part["type"] == "function_result"
+        }
+        self.assertTrue(calls)
+        self.assertEqual(calls, results)
+        self.assertTrue(any(
+            "REVIEW" in part.get("text", "")
+            for message in messages for part in message["contents"]
+        ))
+        self.assertEqual(next_sources[0].clients[coding].calls, 1)
+        self.assertEqual(next_sources[0].clients[primary].calls, 2)
+
+    async def test_production_return_policy_rejects_legacy_service_session_without_erasing_it(self):
+        sessions = []
+
+        @chat_middleware
+        async def legacy_session(context, call_next):
+            context.session.service_session_id = "resp_synthetic_legacy"
+            sessions.append(context.session)
+            await call_next()
+
+        def extra(name):
+            return [legacy_session] if name.endswith("-coding-agent") else []
+
+        host, roles, sources = self.production_host({
+            "primary": [(("START\n",), "coding")],
+            "coding": [(("REVIEW\n",), None)],
+        }, middleware_factory=extra, client_factory=ServiceDefaultHandoffClient)
+        with self.assertLogs("workflows.responses", level="INFO"):
+            events = [
+                event.as_dict() async for event in host._respond(
+                    CreateResponse(input="Synthetic legacy history.", stream=True),
+                    context("Synthetic legacy history."), asyncio.Event(),
+                )
+            ]
+        self.assertEqual(events[-1]["type"], "response.failed")
+        self.assertEqual(events[-1]["response"]["error"]["code"], "server_error")
+        self.assertEqual(sessions[0].service_session_id, "resp_synthetic_legacy")
+        self.assertEqual(sources[0].clients[roles["coding"].agent_name].calls, 0)
 
 
 if __name__ == "__main__":

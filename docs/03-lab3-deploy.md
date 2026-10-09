@@ -164,11 +164,31 @@ uv run python -c "from fixtures.test_items import TEST_ITEMS, render_prompt; pri
 | T09–T10 | （無交接）說明能力邊界                          |
 | T11–T12 | `primary → 專家 A → primary → 專家 B → primary` |
 
-如果結果不一致，**通常是環境變數沒帶上去**（例如 `MODEL_DEPLOYMENT_NAME` 在 azd 環境的值與 `src/.env` 不同）。
+結果不一致時，應以本次 session 的 framework transition、waiting source 與錯誤記錄判讀，
+不要只用回覆中的「來源：專家」或假定是環境變數問題。環境值不一致仍是可能原因，
+但 `add_handoff` 本身只允許路由，不會強制正常完成後回交。
 
 Playground 對話的對象是整個多代理系統。`HandoffResponsesHost` 將四代理工作流包成單一
 Responses 端點，使用公開的 `response_handler` 與 `Workflow.run(responses=...)` 接口，
 把「繼續」等文字交回正在等待的 Handoff 請求，而不是要求 Playground 傳送工具回傳值。
+
+Handoff runtime 的三位專家有程式控制的 completion-return policy：
+正常回合沒有合法回交 call 時，middleware 補一個非文字控制 call，由 SDK 真正交回 Primary；
+已有 call 就不重複補，原審查文字只傳遞一次。Primary 不被強制交接，仍負責彙整與釐清。
+這與「業務審查完成」是不同的判定；需要補充材料不能被當成成功審查。
+
+外層 guard 在 stream 真正消費後仍核對回交結果。空結果、工具錯誤、特殊未完成動作、
+降級或技術失敗不會冒充 completed 的專家等待，而是走既有 host 的明確失敗路徑；
+取消不被吞掉。原 schema 不擴充，也不靠 autonomous mode 或模型重試完成回交。
+此補強不增加專家的回交決策 model call；相較於提前停在專家的失敗路徑，
+會增加應有的 Primary 彙整呼叫與 Token 成本。Lab 1 的單獨 Coding 不受影響。
+
+僅 runtime specialists 的模型請求使用 `store=False`，避免程式補的控制 call
+與服務端原始 response 的工具 history 不一致。SDK 會將本機 call/result history
+保存到既有 checkpoint，下一輪還原後傳送完整上下文；Primary 的 storage 行為不變。
+Hosted session 與 `$HOME` checkpoint 的持久化仍保留，輸入 Token 成本／快取效果可能不同。
+舊 service-managed conversation ID 不會被清除或假裝成功遷移；如不相容會明確失敗。
+部署這項政策後，請用新 session/conversation 驗證，不沿用 version 9 的既有對話。
 
 每輪重新建立工作流，並依使用者與 conversation 還原 checkpoint；不共用上一輪的 executor
 記憶體狀態，不同對話也不必互相排隊（同一個 conversation 的追問才會依序處理）。
