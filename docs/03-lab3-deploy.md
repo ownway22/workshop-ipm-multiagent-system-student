@@ -172,29 +172,42 @@ Playground 對話的對象是整個多代理系統。`HandoffResponsesHost` 將�
 Responses 端點，使用公開的 `response_handler` 與 `Workflow.run(responses=...)` 接口，
 把「繼續」等文字交回正在等待的 Handoff 請求，而不是要求 Playground 傳送工具回傳值。
 
-Handoff runtime 的三位專家有程式控制的 completion-return policy：
-正常回合沒有合法回交 call 時，middleware 補一個非文字控制 call，由 SDK 真正交回 Primary；
-已有 call 就不重複補，原審查文字只傳遞一次。Primary 不被強制交接，仍負責彙整與釐清。
-這與「業務審查完成」是不同的判定；需要補充材料不能被當成成功審查。
+Handoff runtime 使用 `SpecialistOutcome` 包裝原 `SpecialistReview`，或明確的
+needs_input/unavailable。review 會實際解析並核對執行角色；只有交接 call 而無 outcome
+會失敗。有效結果沒有回交 call 時才補控制 call，由 SDK 真正交回 Primary，文字不重播。
+Primary 的公開 SDK session 保存 versioned JSON requirement ledger；planning/resume action
+與實際 outcome/receipt 控制進度。pending 子需求若被 Primary 以「稍後處理」略過，
+程式最多補當前步驟的合法下一段交接，不依題號或材料檔案數決定路由。
 
-外層 guard 在 stream 真正消費後仍核對回交結果。空結果、工具錯誤、特殊未完成動作、
-降級或技術失敗不會冒充 completed 的專家等待，而是走既有 host 的明確失敗路徑；
-取消不被吞掉。原 schema 不擴充，也不靠 autonomous mode 或模型重試完成回交。
-此補強不增加專家的回交決策 model call；相較於提前停在專家的失敗路徑，
-會增加應有的 Primary 彙整呼叫與 Token 成本。Lab 1 的單獨 Coding 不受影響。
+新審查要求建立新 revision，保留舊材料與已驗證結果；純回顧不強制重審。
+阻塞計畫的補材料／明確續辦使用有效 resume；明確改需求才建立 replacement revision，
+保留舊未完成狀態。語意不明只問一個問題，不擅自交接或取消舊計畫。
+Primary 的 final disposition 與完成/未完成清單須符合 ledger。protocol completed
+不等於全部需求 reviewed：正常 needs_input/unavailable 回合仍保留未完成需求。
+完整生命週期與有限 budget 見 [Lab 2 的 runtime 契約](02-lab2-multi-agent.md#handoff-only-outcome需求-ledger-與程式控制回交)。
 
-僅 runtime specialists 的模型請求使用 `store=False`，避免程式補的控制 call
-與服務端原始 response 的工具 history 不一致。SDK 會將本機 call/result history
-保存到既有 checkpoint，下一輪還原後傳送完整上下文；Primary 的 storage 行為不變。
-Hosted session 與 `$HOME` checkpoint 的持久化仍保留，輸入 Token 成本／快取效果可能不同。
-舊 service-managed conversation ID 不會被清除或假裝成功遷移；如不相容會明確失敗。
-部署這項政策後，請用新 session/conversation 驗證，不沿用 version 9 的既有對話。
+外層 guard 等原 stream finalized response 才判定完成，允許中間暫時 token；
+final pending、缺 terminal、空結果、錯誤、特殊動作或技術降級仍走 host 明確失敗路徑，
+取消不被吞掉。不啟用 autonomous mode／模型重試，也不擴大 checkpoint allowlist。
+Handoff-only JSON Schema mapping 不改共用角色、`SpecialistReview` 或 Lab 1 單獨 Coding。
+
+Primary 與 specialists 的 runtime 模型請求全部使用 `store=False`，避免程式補的 call
+與服務端原始 history 不一致。SDK 本機 call/result history 連同 ledger 保存到既有
+checkpoint，下一輪還原後傳送完整上下文；Hosted session 與 `$HOME` 持久化仍保留。
+首次 planning 通常增加一次 Primary 模型呼叫，resume 也有對應呼叫成本；不增加專家的
+回交決策呼叫。完整本機 context 會影響輸入 Token 與快取，不能視為免費。
+此保證只涵蓋已接受計畫的執行，不保證自然語言理解、計畫完整性或審查內容必然正確。
+舊 service-managed ID 不清除或假裝遷移；**部署後必須使用新 session/conversation**。
+離線 regression 通過不代表 Foundry provider、Playground UI 或 Tracing 已通過驗收。
 
 每輪重新建立工作流，並依使用者與 conversation 還原 checkpoint；不共用上一輪的 executor
 記憶體狀態，不同對話也不必互相排隊（同一個 conversation 的追問才會依序處理）。
 checkpoint 僅額外允許 Handoff 請求、`list[Message]` 型別描述與 Azure role enum，
 不關閉反序列化限制。保存前移除 SDK 的 `raw_representation` 除錯物件，保留文字、
 工具資料與結構化結果；若最後一輪 checkpoint 無法保存，回傳失敗而非假裝可以繼續對話。
+已存在的 ledger checkpoint 在交給 SDK 還原及複製到本輪目錄前，先驗證 Primary
+owner session/state/ledger；不接受缺失、損壞或不支援版本，不重建遺失的計畫。
+此驗證由正式 Responses 入口明確啟用，不影響未使用 ledger 的 generic workflow。
 
 checkpoint 存在哪裡、留多久：
 

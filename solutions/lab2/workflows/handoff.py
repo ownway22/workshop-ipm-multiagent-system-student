@@ -26,7 +26,7 @@
 注入交接工具、掛上 middleware，因此要求參與者支援本地工具呼叫。
 
 兩者由同一份定義檔（`src/agents/`）產生，角色與資料契約一致但物件不同。
-Handoff runtime 另附內部控制規則與 specialists-only 回交政策；Lab 1 的角色文字不變。
+Handoff runtime 另附 outcome、需求進度與內部控制規則；Lab 1 的角色文字不變。
 `.env` 換一個專案端點，這裡就會連到另一個專案，不需要改任何程式碼。
 """
 
@@ -34,15 +34,20 @@ import asyncio
 import json
 import logging
 import uuid
-from collections.abc import AsyncIterator, Mapping, Sequence
-from typing import TYPE_CHECKING
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from copy import deepcopy
+from typing import TYPE_CHECKING, Literal, Self
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from agents import build_agent_roles
 from models.agent_role import AgentRole
+from models.specialist_review import ReviewCategory, SpecialistReview
 
 if TYPE_CHECKING:  # 只為型別標註；執行期不匯入，維持本模組「用到才 import」的一致風格
     from agent_framework import (
-        Agent, AgentResponse, AgentResponseUpdate, ChatResponse, CheckpointStorage, ResponseStream,
+        Agent, AgentResponse, AgentResponseUpdate, AgentSession, ChatResponse, CheckpointStorage,
+        Message, ResponseStream, WorkflowCheckpoint,
     )
 
 logger = logging.getLogger(__name__)
@@ -53,8 +58,297 @@ _DEGRADED_RESULT = "handoff_degraded"
 class HandoffRoutingError(RuntimeError):
     """專家回合沒有完成合法回交；不能當成正常審查或使用者等待。"""
 
+
+SpecialistKey = Literal["coding", "architect", "spec"]
+_LEDGER_KEY = "handoff.requirements.v1"
+_LEDGER_MARKER = "handoff.requirements_initialized"
+_DISPATCH_KEY = "handoff.dispatch.v1"
+_RECEIPT_KEY = "handoff.outcome_receipt.v1"
+_ACCEPT_PLAN = "accept_review_plan"
+_RESUME_PLAN = "resume_review_plan"
+_CATEGORIES = {
+    "coding": ReviewCategory.CODE,
+    "architect": ReviewCategory.ARCHITECTURE,
+    "spec": ReviewCategory.SPECIFICATION,
+}
+
+
+class SpecialistOutcome(BaseModel):
+    """Handoff-only 結果；控制 call 本身不是審查結果。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["review", "needs_input", "unavailable"]
+    review: SpecialistReview | None = None
+    detail: str | None = None
+    question: str | None = None
+
+    @model_validator(mode="after")
+    def valid_outcome(self) -> Self:
+        if self.kind == "review":
+            if self.review is None or self.detail is not None or self.question is not None:
+                raise ValueError("review requires only a validated SpecialistReview")
+        else:
+            if self.review is not None or not self.detail or not self.detail.strip():
+                raise ValueError("blocked outcomes require a reason, not invented findings")
+            if self.kind == "needs_input":
+                if not self.question or not self.question.strip():
+                    raise ValueError("needs_input requires one clarification question")
+            elif self.question is not None:
+                raise ValueError("unavailable is a reason, not a clarification question")
+        return self
+
+
+class ReviewPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    roles: list[SpecialistKey] = Field(min_length=1, max_length=3)
+    replace: bool = False
+    reason: str | None = None
+
+    @model_validator(mode="after")
+    def valid_plan(self) -> Self:
+        if len(set(self.roles)) != len(self.roles):
+            raise ValueError("a finite plan cannot repeat a role")
+        if self.replace and (not self.reason or not self.reason.strip()):
+            raise ValueError("replacing unfinished work requires an explicit reason")
+        if not self.replace and self.reason is not None:
+            raise ValueError("replacement reasons belong to replacement revisions")
+        return self
+
+
+class HandoffDispatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    revision_id: str = Field(min_length=1)
+    step: int = Field(ge=0, le=2)
+    role: SpecialistKey
+    attempt: int = Field(ge=1, le=2)
+    dispatch_id: str = Field(min_length=1)
+    call_id: str = Field(min_length=1)
+
+
+class OutcomeReceipt(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dispatch: HandoffDispatch
+    source: str = Field(min_length=1)
+    handoff_call_id: str = Field(min_length=1)
+    outcome: SpecialistOutcome
+
+
+class ReviewTask(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: SpecialistKey
+    status: Literal["pending", "running", "reviewed", "needs_input", "unavailable"] = "pending"
+    attempts: int = Field(default=0, ge=0, le=2)
+    dispatch: HandoffDispatch | None = None
+    receipt_id: str | None = None
+    outcome: SpecialistOutcome | None = None
+
+
+class PlanRevision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    number: int = Field(ge=1)
+    accepted_turn: int = Field(ge=1)
+    retired_turn: int | None = Field(default=None, ge=1)
+    replacement_reason: str | None = None
+    tasks: list[ReviewTask] = Field(min_length=1, max_length=3)
+    receipts: dict[str, OutcomeReceipt] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def valid_progress(self) -> Self:
+        ReviewPlan(roles=[task.role for task in self.tasks])
+        unfinished = False
+        for index, task in enumerate(self.tasks):
+            if unfinished and task.status != "pending":
+                raise ValueError("later tasks cannot run before the current task finishes")
+            unfinished = unfinished or task.status != "reviewed"
+            if task.status == "pending":
+                if task.dispatch is not None or task.outcome is not None or task.receipt_id is not None:
+                    raise ValueError("pending tasks cannot claim completed work")
+                continue
+            dispatch = task.dispatch
+            if (
+                dispatch is None or dispatch.revision_id != self.id or dispatch.step != index
+                or dispatch.role != task.role or dispatch.attempt != task.attempts
+            ):
+                raise ValueError("task progress requires the matching dispatched attempt")
+            if task.status == "running":
+                if task.outcome is not None or task.receipt_id is not None:
+                    raise ValueError("running tasks cannot claim a result")
+                continue
+            receipt = self.receipts.get(task.receipt_id or "")
+            expected = "review" if task.status == "reviewed" else task.status
+            if (
+                receipt is None or receipt.dispatch != dispatch or receipt.outcome != task.outcome
+                or receipt.outcome.kind != expected
+            ):
+                raise ValueError("completed or blocked tasks require their executed outcome receipt")
+        dispatches: set[str] = set()
+        for call_id, receipt in self.receipts.items():
+            dispatch = receipt.dispatch
+            if (
+                call_id != receipt.handoff_call_id or dispatch.revision_id != self.id
+                or dispatch.step >= len(self.tasks) or self.tasks[dispatch.step].role != dispatch.role
+                or dispatch.attempt > self.tasks[dispatch.step].attempts
+                or dispatch.dispatch_id in dispatches
+            ):
+                raise ValueError("receipt is not a unique executed step in this revision")
+            if receipt.outcome.review is not None and receipt.outcome.review.category != _CATEGORIES[dispatch.role]:
+                raise ValueError("receipt category disagrees with the executed role")
+            dispatches.add(dispatch.dispatch_id)
+        for index, task in enumerate(self.tasks):
+            attempts = sorted(
+                receipt.dispatch.attempt for receipt in self.receipts.values()
+                if receipt.dispatch.step == index
+            )
+            completed_attempts = task.attempts - (task.status == "running")
+            if attempts != list(range(1, completed_attempts + 1)):
+                raise ValueError("task attempts do not match executed outcome receipts")
+        return self
+
+    def next_task(self) -> ReviewTask | None:
+        return next((task for task in self.tasks if task.status != "reviewed"), None)
+
+
+class ReviewTurn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    number: int = Field(ge=1)
+    id: str = Field(min_length=1)
+    decision: Literal["undecided", "plan", "resume", "recap", "clarify", "out_of_scope"] = "undecided"
+    model_calls: int = Field(default=0, ge=0, le=8)
+    closed: bool = False
+
+
+class ReviewLedger(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1] = 1
+    turn: ReviewTurn
+    revisions: list[PlanRevision] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def valid_revisions(self) -> Self:
+        identifiers: set[str] = set()
+        calls: set[str] = set()
+        for index, revision in enumerate(self.revisions):
+            if (
+                revision.number != index + 1 or revision.id in identifiers
+                or revision.accepted_turn > self.turn.number
+                or revision.retired_turn is not None and revision.retired_turn > self.turn.number
+                or revision.retired_turn is not None and revision.retired_turn <= revision.accepted_turn
+                or index < len(self.revisions) - 1 and revision.retired_turn is None
+                or index == len(self.revisions) - 1 and revision.retired_turn is not None
+            ):
+                raise ValueError("revision chronology is inconsistent")
+            if calls.intersection(revision.receipts):
+                raise ValueError("handoff receipt cannot complete multiple revisions")
+            identifiers.add(revision.id)
+            calls.update(revision.receipts)
+        return self
+
+    def current(self) -> PlanRevision | None:
+        return self.revisions[-1] if self.revisions else None
+
+    def progress(self) -> tuple[list[SpecialistKey], list[SpecialistKey]]:
+        revision = self.current()
+        tasks = revision.tasks if revision is not None else []
+        return (
+            [task.role for task in tasks if task.status == "reviewed"],
+            [task.role for task in tasks if task.status != "reviewed"],
+        )
+
+
+class PrimaryReply(BaseModel):
+    """結束 disposition 與進度必須符合 runtime 的已驗證狀態。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    disposition: Literal["complete", "recap", "clarify", "needs_input", "unavailable", "out_of_scope"]
+    message: str = Field(min_length=1)
+    question: str | None = None
+    reviewed: list[SpecialistKey] = Field(default_factory=list)
+    unfinished: list[SpecialistKey] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def nonempty_reply(self) -> Self:
+        if not self.message.strip():
+            raise ValueError("empty output is not completion")
+        if self.disposition in ("clarify", "needs_input"):
+            if not self.question or not self.question.strip():
+                raise ValueError("clarification requires one question")
+        elif self.question is not None:
+            raise ValueError("this disposition does not ask for user input")
+        return self
+
+
+def load_review_ledger(session: "AgentSession") -> ReviewLedger | None:
+    if _LEDGER_KEY not in session.state:
+        if session.state:
+            raise HandoffRoutingError("既有 Handoff 狀態缺少需求 ledger，不能安全重置。")
+        return None
+    if session.state.get(_LEDGER_MARKER) is not True:
+        raise HandoffRoutingError("Handoff ledger 初始化標記不符。")
+    try:
+        return ReviewLedger.model_validate_json(
+            json.dumps(session.state[_LEDGER_KEY], allow_nan=False), strict=True,
+        )
+    except (ValidationError, TypeError, ValueError):
+        raise HandoffRoutingError("Handoff 需求 ledger 損壞或矛盾。") from None
+
+
+def build_review_checkpoint_validator(
+    roles: dict[str, AgentRole] | None = None,
+) -> "Callable[[WorkflowCheckpoint], None]":
+    """在 SDK 套用 session 缺省值之前，驗證已存在 checkpoint 的 ledger owner。"""
+    from agent_framework import AgentSession
+
+    selected_roles = roles if roles is not None else build_agent_roles()
+    primary_name = selected_roles["primary"].agent_name
+
+    def validate(checkpoint: "WorkflowCheckpoint") -> None:
+        executor_states = checkpoint.state.get("_executor_state")
+        owner = executor_states.get(primary_name) if isinstance(executor_states, dict) else None
+        payload = owner.get("agent_session") if isinstance(owner, dict) else None
+        if (
+            not isinstance(payload, dict) or payload.get("type") != "session"
+            or not isinstance(payload.get("session_id"), str) or not payload["session_id"].strip()
+            or "service_session_id" not in payload or payload["service_session_id"] is not None
+            or not isinstance(payload.get("state"), dict) or _LEDGER_KEY not in payload["state"]
+        ):
+            raise HandoffRoutingError("既有 checkpoint 缺少有效的 Primary owner session/state/ledger。")
+        session = AgentSession.from_dict(payload)
+        ledger = load_review_ledger(session)
+        if ledger is None or not ledger.turn.closed:
+            raise HandoffRoutingError("既有 checkpoint 的 Primary ledger 不是已結束的使用者回合。")
+        revision = ledger.current()
+        task = revision.next_task() if revision is not None else None
+        if task is not None and task.status in ("pending", "running"):
+            raise HandoffRoutingError("既有 checkpoint 在可執行需求未完成時提前等待。")
+        if any(
+            receipt.source != selected_roles[receipt.dispatch.role].agent_name
+            for item in ledger.revisions for receipt in item.receipts.values()
+        ):
+            raise HandoffRoutingError("既有 checkpoint 的 outcome receipt 來源不符。")
+
+    return validate
+
+
+def _save_ledger(session: "AgentSession", ledger: ReviewLedger) -> None:
+    try:
+        data = ReviewLedger.model_validate_json(ledger.model_dump_json(), strict=True).model_dump(mode="json")
+    except ValidationError:
+        raise HandoffRoutingError("Handoff 需求進度更新不符合契約。") from None
+    session.state[_LEDGER_KEY] = data
+    session.state[_LEDGER_MARKER] = True
+
 #: 專家角色的 key（Primary 以外的三個）。順序即 `add_handoff` 的建邊順序。
-SPECIALIST_KEYS: tuple[str, ...] = ("coding", "architect", "spec")
+SPECIALIST_KEYS: tuple[SpecialistKey, ...] = ("coding", "architect", "spec")
 
 #: Workflow 名稱。與 Lab 3 的 hosted agent 名稱一致，方便對照兩者是同一套拓撲。
 WORKFLOW_NAME = "qvn-ipm-review"
@@ -291,10 +585,33 @@ def _runtime_instructions(primary_name: str) -> str:
         "\n\n## Handoff 執行期控制規則\n"
         "角色定義中的「沒有任何工具」指沒有外部查詢或執行工具；"
         "本工作流另有框架提供的內部交接控制工具。\n"
-        f"本回合控制權必須交回 {primary_name}，由協調者彙整或向使用者釐清。"
+        "先產生 SpecialistOutcome：review 包含原 SpecialistReview；"
+        "needs_input 包含 detail 與一個 question；unavailable 只說明 detail。"
+        "不能只交接而沒有 outcome，也不能自報 source、done 或 handled_by。\n"
+        f"有效 outcome 產生後控制權交回 {primary_name}，由協調者彙整或向使用者釐清。"
         "程式會補上必要的回交控制 call，不是只靠 prompt 保證。\n"
         "原審查結果只輸出一次；需要補充材料的說明不代表審查完成，"
         "不得捏造審查結果。業務與 schema 的原有限制不變。"
+    )
+
+
+def _primary_runtime_instructions() -> str:
+    return (
+        "\n\n## Handoff 需求生命週期\n"
+        f"明確的新審查要求先執行 {_ACCEPT_PLAN}，以 roles 登記有限、有序計畫，"
+        "不要在內部回交時另建計畫。說明交給誰時必須有一句非空文字。\n"
+        "已完成計畫後的新審查必須建立新 revision；純回顧使用 recap，不重做審查。"
+        "材料與歷史不清除。\n"
+        f"needs_input/unavailable 後的補材料或明確續辦使用 {_RESUME_PLAN}；"
+        f"明確改需求使用 {_ACCEPT_PLAN}(replace=true, reason=改需求的理由)。"
+        "不能區分時使用 clarify，只問一個問題，保留舊計畫。\n"
+        "程式會依已接受計畫補必要的下一段交接，不可用稍後處理代替 pending 任務。"
+        "只能根據實際 outcome 彙整，不可捏造專家分析或完成紀錄。\n"
+        "最後回覆符合 PrimaryReply：complete 只用於本輪計畫全部 reviewed；"
+        "needs_input/unavailable 誠實說明阻塞；clarify/out_of_scope 不交接。"
+        "reviewed 與 unfinished 必須等於 runtime 提供的角色清單，"
+        "message 明確說明已完成與未完成事項；需要釐清時 question 只有一個問題。"
+        "協調進度不代表審查內容必然正確。"
     )
 
 
@@ -338,7 +655,381 @@ def _check_response_complete(response: "ChatResponse | AgentResponse") -> None:
         raise HandoffRoutingError("專家回合未正常完成，不能補上回交。")
 
 
-def build_completion_return_middleware(primary_name: str):
+def _require_local_history(session: "AgentSession | None", options: Mapping | None) -> None:
+    if session is None:
+        raise HandoffRoutingError("Handoff runtime 需要公開 SDK session。")
+    if session.service_session_id:
+        raise HandoffRoutingError("既有服務端 history 不能安全遷移，請建立新的 session/conversation。")
+    if (options or {}).get("store") is not False:
+        raise HandoffRoutingError("Handoff runtime 的模型 history 必須使用 store=False。")
+    if any((options or {}).get(key) for key in ("previous_response_id", "conversation")):
+        raise HandoffRoutingError("Handoff runtime 不能引用服務端 response/conversation。")
+
+
+def _outcome(response: "ChatResponse | AgentResponse", role: SpecialistKey) -> SpecialistOutcome:
+    try:
+        outcome = SpecialistOutcome.model_validate_json(response.text, strict=True)
+    except ValidationError:
+        raise HandoffRoutingError("專家缺少有效 review/needs_input/unavailable outcome。") from None
+    if outcome.review is not None and outcome.review.category != _CATEGORIES[role]:
+        raise HandoffRoutingError("專家 review 的 category 與實際執行角色不符。")
+    return outcome
+
+
+def _handoff_result(response: "AgentResponse") -> tuple[str, str]:
+    results = [
+        content for content in response.messages[-1].contents
+        if content.type == "function_result"
+    ] if response.messages else []
+    if len(results) != 1 or not results[0].call_id:
+        raise HandoffRoutingError("沒有唯一、有效的 SDK handoff result。")
+    payload = results[0].result
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            raise HandoffRoutingError("SDK handoff result 格式不符。") from None
+    if (
+        not isinstance(payload, Mapping) or set(payload) != {"handoff_to"}
+        or not isinstance(payload["handoff_to"], str) or not payload["handoff_to"]
+    ):
+        raise HandoffRoutingError("SDK handoff result 沒有合法目標。")
+    return results[0].call_id, payload["handoff_to"]
+
+
+def _assistant_message(response: "ChatResponse | AgentResponse") -> "Message":
+    message = next((
+        message for message in reversed(response.messages)
+        if message.role == "assistant" and message.text.strip()
+    ), None)
+    if message is None:
+        raise HandoffRoutingError("Handoff 控制需要非空 assistant 訊息。")
+    return message
+
+
+def _read_dispatch(messages: Sequence["Message"], role: SpecialistKey, primary_name: str) -> HandoffDispatch:
+    dispatches = []
+    for message in messages:
+        payload = (message.additional_properties or {}).get(_DISPATCH_KEY)
+        if payload is None:
+            continue
+        if message.role != "assistant" or message.author_name != primary_name:
+            raise HandoffRoutingError("Handoff dispatch 來源不是 runtime Primary。")
+        try:
+            dispatch = HandoffDispatch.model_validate(payload, strict=True)
+        except ValidationError:
+            raise HandoffRoutingError("Handoff dispatch metadata 不符合契約。") from None
+        if dispatch.role == role:
+            dispatches.append(dispatch)
+    if len(dispatches) != 1:
+        raise HandoffRoutingError("專家沒有唯一的當前 plan/step dispatch。")
+    return dispatches[0]
+
+
+def _consume_receipts(ledger: ReviewLedger, messages: Sequence["Message"], roles: dict[str, AgentRole]) -> None:
+    for message in messages:
+        payload = (message.additional_properties or {}).get(_RECEIPT_KEY)
+        if payload is None:
+            continue
+        try:
+            receipt = OutcomeReceipt.model_validate_json(
+                json.dumps(payload, allow_nan=False), strict=True,
+            )
+        except (ValidationError, TypeError, ValueError):
+            raise HandoffRoutingError("Handoff outcome receipt 不符合契約。") from None
+        dispatch = receipt.dispatch
+        expected_source = roles[dispatch.role].agent_name
+        if (
+            message.role != "assistant" or message.author_name != expected_source
+            or receipt.source != expected_source
+        ):
+            raise HandoffRoutingError("Outcome receipt 不是實際專家產生的 metadata。")
+        revision = next((item for item in ledger.revisions if item.id == dispatch.revision_id), None)
+        if revision is None:
+            raise HandoffRoutingError("Outcome receipt 不屬於已接受 revision。")
+        known = revision.receipts.get(receipt.handoff_call_id)
+        if known is not None:
+            if known != receipt:
+                raise HandoffRoutingError("已驗證 receipt 被改寫。")
+            continue
+        if revision is not ledger.current() or dispatch.step >= len(revision.tasks):
+            raise HandoffRoutingError("舊 revision 的未知 outcome 不能更新新需求。")
+        task = revision.next_task()
+        if task is None or task.status != "running" or task.dispatch != dispatch:
+            raise HandoffRoutingError("Outcome receipt 與當前執行步驟不符。")
+        task.status = "reviewed" if receipt.outcome.kind == "review" else receipt.outcome.kind
+        task.outcome = receipt.outcome
+        task.receipt_id = receipt.handoff_call_id
+        revision.receipts[receipt.handoff_call_id] = receipt
+
+
+def build_primary_guard_middleware(roles: dict[str, AgentRole]):
+    from agent_framework import AgentResponse, AgentResponseUpdate, ResponseStream, agent_middleware
+
+    @agent_middleware
+    async def primary_guard(context, call_next):
+        session = context.session
+        if session is None or session.service_session_id:
+            raise HandoffRoutingError("Primary 需要本機 SDK session，不能清除舊服務端 ID。")
+        ledger = load_review_ledger(session)
+        user_turn = any(message.role == "user" for message in context.messages)
+        if ledger is None:
+            if not user_turn:
+                raise HandoffRoutingError("內部回交缺少 Primary 需求 ledger。")
+            ledger = ReviewLedger(turn=ReviewTurn(number=1, id=uuid.uuid4().hex))
+        else:
+            if any(
+                receipt.source != roles[receipt.dispatch.role].agent_name
+                for revision in ledger.revisions for receipt in revision.receipts.values()
+            ):
+                raise HandoffRoutingError("已保存 outcome receipt 的來源與執行角色不符。")
+            _consume_receipts(ledger, context.messages, roles)
+            if user_turn:
+                revision = ledger.current()
+                task = revision.next_task() if revision is not None else None
+                if not ledger.turn.closed or task is not None and task.status in ("pending", "running"):
+                    raise HandoffRoutingError("未結束的可執行需求不能被新 user turn 默默覆蓋。")
+                # 每次真正的 user invocation 都有新 ID；相同本文也不合併成同一 turn。
+                ledger.turn = ReviewTurn(number=ledger.turn.number + 1, id=uuid.uuid4().hex)
+            elif ledger.turn.closed:
+                raise HandoffRoutingError("已結束的 user turn 不能接受額外內部回合。")
+        _save_ledger(session, ledger)
+
+        def verify(response: AgentResponse) -> None:
+            _check_response_complete(response)
+            current = load_review_ledger(session)
+            if current is None:
+                raise HandoffRoutingError("Primary 執行後 ledger 遺失。")
+            revision = current.current()
+            task = revision.next_task() if revision is not None else None
+            last = response.messages[-1].contents if response.messages else []
+            if any(content.type == "function_result" for content in last):
+                call_id, target = _handoff_result(response)
+                if (
+                    task is None or task.status != "running" or task.dispatch is None
+                    or target != roles[task.role].agent_name or call_id != task.dispatch.call_id
+                ):
+                    raise HandoffRoutingError("Primary SDK handoff result 與當前 step 不符。")
+                message = _assistant_message(response)
+                message.additional_properties = {
+                    **(message.additional_properties or {}),
+                    _DISPATCH_KEY: task.dispatch.model_dump(mode="json"),
+                }
+                return
+            try:
+                answer = PrimaryReply.model_validate_json(_assistant_message(response).text, strict=True)
+            except ValidationError:
+                raise HandoffRoutingError("Primary 缺少有效 final disposition。") from None
+            reviewed, unfinished = current.progress()
+            if answer.reviewed != reviewed or answer.unfinished != unfinished:
+                raise HandoffRoutingError("Primary 最終完成/未完成清單與已驗證進度不符。")
+            if current.turn.decision == "undecided":
+                if answer.disposition == "recap":
+                    if revision is None or task is not None:
+                        raise HandoffRoutingError("未完成計畫不能以 recap 冒充結案。")
+                elif answer.disposition not in ("clarify", "out_of_scope"):
+                    raise HandoffRoutingError("新的審查要求必須先 planning 或有效 resume。")
+                current.turn.decision = answer.disposition
+            else:
+                expected = task.status if task is not None else "complete"
+                if expected not in ("complete", "needs_input", "unavailable") or answer.disposition != expected:
+                    raise HandoffRoutingError("Primary 不能以稍後處理結束未完成需求。")
+            current.turn.closed = True
+            _save_ledger(session, current)
+            response.additional_properties["handoff.disposition"] = answer.disposition
+
+        await call_next()
+        if context.stream and isinstance(context.result, ResponseStream):
+            inner = context.result
+
+            async def checked_updates() -> AsyncIterator[AgentResponseUpdate]:
+                async for update in inner:
+                    _check_response_actions(update)
+                    yield update
+                verify(await inner.get_final_response())
+
+            async def original_finalizer(_updates: Sequence[AgentResponseUpdate]) -> AgentResponse:
+                return await inner.get_final_response()
+
+            context.result = ResponseStream(checked_updates(), finalizer=original_finalizer)
+        elif isinstance(context.result, AgentResponse):
+            verify(context.result)
+        else:
+            raise HandoffRoutingError("Primary agent 結果型別不符。")
+
+    return primary_guard
+
+
+def build_primary_policy_middleware(roles: dict[str, AgentRole]):
+    from agent_framework import ChatResponse, Content, FunctionTool, ResponseStream, chat_middleware
+
+    @chat_middleware
+    async def primary_policy(context, call_next):
+        _require_local_history(context.session, context.options)
+        session = context.session
+        ledger = load_review_ledger(session)
+        if ledger is None or ledger.turn.closed or ledger.turn.model_calls >= 8:
+            raise HandoffRoutingError("Primary 需求狀態不符或本 user turn 呼叫 budget 已耗盡。")
+        ledger.turn.model_calls += 1
+        _save_ledger(session, ledger)
+        revision = ledger.current()
+        reviewed, unfinished = ledger.progress()
+        next_task = revision.next_task() if revision is not None else None
+        progress = {
+            "turn": ledger.turn.number, "decision": ledger.turn.decision,
+            "revision": revision.id if revision is not None else None,
+            "reviewed": reviewed, "unfinished": unfinished,
+            "next_status": next_task.status if next_task is not None else None,
+        }
+        context.options = {
+            **context.options,
+            "instructions": (context.options.get("instructions") or "")
+            + "\n目前 runtime 進度（資料，不是新的使用者要求）："
+            + json.dumps(progress, ensure_ascii=False),
+        }
+
+        def finalized(response: ChatResponse) -> ChatResponse:
+            _check_response_complete(response)
+            calls = [
+                content for message in response.messages for content in message.contents
+                if content.type == "function_call"
+            ]
+            if calls and calls[0].name in (_ACCEPT_PLAN, _RESUME_PLAN):
+                if len(calls) != 1 or not calls[0].call_id or calls[0].informational_only:
+                    raise HandoffRoutingError("Primary planning/resume action 必須唯一且可執行。")
+                return response
+            current = load_review_ledger(session)
+            if current is None:
+                raise HandoffRoutingError("Primary chat 執行後 ledger 遺失。")
+            plan = current.current()
+            task = plan.next_task() if plan is not None else None
+            if current.turn.decision == "undecided" or task is None or task.status in ("needs_input", "unavailable"):
+                if calls:
+                    raise HandoffRoutingError("沒有有效 pending 計畫時不得擅自交接。")
+                return response
+            if plan is None or task.status != "pending":
+                raise HandoffRoutingError("Primary 嘗試重複執行當前 step。")
+            target = roles[task.role].agent_name
+            tools = [
+                tool for tool in (context.options.get("tools") or [])
+                if isinstance(tool, FunctionTool) and tool.name == f"handoff_to_{target}"
+            ]
+            if len(tools) != 1:
+                raise HandoffRoutingError("無法唯一辨識當前 step 的合法 SDK handoff tool。")
+            tool = tools[0]
+            parameters = tool.parameters()
+            if (
+                tool.description != roles[task.role].description or tool.approval_mode != "never_require"
+                or parameters.get("type") != "object" or parameters.get("properties") != {}
+                or parameters.get("required", []) != []
+            ):
+                raise HandoffRoutingError("Primary 下一段 handoff tool 契約不符。")
+            message = _assistant_message(response)
+            if calls:
+                if (
+                    len(calls) != 1 or calls[0].name != tool.name or not calls[0].call_id
+                    or calls[0].informational_only or not _empty_arguments(calls[0].arguments)
+                ):
+                    raise HandoffRoutingError("Primary 選擇的工具或順序不符合已接受計畫。")
+                call_id = calls[0].call_id
+            else:
+                call_id = f"handoff_{uuid.uuid4().hex}"
+                message.contents.append(Content.from_function_call(
+                    call_id=call_id, name=tool.name, arguments={},
+                ))
+            task.attempts += 1
+            task.status = "running"
+            task.dispatch = HandoffDispatch(
+                revision_id=plan.id, step=plan.tasks.index(task), role=task.role,
+                attempt=task.attempts, dispatch_id=uuid.uuid4().hex, call_id=call_id,
+            )
+            _save_ledger(session, current)
+            return response
+
+        await call_next()
+        if context.stream and isinstance(context.result, ResponseStream):
+            context.stream_result_hooks.insert(0, finalized)
+        elif isinstance(context.result, ChatResponse):
+            context.result = finalized(context.result)
+        else:
+            raise HandoffRoutingError("Primary chat 結果型別不符。")
+
+    return primary_policy
+
+
+def build_plan_action_middleware():
+    from agent_framework import function_middleware
+
+    @function_middleware
+    async def plan_action(context, call_next):
+        if context.function.name not in (_ACCEPT_PLAN, _RESUME_PLAN):
+            await call_next()
+            return
+        session = context.session
+        if session is None:
+            raise HandoffRoutingError("Planning/resume action 缺少 Primary session。")
+        ledger = load_review_ledger(session)
+        if ledger is None or ledger.turn.closed or ledger.turn.decision != "undecided":
+            raise HandoffRoutingError("每個新 user turn 只能接受一次 planning/resume 決策。")
+        revision = ledger.current()
+        task = revision.next_task() if revision is not None else None
+        if context.function.name == _ACCEPT_PLAN:
+            try:
+                arguments = context.arguments
+                plan = ReviewPlan.model_validate(
+                    arguments.model_dump() if isinstance(arguments, BaseModel) else arguments, strict=True,
+                )
+            except ValidationError:
+                raise HandoffRoutingError("Planning action 的有限需求計畫無效。") from None
+            if task is not None and (task.status not in ("needs_input", "unavailable") or not plan.replace):
+                raise HandoffRoutingError("未完成需求只能在明確改需求時建立 replacement revision。")
+            if task is None and plan.replace:
+                raise HandoffRoutingError("沒有未完成需求可供 replacement。")
+            if revision is not None:
+                revision.retired_turn = ledger.turn.number
+            ledger.revisions.append(PlanRevision(
+                id=uuid.uuid4().hex, number=len(ledger.revisions) + 1,
+                accepted_turn=ledger.turn.number, replacement_reason=plan.reason,
+                tasks=[ReviewTask(role=role) for role in plan.roles],
+            ))
+            ledger.turn.decision = "plan"
+        else:
+            if task is None or task.status not in ("needs_input", "unavailable") or task.attempts >= 2:
+                raise HandoffRoutingError("Resume 沒有可續辦步驟，或步驟 budget 已耗盡。")
+            task.status = "pending"
+            task.dispatch = None
+            task.receipt_id = None
+            task.outcome = None
+            ledger.turn.decision = "resume"
+        await call_next()
+        _save_ledger(session, ledger)
+
+    return plan_action
+
+
+def _planning_tools():
+    from agent_framework import FunctionTool
+
+    def accept_plan(roles: list[SpecialistKey], replace: bool = False, reason: str | None = None) -> dict:
+        return {"accepted": roles, "replace": replace, "reason": reason}
+
+    def resume_plan() -> dict:
+        return {"resumed": True}
+
+    return [
+        FunctionTool(
+            name=_ACCEPT_PLAN, description="接受本 user turn 的有序審查需求；明確改需求才 replace。",
+            input_model=ReviewPlan, func=accept_plan, approval_mode="never_require",
+        ),
+        FunctionTool(
+            name=_RESUME_PLAN, description="使用者已補材料或明確續辦時，續辦目前阻塞的需求。",
+            input_model={"type": "object", "properties": {}},
+            func=resume_plan, approval_mode="never_require",
+        ),
+    ]
+
+
+def build_completion_return_middleware(primary_name: str, role: SpecialistKey):
     """在原 chat stream 的 result hook 補控制 call，保留原 finalizer 與 hooks。"""
     from agent_framework import (
         ChatResponse, Content, FunctionTool, ResponseStream, chat_middleware,
@@ -349,14 +1040,7 @@ def build_completion_return_middleware(primary_name: str):
 
     @chat_middleware
     async def completion_return(context, call_next):
-        if (context.options or {}).get("store") is not False:
-            raise HandoffRoutingError("專家回交需要本機模型 history，store 必須為 False。")
-        if context.session is not None and context.session.service_session_id:
-            raise HandoffRoutingError(
-                "既有服務端 conversation 無法安全轉成本機 history，請建立新的 session／conversation。"
-            )
-        if any((context.options or {}).get(key) for key in ("previous_response_id", "conversation")):
-            raise HandoffRoutingError("專家回交不能引用既有服務端 response 或 conversation。")
+        _require_local_history(context.session, context.options)
         candidates = [
             tool for tool in (context.options or {}).get("tools", []) or []
             if isinstance(tool, FunctionTool) and tool.name == expected_name
@@ -376,6 +1060,7 @@ def build_completion_return_middleware(primary_name: str):
 
         def return_control(response: ChatResponse) -> ChatResponse:
             _check_response_complete(response)
+            _outcome(response, role)
             calls = [
                 content for message in response.messages for content in message.contents
                 if content.type == "function_call"
@@ -410,31 +1095,28 @@ def build_completion_return_middleware(primary_name: str):
     return completion_return
 
 
-def build_return_guard_middleware(primary_name: str):
+def build_return_guard_middleware(primary_name: str, role: SpecialistKey):
     """位於降級處理外層，消費完 stream 後仍核對 SDK 產生的回交結果。"""
     from agent_framework import AgentResponse, AgentResponseUpdate, ResponseStream, agent_middleware
 
-    def verify(response: AgentResponse) -> None:
+    def verify(response: AgentResponse, dispatch: HandoffDispatch) -> None:
         _check_response_complete(response)
-        if not response.messages:
-            raise HandoffRoutingError("專家沒有 SDK 回交結果。")
-        results = [
-            content for content in response.messages[-1].contents
-            if content.type == "function_result"
-        ]
-        if len(results) != 1 or not results[0].call_id:
-            raise HandoffRoutingError("專家沒有唯一的 SDK 回交結果。")
-        payload = results[0].result
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except json.JSONDecodeError:
-                raise HandoffRoutingError("SDK 回交結果格式不符。") from None
-        if not isinstance(payload, Mapping) or dict(payload) != {"handoff_to": primary_name}:
+        call_id, target = _handoff_result(response)
+        if target != primary_name:
             raise HandoffRoutingError("SDK 回交結果未指向 Primary。")
+        outcome = _outcome(response, role)
+        message = _assistant_message(response)
+        receipt = OutcomeReceipt(
+            dispatch=dispatch, source=message.author_name or "",
+            handoff_call_id=call_id, outcome=outcome,
+        )
+        message.additional_properties = {
+            **(message.additional_properties or {}), _RECEIPT_KEY: receipt.model_dump(mode="json"),
+        }
 
     @agent_middleware
     async def return_guard(context, call_next):
+        dispatch = _read_dispatch(context.messages, role, primary_name)
         await call_next()
         if context.stream and isinstance(context.result, ResponseStream):
             inner = context.result
@@ -445,18 +1127,40 @@ def build_return_guard_middleware(primary_name: str):
                         raise HandoffRoutingError("專家 stream 更新型別不符。")
                     _check_response_actions(update)
                     yield update
-                verify(await inner.get_final_response())
+                verify(await inner.get_final_response(), dispatch)
 
             async def original_finalizer(_updates: Sequence[AgentResponseUpdate]) -> AgentResponse:
                 return await inner.get_final_response()
 
             context.result = ResponseStream(checked_updates(), finalizer=original_finalizer)
         elif isinstance(context.result, AgentResponse):
-            verify(context.result)
+            verify(context.result, dispatch)
         else:
             raise HandoffRoutingError("專家 agent 結果型別不符合回交契約。")
 
     return return_guard
+
+
+def _strict_runtime_schema(schema: dict[str, object]) -> dict[str, object]:
+    result = deepcopy(schema)
+
+    def normalize(node: object) -> None:
+        if isinstance(node, dict):
+            node.pop("default", None)
+            if node.get("type") == "object":
+                properties = node.get("properties")
+                if not isinstance(properties, dict):
+                    raise HandoffRoutingError("Runtime object schema 缺少 properties。")
+                node["required"] = list(properties)
+                node["additionalProperties"] = False
+            for value in node.values():
+                normalize(value)
+        elif isinstance(node, list):
+            for value in node:
+                normalize(value)
+
+    normalize(result)
+    return result
 
 
 def build_participants(
@@ -468,10 +1172,9 @@ def build_participants(
     `HandoffBuilder.build()` 會直接以 `ValueError` 失敗，訊息會列出缺少設定的 agent。
     這個旗標讓本機保存的對話歷史，與服務端在交接工具呼叫短路後的狀態保持一致。
 
-    `response_format` 一律取自定義檔（Primary 為 `None`，三位專家為 `SpecialistReview`）。
-    這裡不可另外指定，否則就多出一份會與定義檔分歧的設定。
-    只有 specialists 新建的 options 加上 `store=False`，由 SDK 本機 history 保存
-    程式補的控制 call；不修改共用 client、角色定義或 Primary 的 storage 選擇。
+    Handoff-only options 使用 SpecialistOutcome（內含原 SpecialistReview）與 PrimaryReply。
+    四位參與者都使用 store=False，由 SDK 本機 history 保存程式補的控制 call/result。
+    共用 client、角色定義及 Lab 1 的 schema/行為不變。
 
     來源 M04（microsoft/agent-framework 官方 handoff sample 與原始碼）：
     https://github.com/microsoft/agent-framework
@@ -480,25 +1183,41 @@ def build_participants(
     participants: dict[str, Agent] = {}
     primary_name = roles["primary"].agent_name
     for key, role in roles.items():
-        default_options: dict[str, object] = {}
-        if role.response_format is not None:
-            default_options["response_format"] = role.response_format
-        if key in SPECIALIST_KEYS:
-            default_options["store"] = False
+        default_options: dict[str, object] = {
+            "store": False,
+            "response_format": _strict_runtime_schema(
+                PrimaryReply.model_json_schema() if key == "primary"
+                else SpecialistOutcome.model_json_schema()
+            ),
+        }
+        specialist_key: SpecialistKey | None = next(
+            (candidate for candidate in SPECIALIST_KEYS if candidate == key), None
+        )
+        if key == "primary":
+            default_options["tools"] = _planning_tools()
+            guard = build_primary_guard_middleware(roles)
+            policy = [build_plan_action_middleware(), build_primary_policy_middleware(roles)]
+        elif specialist_key is None:
+            raise HandoffRoutingError("未知 Handoff 參與者角色。")
+        else:
+            guard = build_return_guard_middleware(primary_name, specialist_key)
+            policy = [build_completion_return_middleware(primary_name, specialist_key)]
         participants[key] = client.as_agent(
             name=role.agent_name,
             description=role.description,
             instructions=(
-                role.instructions + _runtime_instructions(primary_name)
-                if key in SPECIALIST_KEYS else role.instructions
+                role.instructions + (
+                    _primary_runtime_instructions() if key == "primary"
+                    else _runtime_instructions(primary_name)
+                )
             ),
             default_options=default_options or None,
             require_per_service_call_history_persistence=True,
             middleware=[
-                *([build_return_guard_middleware(primary_name)] if key in SPECIALIST_KEYS else []),
+                guard,
                 *([build_checkpoint_safe_middleware()] if checkpoint_safe else []),
                 build_degraded_reply_middleware(role.agent_name),
-                *([build_completion_return_middleware(primary_name)] if key in SPECIALIST_KEYS else []),
+                *policy,
             ],
         )
     return participants

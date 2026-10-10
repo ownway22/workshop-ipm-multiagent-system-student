@@ -1,17 +1,23 @@
 import asyncio
+import gc
+import hashlib
 import json
+import shutil
 import tempfile
 import unittest
 import uuid
 from collections.abc import Awaitable, Mapping, Sequence
+from copy import deepcopy
 from pathlib import Path
-from types import SimpleNamespace
+from types import GenericAlias, SimpleNamespace
 from typing import Any, Never
 from unittest.mock import patch
 
 from httpx import ASGITransport, AsyncClient, MockTransport, Response
 from openai import AsyncOpenAI
+from pydantic import ValidationError
 from agent_framework import (
+    AgentSession,
     AgentResponse,
     AgentResponseUpdate,
     BaseChatClient,
@@ -20,6 +26,7 @@ from agent_framework import (
     ChatResponseUpdate,
     Content,
     Executor,
+    FileCheckpointStorage,
     FinishReason,
     FunctionInvocationLayer,
     FunctionTool,
@@ -35,17 +42,28 @@ from agent_framework import (
     response_handler,
 )
 from agent_framework.orchestrations import HandoffAgentUserRequest, HandoffBuilder, HandoffSentEvent
-from agent_framework.openai import OpenAIChatClient, OpenAIContinuationToken
-from azure.ai.agentserver.responses.models import CreateResponse, ItemMessage
+from agent_framework.openai import OpenAIChatClient, OpenAIChatOptions, OpenAIContinuationToken
+from azure.ai.agentserver.responses.models import CreateResponse, ItemMessage, MessageRole
 
 from agents import build_agent_roles
-from models.specialist_review import SpecialistReview
+from models.specialist_review import ReviewCategory, Severity, SpecialistReview
 from workflows.responses import HandoffRequestError, HandoffResponsesHost
 from workflows.handoff import (
     HandoffRoutingError,
+    PlanRevision,
+    PrimaryReply,
+    ReviewLedger,
+    SpecialistKey,
+    SpecialistOutcome,
+    _LEDGER_KEY,
+    _RECEIPT_KEY,
+    _outcome,
+    _strict_runtime_schema,
     build_checkpoint_safe_middleware,
     build_participants,
+    build_review_checkpoint_validator,
     build_workflow,
+    load_review_ledger,
 )
 
 
@@ -124,10 +142,12 @@ class ScriptedHandoffClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseCh
     """Replace only the model; framework middleware still handles the handoff tools."""
 
     def __init__(
-        self, name: str, script: Sequence[tuple[tuple[str, ...], str | None]]
+        self, name: str,
+        script: Sequence[tuple[tuple[str, ...], str | tuple[str, dict[str, Any]] | None]],
     ) -> None:
         super().__init__()
         self.name = name
+        self.response_prefix = name
         self.script = list(script)
         self.calls = 0
         self.requests = []
@@ -150,7 +170,7 @@ class ScriptedHandoffClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseCh
         self.calls += 1
         self.requests.append([message.to_dict() for message in messages])
         self.options_seen.append(dict(options))
-        message_id = f"{self.name}-{self.calls}"
+        message_id = f"{self.response_prefix}-{self.calls}"
         updates = [
             ChatResponseUpdate(
                 role="assistant",
@@ -172,7 +192,9 @@ class ScriptedHandoffClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseCh
             for text in chunks
         )
         if target is not None:
-            tool_name = f"handoff_to_{target}"
+            tool_name, arguments = (
+                target if isinstance(target, tuple) else (f"handoff_to_{target}", {})
+            )
             if not any(
                 isinstance(tool, FunctionTool) and tool.name == tool_name
                 for tool in options.get("tools", [])
@@ -180,7 +202,7 @@ class ScriptedHandoffClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseCh
                 raise AssertionError(f"Framework did not inject {tool_name}")
             updates.append(ChatResponseUpdate(
                 contents=[Content.from_function_call(
-                    call_id=message_id, name=tool_name, arguments={}
+                    call_id=message_id, name=tool_name, arguments=arguments
                 )],
                 role="assistant",
                 author_name=self.name,
@@ -254,6 +276,53 @@ class ScriptedRoleClients:
         agent = client.as_agent(**options)
         self.agents[name] = agent
         return agent
+
+
+class ObservedRoleClients(ScriptedRoleClients):
+    """Observe production policy; no test-only routing or ledger decisions."""
+
+    def __init__(self, scripts, *, roles, **kwargs):
+        super().__init__(scripts, **kwargs)
+        self.roles = roles
+        self.sessions_seen = {}
+        self.primary_results = []
+        self.incoming_roles = []
+
+    def as_agent(self, **options):
+        key = next(key for key, role in self.roles.items() if role.agent_name == options["name"])
+
+        @agent_middleware
+        async def observe(context, call_next):
+            self.sessions_seen[key] = context.session
+            if key == "primary":
+                self.incoming_roles.append([message.role for message in context.messages])
+            await call_next()
+            if key == "primary":
+                if context.stream:
+                    context.result.with_result_hook(self.primary_results.append)
+                else:
+                    self.primary_results.append(context.result)
+
+        options = dict(options)
+        options["middleware"] = [observe, *options.get("middleware", [])]
+        agent = super().as_agent(**options)
+        client = self.clients[options["name"]]
+        if isinstance(client, ScriptedHandoffClient):
+            client.response_prefix = f"{client.name}-{uuid.uuid4().hex}"
+        return agent
+
+    @property
+    def injected_calls(self):
+        responses = list(self.primary_results)
+        primary = self.clients.get(self.roles["primary"].agent_name)
+        if isinstance(primary, ScriptedHandoffClient):
+            responses.extend(primary.finalized_responses)
+        return list({
+            content.call_id
+            for response in responses for message in response.messages
+            for content in message.contents if content.type == "function_call"
+            and isinstance(content.call_id, str) and content.call_id.startswith("handoff_")
+        })
 
 
 class FaultHandoffClient(ScriptedHandoffClient):
@@ -331,13 +400,95 @@ class ServiceDefaultHandoffClient(ScriptedHandoffClient):
     STORES_BY_DEFAULT = True
 
 
+class StoredResponsesClient(OpenAIChatClient):
+    STORES_BY_DEFAULT = True
+
+
+def review_text(role: SpecialistKey, summary: str, *, indent=None) -> str:
+    return SpecialistOutcome(
+        kind="review",
+        review=SpecialistReview(
+            category=ReviewCategory({"coding": "code", "spec": "specification", "architect": "architecture"}[role]),
+            summary=summary, findings=["Synthetic finding."], severity=Severity.LOW,
+            evidence=["Synthetic material supplied in this offline test."],
+            recommendations=["Synthetic recommendation."], limitations=["Offline fixture only."],
+        ),
+    ).model_dump_json(indent=indent)
+
+
+def required_revision(session: AgentSession) -> PlanRevision:
+    ledger = required_ledger(session)
+    revision = ledger.current()
+    if revision is None:
+        raise AssertionError("Expected a persisted production revision.")
+    return revision
+
+
+def required_ledger(session: AgentSession) -> ReviewLedger:
+    ledger = load_review_ledger(session)
+    if ledger is None:
+        raise AssertionError("Expected a persisted production ledger.")
+    return ledger
+
+
+def reply_text(disposition, message, roles=(), *, unfinished=(), question=None):
+    return PrimaryReply(
+        disposition=disposition, message=message, reviewed=list(roles),
+        unfinished=list(unfinished), question=question,
+    ).model_dump_json()
+
+
+def planned_primary(roles, steps):
+    return [((), ("accept_review_plan", {"roles": list(roles)})), *steps]
+
+
+def assert_strict_schema(case: unittest.TestCase, schema: dict[str, Any]) -> None:
+    def visit(node):
+        if isinstance(node, dict):
+            case.assertNotIn("default", node)
+            if node.get("type") == "object":
+                properties = node.get("properties", {})
+                required = node.get("required", [])
+                case.assertEqual(
+                    set(required), set(properties), "strict schema must require every property"
+                )
+                case.assertEqual(len(required), len(properties))
+                case.assertIs(node.get("additionalProperties"), False)
+            if "$ref" in node:
+                reference = node["$ref"]
+                case.assertTrue(reference.startswith("#/"))
+                resolved = schema
+                for part in reference[2:].split("/"):
+                    key = part.replace("~1", "/").replace("~0", "~")
+                    case.assertIn(key, resolved)
+                    resolved = resolved[key]
+                case.assertIsInstance(resolved, dict)
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value)
+
+    visit(schema)
+
+
+def assert_strict_request_schema(case: unittest.TestCase, body: dict[str, Any]) -> None:
+    response_format = body["text"]["format"]
+    case.assertIs(response_format["strict"], True)
+    assert_strict_schema(case, response_format["schema"])
+    for tool in body.get("tools", []):
+        if tool.get("strict") is True:
+            assert_strict_schema(case, tool["parameters"])
+
+
 def provider_responses_events(
     chunks: Sequence[str], *, target: str | None = None,
     status: str | None = "completed", incomplete_reason: str | None = None,
+    call: tuple[str, dict[str, Any]] | None = None, response_id="resp_offline_provider",
 ):
     text = "".join(chunks)
     response = {
-        "id": "resp_offline_provider", "object": "response", "created_at": 1,
+        "id": response_id, "object": "response", "created_at": 1,
         "model": "offline-responses", "parallel_tool_calls": False,
         "tool_choice": "auto", "tools": [], "output": [], "status": "in_progress",
     }
@@ -367,26 +518,30 @@ def provider_responses_events(
         {"type": "response.output_item.done", "output_index": 0, "item": message},
     ]
     output = [message]
-    if target is not None:
-        call = {
+    if target is not None or call is not None:
+        name, arguments = call if call is not None else (f"handoff_to_{target}", {})
+        tool_call = {
             "type": "function_call", "id": "fc_offline_provider",
-            "call_id": "call_offline_provider", "name": f"handoff_to_{target}",
-            "arguments": "{}", "status": "completed",
+            "call_id": f"call_{response_id}", "name": name,
+            "arguments": json.dumps(arguments), "status": "completed",
         }
-        call_location = {"item_id": call["id"], "output_index": 1}
+        call_location = {"item_id": tool_call["id"], "output_index": 1}
         events.extend([
             {
                 "type": "response.output_item.added", "output_index": 1,
-                "item": {**call, "arguments": "", "status": "in_progress"},
+                "item": {**tool_call, "arguments": "", "status": "in_progress"},
             },
-            {"type": "response.function_call_arguments.delta", **call_location, "delta": "{}"},
+            {
+                "type": "response.function_call_arguments.delta", **call_location,
+                "delta": tool_call["arguments"],
+            },
             {
                 "type": "response.function_call_arguments.done", **call_location,
-                "name": call["name"], "arguments": "{}",
+                "name": tool_call["name"], "arguments": tool_call["arguments"],
             },
-            {"type": "response.output_item.done", "output_index": 1, "item": call},
+            {"type": "response.output_item.done", "output_index": 1, "item": tool_call},
         ])
-        output.append(call)
+        output.append(tool_call)
     if status is not None:
         events.append({
             "type": f"response.{status}",
@@ -440,7 +595,8 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         ])
 
     def production_host(
-        self, scripts, *, suffix="production", client_factory=None, middleware_factory=None
+        self, scripts, *, suffix="production", client_factory=None, middleware_factory=None,
+        source_factory=None,
     ):
         roles = build_agent_roles("policy-")
         sources = []
@@ -448,14 +604,17 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         def factory():
             named_scripts = {
                 roles[key].agent_name: [
-                    (chunks, roles[target].agent_name if target is not None else None)
+                    (chunks, roles[target].agent_name if isinstance(target, str) else target)
                     for chunks, target in steps
                 ]
                 for key, steps in scripts.items()
             }
-            source = ScriptedRoleClients(
-                named_scripts, client_factory=client_factory,
-                middleware_factory=middleware_factory,
+            arguments = {
+                "client_factory": client_factory, "middleware_factory": middleware_factory,
+            }
+            source = (
+                source_factory(named_scripts, roles=roles, **arguments)
+                if source_factory is not None else ScriptedRoleClients(named_scripts, **arguments)
             )
             sources.append(source)
             return build_workflow(
@@ -465,11 +624,995 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
 
         return (
             HandoffResponsesHost(
-                factory, checkpoint_root=self.root / suffix, configure_observability=None
+                factory, checkpoint_root=self.root / suffix,
+                checkpoint_validator=build_review_checkpoint_validator(roles),
+                configure_observability=None,
             ),
             roles,
             sources,
         )
+
+    def ledger_host(self, scripts, **kwargs):
+        def source_factory(named_scripts, *, roles, **arguments):
+            return ObservedRoleClients(
+                named_scripts, roles=roles, **arguments,
+            )
+        return self.production_host(
+            scripts, source_factory=source_factory,
+            client_factory=kwargs.pop("client_factory", ServiceDefaultHandoffClient), **kwargs,
+        )
+
+    async def ledger_turn(
+        self, host, *, conversation="prototype", previous=None, text="Synthetic supplied material.",
+    ):
+        request = {"input": text, "stream": False}
+        request["previous_response_id" if previous is not None else "conversation"] = (
+            previous if previous is not None else conversation
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=host), base_url="http://localhost"
+        ) as client:
+            with self.assertLogs("workflows.responses", level="INFO") as captured:
+                response = await client.post("/responses", json=request)
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json(), captured
+
+    def ledger_checkpoint_dir(self, root, response_id):
+        digest = hashlib.sha256(response_id.encode()).hexdigest()
+        directories = list(root.glob(f"*/responses/{digest}"))
+        self.assertEqual(len(directories), 1)
+        return directories[0]
+
+    def ledger_transitions(self, captured):
+        return [
+            record.args for record in captured.records
+            if record.msg == "Handoff transition: source=%s target=%s"
+        ]
+
+    async def test_ledger_file_restore_forks_and_isolation(self):
+        spec = review_text("spec", "SPEC-REVIEW")
+        needs = SpecialistOutcome(
+            kind="needs_input", detail="Capacity material is missing.", question="What is the capacity target?"
+        ).model_dump_json()
+        blocked = reply_text(
+            "needs_input", "Spec reviewed; architecture incomplete.", ["spec"],
+            unfinished=["architect"], question="What is the capacity target?",
+        )
+        host, roles, sources = self.ledger_host({
+            "primary": [
+                ((), ("accept_review_plan", {"roles": ["spec", "architect"]})),
+                (("START\n",), "spec"), (("I will process architecture later.\n",), None),
+                ((blocked,), None),
+            ],
+            "spec": [((spec,), None)],
+            "architect": [((needs,), None)],
+        }, suffix="prototype-durable")
+        first, captured = await self.ledger_turn(host)
+        self.assertEqual(first["status"], "completed")
+        self.assertEqual(self.ledger_transitions(captured), [
+            (roles["primary"].agent_name, roles["spec"].agent_name),
+            (roles["spec"].agent_name, roles["primary"].agent_name),
+            (roles["primary"].agent_name, roles["architect"].agent_name),
+            (roles["architect"].agent_name, roles["primary"].agent_name),
+        ])
+        owner = sources[0].sessions_seen["primary"]
+        ledger = required_revision(owner)
+        self.assertEqual([task.status for task in ledger.tasks], ["reviewed", "needs_input"])
+        self.assertEqual(ledger.tasks[1].attempts, 1)
+        for key in ("spec", "architect"):
+            self.assertIsNot(owner.state, sources[0].sessions_seen[key].state)
+            self.assertNotIn(_LEDGER_KEY, sources[0].sessions_seen[key].state)
+        original_dir = self.ledger_checkpoint_dir(self.root / "prototype-durable", first["id"])
+        storage = FileCheckpointStorage(
+            original_dir,
+            allowed_checkpoint_types=[
+                f"{kind.__module__}:{kind.__qualname__}"
+                for kind in (HandoffAgentUserRequest, MessageRole, GenericAlias)
+            ],
+        )
+        self.assertIsInstance(storage, FileCheckpointStorage)
+        checkpoints = await storage.list_checkpoints(workflow_name="production-policy-test")
+        self.assertEqual(len(checkpoints), 1)
+        original_file = original_dir / f"{checkpoints[0].checkpoint_id}.json"
+        original_bytes = original_file.read_bytes()
+        self.assertIn(_LEDGER_KEY, original_bytes.decode())
+        self.assertNotIn("test_handoff_responses:Prototype", original_bytes.decode())
+        del owner, ledger, host, checkpoints
+        sources.clear()
+        gc.collect()
+
+        branches = []
+        for branch in ("fork-a", "fork-b"):
+            architecture = review_text("architect", branch)
+            complete = reply_text("complete", f"Verified {branch} summary.", ["spec", "architect"])
+            restarted, _, new_sources = self.ledger_host({
+                "primary": [
+                    ((), ("resume_review_plan", {})),
+                    (("I will process architecture later.\n",), None),
+                    ((complete,), None),
+                ],
+                "spec": [],
+                "architect": [((architecture,), None)],
+            }, suffix="prototype-durable")
+            result, log = await self.ledger_turn(
+                restarted, conversation=branch, previous=first["id"]
+            )
+            self.assertEqual(result["status"], "completed", result)
+            self.assertEqual(self.ledger_transitions(log), [
+                (roles["primary"].agent_name, roles["architect"].agent_name),
+                (roles["architect"].agent_name, roles["primary"].agent_name),
+            ])
+            restored = required_revision(new_sources[0].sessions_seen["primary"])
+            self.assertEqual([task.status for task in restored.tasks], ["reviewed", "reviewed"])
+            outcome = restored.tasks[0].outcome
+            if outcome is None or outcome.review is None:
+                self.fail("Restored completed task lost its validated review.")
+            self.assertEqual(outcome.review.summary, "SPEC-REVIEW")
+            self.assertEqual(restored.tasks[0].attempts, 1)
+            self.assertEqual(restored.tasks[1].attempts, 2)
+            self.assertEqual(new_sources[0].clients[roles["spec"].agent_name].calls, 0)
+            self.assertEqual(new_sources[0].clients[roles["architect"].agent_name].calls, 1)
+            output = "".join(
+                part["text"] for item in result["output"] if item["type"] == "message"
+                for part in item["content"] if part["type"] == "output_text"
+            )
+            self.assertNotIn("SPEC-REVIEW", output)
+            self.assertEqual(output.count(architecture), 1)
+            branch_dir = self.ledger_checkpoint_dir(self.root / "prototype-durable", result["id"])
+            branches.append((branch_dir, {path.name: path.read_bytes() for path in branch_dir.glob("*.json")}))
+            self.assertEqual(original_file.read_bytes(), original_bytes)
+        for directory, snapshot in branches:
+            self.assertEqual({path.name: path.read_bytes() for path in directory.glob("*.json")}, snapshot)
+
+        separate, _, fresh = self.ledger_host({
+            "primary": [((reply_text(
+                "clarify", "Review intent is unclear.", question="What kind of review do you need?"
+            ),), None)],
+        }, suffix="prototype-durable")
+        isolated, log = await self.ledger_turn(separate, conversation="independent")
+        self.assertEqual(isolated["status"], "completed")
+        self.assertEqual(self.ledger_transitions(log), [])
+        self.assertEqual(required_ledger(fresh[0].sessions_seen["primary"]).revisions, [])
+
+    async def test_ledger_result_only_and_existing_ordered_handoffs(self):
+        plans: tuple[list[SpecialistKey], ...] = (
+            ["coding"], ["coding", "architect"], ["spec", "architect"],
+        )
+        for tasks in plans:
+            for existing in (False, True):
+                with self.subTest(tasks=tasks, existing=existing):
+                    scripts = {
+                        "primary": [
+                            ((), ("accept_review_plan", {"roles": tasks})),
+                            (("START\n",), tasks[0]),
+                        ],
+                    }
+                    for index, role in enumerate(tasks):
+                        scripts[role] = [((review_text(role, f"{role}-REVIEW"),), "primary" if existing else None)]
+                        if index + 1 < len(tasks):
+                            scripts["primary"].append(
+                                (("I will handle the next requirement later.\n",), tasks[index + 1] if existing else None)
+                            )
+                    scripts["primary"].append((
+                        (reply_text("complete", "Verified summary.", tasks),), None,
+                    ))
+                    host, roles, sources = self.ledger_host(
+                        scripts, suffix=f"prototype-ordered-{tasks[0]}-{len(tasks)}-{existing}",
+                    )
+                    result, captured = await self.ledger_turn(host)
+                    self.assertEqual(result["status"], "completed", result)
+                    primary = roles["primary"].agent_name
+                    self.assertEqual(self.ledger_transitions(captured), [
+                        edge for role in tasks for edge in (
+                            (primary, roles[role].agent_name), (roles[role].agent_name, primary),
+                        )
+                    ])
+                    self.assertEqual(sources[0].clients[primary].calls, len(tasks) + 2)
+                    self.assertEqual(len(sources[0].injected_calls), 0 if existing else len(tasks) - 1)
+                    text = "".join(
+                        part["text"] for item in result["output"] if item["type"] == "message"
+                        for part in item["content"] if part["type"] == "output_text"
+                    )
+                    for role in tasks:
+                        self.assertEqual(sources[0].clients[roles[role].agent_name].calls, 1)
+                        self.assertEqual(text.count(review_text(role, f"{role}-REVIEW")), 1)
+                    self.assertEqual([
+                        task.status for task in required_revision(sources[0].sessions_seen["primary"]).tasks
+                    ], ["reviewed"] * len(tasks))
+
+    async def test_ledger_outcomes_and_invalid_plan_fail_closed(self):
+        cases = (
+            ("tool_only", (), "primary", ["spec", "architect"], None, "spec"),
+            ("wrong_category", (review_text("coding", "WRONG"),), None, ["spec"], None, "spec"),
+            ("forged_done", ('{"kind":"review","done":true,"handled_by":["spec"]}',), None, ["spec"], None, "spec"),
+            ("wrong_order", (review_text("spec", "SPEC"),), None, ["spec", "architect"], None, "architect"),
+            ("duplicate_plan", (review_text("spec", "SPEC"),), None, ["spec", "spec"], None, "spec"),
+            ("unavailable", (SpecialistOutcome(kind="unavailable", detail="Synthetic service unavailable.").model_dump_json(),), None,
+             ["spec", "architect"], reply_text(
+                 "unavailable", "Spec unavailable; architecture unfinished.", unfinished=["spec", "architect"]
+             ), "spec"),
+        )
+        for label, chunks, target, tasks, answer, first in cases:
+            with self.subTest(case=label):
+                scripts = {
+                    "primary": [
+                        ((), ("accept_review_plan", {"roles": tasks})),
+                        (("START\n",), first),
+                    ],
+                    "spec": [(chunks, target)],
+                }
+                if answer is not None:
+                    scripts["primary"].append(((answer,), None))
+                host, roles, sources = self.ledger_host(scripts, suffix=f"prototype-{label}")
+                result, captured = await self.ledger_turn(host)
+                self.assertEqual(result["status"], "completed" if answer is not None else "failed", result)
+                self.assertEqual(sources[0].clients[roles["architect"].agent_name].calls, 0)
+                ledger = load_review_ledger(sources[0].sessions_seen["primary"])
+                revision = ledger.current() if ledger is not None else None
+                if revision is not None:
+                    self.assertNotIn("reviewed", [task.status for task in revision.tasks])
+                if answer is None:
+                    self.assertEqual(result["error"]["code"], "server_error")
+                    self.assertFalse(any(
+                        record.msg == "Handoff waiting for user input: source=%s request_id=%s"
+                        for record in captured.records
+                    ))
+                else:
+                    if revision is None:
+                        self.fail("Unavailable outcome lost its accepted plan.")
+                    self.assertEqual([task.status for task in revision.tasks], ["unavailable", "pending"])
+                    outcome = revision.tasks[0].outcome
+                    if outcome is None:
+                        self.fail("Unavailable task lost its typed outcome.")
+                    self.assertIsNone(outcome.review)
+                    self.assertEqual(sources[0].clients[roles["spec"].agent_name].calls, 1)
+
+    async def test_ledger_missing_corrupt_state_and_legacy_id_are_not_reset(self):
+        blocked = reply_text(
+            "needs_input", "Spec and architecture incomplete.", unfinished=["spec", "architect"],
+            question="Please supply missing specification details?",
+        )
+        host, _, initial = self.ledger_host({
+            "primary": [
+                ((), ("accept_review_plan", {"roles": ["spec", "architect"]})),
+                (("START\n",), "spec"), ((blocked,), None),
+            ],
+            "spec": [((
+                SpecialistOutcome(
+                    kind="needs_input", detail="Missing specification details.",
+                    question="Please supply specification details?",
+                ).model_dump_json(),
+            ), None)],
+        }, suffix="prototype-corrupt")
+        first, _ = await self.ledger_turn(host)
+        self.assertEqual(first["status"], "completed")
+        del host
+        initial.clear()
+        gc.collect()
+        for fault in ("missing", "missing_marker", "corrupt", "coerced_counter", "legacy"):
+            with self.subTest(fault=fault):
+                sessions = []
+
+                @agent_middleware
+                async def damage(context, call_next):
+                    sessions.append(context.session)
+                    if fault in ("missing", "missing_marker"):
+                        context.session.state.pop(_LEDGER_KEY)
+                        if fault == "missing_marker":
+                            context.session.state.pop("handoff.requirements_initialized")
+                    elif fault == "corrupt":
+                        context.session.state[_LEDGER_KEY] = {"version": 1, "tasks": []}
+                    elif fault == "coerced_counter":
+                        context.session.state[_LEDGER_KEY]["turn"]["model_calls"] = "1"
+                    else:
+                        context.session.service_session_id = "resp_unmigrated_legacy"
+                    await call_next()
+
+                def extra(name):
+                    return [damage] if name == roles["primary"].agent_name else []
+
+                restarted, roles, sources = self.ledger_host(
+                    {"primary": []}, suffix="prototype-corrupt", middleware_factory=extra,
+                )
+                result, captured = await self.ledger_turn(
+                    restarted, conversation=fault, previous=first["id"]
+                )
+                self.assertEqual(result["status"], "failed", result)
+                self.assertEqual(sources[0].clients[roles["primary"].agent_name].calls, 0)
+                self.assertEqual(self.ledger_transitions(captured), [])
+                if fault == "legacy":
+                    self.assertEqual(sessions[0].service_session_id, "resp_unmigrated_legacy")
+                elif fault in ("missing", "missing_marker"):
+                    self.assertNotIn(_LEDGER_KEY, sessions[0].state)
+                elif fault == "coerced_counter":
+                    self.assertEqual(sessions[0].state[_LEDGER_KEY]["turn"]["model_calls"], "1")
+                else:
+                    self.assertEqual(sessions[0].state[_LEDGER_KEY]["tasks"], [])
+
+    async def test_ledger_restore_owner_state_is_validated_before_sdk_fallback(self):
+        needs = SpecialistOutcome(
+            kind="needs_input", detail="Architecture capacity is missing.",
+            question="What capacity is required?",
+        ).model_dump_json()
+        host, roles, sources = self.ledger_host({
+            "primary": planned_primary(["spec", "architect"], [
+                (("START\n",), "spec"), (("Architecture will be handled later.\n",), None),
+                ((reply_text(
+                    "needs_input", "Spec reviewed; architecture remains incomplete.", ["spec"],
+                    unfinished=["architect"], question="What capacity is required?",
+                ),), None),
+            ]),
+            "spec": [((review_text("spec", "PRESERVED-SPEC"),), None)],
+            "architect": [((needs,), None)],
+        }, suffix="restore-owner")
+        first, _ = await self.ledger_turn(host, conversation="restore-owner")
+        self.assertEqual(first["status"], "completed")
+        original_ledger = required_revision(sources[0].sessions_seen["primary"])
+        self.assertEqual([task.status for task in original_ledger.tasks], ["reviewed", "needs_input"])
+        original_root = self.root / "restore-owner"
+        original_snapshot = {
+            path.relative_to(original_root): path.read_bytes()
+            for path in original_root.rglob("*") if path.is_file()
+        }
+        allowed_types = [
+            f"{kind.__module__}:{kind.__qualname__}"
+            for kind in (HandoffAgentUserRequest, MessageRole, GenericAlias)
+        ]
+        del host, original_ledger
+        sources.clear()
+        gc.collect()
+        faults = (
+            "missing_agent_session", "missing_state", "empty_state", "null_state",
+            "wrong_state_type", "missing_ledger", "corrupt_ledger", "unsupported_version",
+            "contradictory_ledger",
+        )
+        for fault in faults:
+            with self.subTest(fault=fault):
+                suffix = f"restore-owner-{fault}"
+                damaged_root = self.root / suffix
+                shutil.copytree(original_root, damaged_root)
+                checkpoint_dir = self.ledger_checkpoint_dir(damaged_root, first["id"])
+                storage = FileCheckpointStorage(checkpoint_dir, allowed_checkpoint_types=allowed_types)
+                checkpoints = await storage.list_checkpoints(workflow_name="production-policy-test")
+                self.assertEqual(len(checkpoints), 1)
+                checkpoint = checkpoints[0]
+                executor = checkpoint.state["_executor_state"][roles["primary"].agent_name]
+                session = executor["agent_session"]
+                if fault == "missing_agent_session":
+                    executor.pop("agent_session")
+                elif fault == "missing_state":
+                    session.pop("state")
+                elif fault == "empty_state":
+                    session["state"] = {}
+                elif fault == "null_state":
+                    session["state"] = None
+                elif fault == "wrong_state_type":
+                    session["state"] = []
+                elif fault == "missing_ledger":
+                    session["state"].pop(_LEDGER_KEY)
+                elif fault == "corrupt_ledger":
+                    session["state"][_LEDGER_KEY] = {"version": 1, "revisions": []}
+                elif fault == "unsupported_version":
+                    session["state"][_LEDGER_KEY]["version"] = 99
+                else:
+                    session["state"][_LEDGER_KEY]["turn"]["closed"] = False
+                await storage.save(checkpoint)
+                before_restore = {
+                    path.relative_to(damaged_root): path.read_bytes()
+                    for path in damaged_root.rglob("*") if path.is_file()
+                }
+                restarted, _, fresh_sources = self.ledger_host({
+                    "primary": [((reply_text(
+                        "out_of_scope", "This request is outside our review capabilities.",
+                    ),), None)],
+                }, suffix=suffix)
+                result, captured = await self.ledger_turn(
+                    restarted, conversation="restore-owner", text="Continue the unfinished review.",
+                )
+                self.assertEqual(result["status"], "failed", result)
+                self.assertEqual(result["error"]["code"], "server_error")
+                self.assertEqual(self.ledger_transitions(captured), [])
+                self.assertEqual(fresh_sources[0].sessions_seen, {})
+                self.assertTrue(all(client.calls == 0 for client in fresh_sources[0].clients.values()))
+                self.assertEqual({
+                    path.relative_to(damaged_root): path.read_bytes()
+                    for path in damaged_root.rglob("*") if path.is_file()
+                }, before_restore)
+                self.assertEqual({
+                    path.relative_to(original_root): path.read_bytes()
+                    for path in original_root.rglob("*") if path.is_file()
+                }, original_snapshot)
+
+    def test_responses_entrypoint_enables_ledger_restore_validation(self):
+        from main import _serve_responses
+
+        with patch("workflows.responses.HandoffResponsesHost") as host_class:
+            _serve_responses(workflow, "127.0.0.1", 8088)
+        host_class.assert_called_once()
+        self.assertIs(host_class.call_args.args[0], workflow)
+        validator = host_class.call_args.kwargs["checkpoint_validator"]
+        self.assertTrue(callable(validator))
+        host_class.return_value.run.assert_called_once_with(host="127.0.0.1", port=8088)
+
+    async def test_ledger_primary_clarification_and_boundary_do_not_handoff(self):
+        for reply in (
+            reply_text("clarify", "Review scope is unclear.", question="Which material should I review?"),
+            reply_text("out_of_scope", "This request is outside our review capabilities."),
+        ):
+            with self.subTest(reply=reply):
+                host, roles, sources = self.ledger_host(
+                    {"primary": [((reply,), None)]}, suffix=reply[:5],
+                )
+                result, captured = await self.ledger_turn(host)
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(self.ledger_transitions(captured), [])
+                self.assertEqual(required_ledger(sources[0].sessions_seen["primary"]).revisions, [])
+                for role in ("spec", "architect", "coding"):
+                    self.assertEqual(sources[0].clients[roles[role].agent_name].calls, 0)
+
+    async def test_ledger_duplicate_review_and_resume_limit_do_not_loop(self):
+        spec = review_text("spec", "ONCE-ONLY-SPEC")
+        host, roles, sources = self.ledger_host({
+            "primary": [
+                ((), ("accept_review_plan", {"roles": ["spec", "architect"]})),
+                (("START\n",), "spec"), (("Review Spec again.\n",), "spec"),
+            ],
+            "spec": [((spec,), None)],
+        }, suffix="prototype-duplicate-review")
+        result, captured = await self.ledger_turn(host)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(sources[0].clients[roles["spec"].agent_name].calls, 1)
+        self.assertEqual(sources[0].clients[roles["architect"].agent_name].calls, 0)
+        self.assertEqual(len(self.ledger_transitions(captured)), 2)
+        self.assertEqual([
+            task.status for task in required_revision(sources[0].sessions_seen["primary"]).tasks
+        ], ["reviewed", "pending"])
+
+        need = SpecialistOutcome(
+            kind="needs_input", detail="Missing architecture detail.", question="What is the target capacity?"
+        ).model_dump_json()
+        answer = reply_text(
+            "needs_input", "Architecture is still incomplete.", unfinished=["architect"],
+            question="What is the target capacity?",
+        )
+        host, _, sources = self.ledger_host({
+            "primary": [
+                ((), ("accept_review_plan", {"roles": ["architect"]})),
+                (("START\n",), "architect"), ((answer,), None),
+            ],
+            "architect": [((need,), None)],
+        }, suffix="prototype-resume-limit")
+        first, _ = await self.ledger_turn(host)
+        self.assertEqual(first["status"], "completed")
+        del host
+        sources.clear()
+        restarted, _, resumed = self.ledger_host({
+            "primary": [
+                ((), ("resume_review_plan", {})),
+                (("Process missing detail.\n",), None), ((answer,), None),
+            ],
+            "architect": [((need,), None)],
+        }, suffix="prototype-resume-limit")
+        second, _ = await self.ledger_turn(restarted, previous=first["id"])
+        self.assertEqual(second["status"], "completed")
+        self.assertEqual(required_revision(
+            resumed[0].sessions_seen["primary"]
+        ).tasks[0].attempts, 2)
+        final, _, last_sources = self.ledger_host({
+            "primary": [((), ("resume_review_plan", {}))],
+        }, suffix="prototype-resume-limit")
+        rejected, captured = await self.ledger_turn(final, previous=second["id"])
+        self.assertEqual(rejected["status"], "failed")
+        self.assertEqual(self.ledger_transitions(captured), [])
+        self.assertEqual(last_sources[0].clients[roles["primary"].agent_name].calls, 1)
+        self.assertEqual(last_sources[0].clients[roles["architect"].agent_name].calls, 0)
+        self.assertEqual(required_revision(
+            last_sources[0].sessions_seen["primary"]
+        ).tasks[0].status, "needs_input")
+
+    async def test_ledger_primary_wire_storage_and_fresh_continuation(self):
+        requests = []
+        rejected = []
+        response_scripts = [
+            ((), ("accept_review_plan", {"roles": ["spec", "architect"]})),
+            (("START\n",), "spec"),
+            (("I will process architecture later.\n",), None),
+            ((reply_text("complete", "Verified initial summary.", ["spec", "architect"]),), None),
+            ((reply_text("recap", "Recall the prior reviews.", ["spec", "architect"]),), None),
+        ]
+
+        def provider(request):
+            body = json.loads(request.content)
+            assert_strict_request_schema(self, body)
+            requests.append(body)
+            supplied_calls = {
+                item["call_id"] for item in body["input"] if item.get("type") == "function_call"
+            }
+            results = {
+                item["call_id"] for item in body["input"] if item.get("type") == "function_call_output"
+            }
+            unknown = results - supplied_calls
+            if unknown:
+                rejected.extend(unknown)
+                return Response(400, json={"error": {
+                    "type": "invalid_request_error", "code": "unmatched_tool_result",
+                    "message": "Synthetic provider: tool result refers to no known call.",
+                }})
+            index = len(requests) - 1
+            self.assertLess(index, len(response_scripts))
+            chunks, target = response_scripts[index]
+            return Response(
+                200, headers={"content-type": "text/event-stream"},
+                text=provider_responses_events(
+                    chunks,
+                    target=roles[target].agent_name if isinstance(target, str) else None,
+                    call=target if isinstance(target, tuple) else None,
+                    response_id=f"resp_local_{index}",
+                ),
+            )
+
+        async with AsyncClient(transport=MockTransport(provider)) as provider_http:
+            async with AsyncOpenAI(
+                api_key="offline-fixture-not-a-real-key", base_url="http://offline.invalid/v1",
+                http_client=provider_http, max_retries=0,
+            ) as openai_client:
+                def client_factory(name, script):
+                    if name == roles["primary"].agent_name:
+                        return StoredResponsesClient(model="offline-responses", async_client=openai_client)
+                    return ServiceDefaultHandoffClient(name, script)
+
+                host, roles, sources = self.ledger_host({
+                    "spec": [((review_text("spec", "WIRE-SPEC"),), None)],
+                    "architect": [((review_text("architect", "WIRE-ARCHITECT"),), None)],
+                }, suffix="wire-history", client_factory=client_factory)
+                first, captured = await self.ledger_turn(
+                    host, text="WIRE-ORIGINAL-MATERIAL: only in the first user request.",
+                )
+                self.assertEqual(first["status"], "completed", first)
+                self.assertEqual(len(self.ledger_transitions(captured)), 4)
+                injected_calls = {
+                    item["call_id"] for body in requests for item in body["input"]
+                    if item.get("type") == "function_call"
+                    and item.get("name") == f"handoff_to_{roles['architect'].agent_name}"
+                }
+                self.assertEqual(len(injected_calls), 1)
+                injected = injected_calls.pop()
+                del host
+                sources.clear()
+                gc.collect()
+                restarted, _, resumed = self.ledger_host(
+                    {}, suffix="wire-history", client_factory=client_factory,
+                )
+                second, captured = await self.ledger_turn(
+                    restarted, previous=first["id"], text="WIRE-FOLLOWUP: no repeated material.",
+                )
+                self.assertEqual(second["status"], "completed", second)
+                self.assertEqual(self.ledger_transitions(captured), [])
+                self.assertEqual(len(requests), 5)
+                self.assertEqual(rejected, [])
+                for body in requests:
+                    self.assertIs(body["store"], False)
+                    self.assertFalse(body.get("previous_response_id") or body.get("conversation"))
+                    calls = {item["call_id"] for item in body["input"] if item.get("type") == "function_call"}
+                    results = {item["call_id"] for item in body["input"] if item.get("type") == "function_call_output"}
+                    self.assertEqual(calls, results)
+                last_calls = [
+                    item["call_id"] for item in requests[-1]["input"] if item.get("type") == "function_call"
+                ]
+                self.assertIn(injected, last_calls)
+                self.assertEqual(len(last_calls), len(set(last_calls)))
+                for text in ("WIRE-SPEC", "WIRE-ARCHITECT", "WIRE-ORIGINAL-MATERIAL", "WIRE-FOLLOWUP"):
+                    self.assertIn(text, json.dumps(requests[-1]["input"]))
+                self.assertIsNone(resumed[0].sessions_seen["primary"].service_session_id)
+                self.assertEqual([task.status for task in required_revision(
+                    resumed[0].sessions_seen["primary"]
+                ).tasks], ["reviewed", "reviewed"])
+
+    async def test_runtime_response_schema_actual_serialization(self):
+        roles = build_agent_roles("strict-schema-")
+        roles_before = {
+            key: (role.instructions, role.response_format) for key, role in roles.items()
+        }
+        source = ScriptedRoleClients({})
+        participants = build_participants(source, roles)
+        schemas = []
+        active_role = "primary"
+
+        def provider(request):
+            body = json.loads(request.content)
+            schema = body["text"]["format"]["schema"]
+            schemas.append(deepcopy(schema))
+            assert_strict_request_schema(self, body)
+            properties = schema["properties"]
+            self.assertEqual(
+                {branch.get("type") for branch in properties["question"]["anyOf"]},
+                {"string", "null"},
+            )
+            if active_role == "primary":
+                for key in ("reviewed", "unfinished"):
+                    self.assertEqual(properties[key]["type"], "array")
+                    self.assertNotIn("anyOf", properties[key])
+                    self.assertEqual(
+                        set(properties[key]["items"]["enum"]), {"coding", "spec", "architect"}
+                    )
+                text = reply_text("clarify", "Scope is unclear.", question="Which material?")
+                planning_tools = [
+                    tool for tool in body["tools"]
+                    if tool["name"] in ("accept_review_plan", "resume_review_plan")
+                ]
+                self.assertEqual(len(planning_tools), 2)
+                self.assertTrue(all(tool["strict"] is False for tool in planning_tools))
+            else:
+                review_branch = properties["review"]["anyOf"]
+                self.assertTrue(any(branch.get("type") == "null" for branch in review_branch))
+                self.assertTrue(any(branch.get("$ref") == "#/$defs/SpecialistReview" for branch in review_branch))
+                text = review_text("spec", "Strict schema review.")
+            return Response(
+                200, headers={"content-type": "text/event-stream"},
+                text=provider_responses_events((text,)),
+            )
+
+        async with AsyncClient(transport=MockTransport(provider)) as provider_http:
+            async with AsyncOpenAI(
+                api_key="offline-fixture-not-a-real-key", base_url="http://offline.invalid/v1",
+                http_client=provider_http, max_retries=0,
+            ) as openai_client:
+                client = OpenAIChatClient(model="offline-responses", async_client=openai_client)
+                for active_role in ("primary", "spec"):
+                    options: OpenAIChatOptions = {
+                        "store": False,
+                        "response_format": participants[active_role].default_options["response_format"],
+                        "tools": participants[active_role].default_options.get("tools"),
+                    }
+                    response = client.get_response(
+                        messages=[Message("user", ["Offline schema fixture."])], stream=True,
+                        options=options,
+                    )
+                    async for _ in response:
+                        pass
+                    await response.get_final_response()
+        self.assertEqual(len(schemas), 2)
+        self.assertEqual(
+            {key: (role.instructions, role.response_format) for key, role in roles.items()},
+            roles_before,
+        )
+
+    def test_runtime_schema_normalization_preserves_constraints_and_semantics(self):
+        def unchanged_contract(node):
+            if isinstance(node, dict):
+                return {
+                    key: unchanged_contract(value) for key, value in node.items()
+                    if key not in ("required", "additionalProperties", "default")
+                }
+            if isinstance(node, list):
+                return [unchanged_contract(value) for value in node]
+            return node
+
+        for model in (PrimaryReply, SpecialistOutcome):
+            with self.subTest(model=model.__name__):
+                original = model.model_json_schema()
+                before = deepcopy(original)
+                self.assertIn("default", original["properties"]["question"])
+                normalized = _strict_runtime_schema(original)
+                assert_strict_schema(self, normalized)
+                self.assertEqual(original, before)
+                self.assertEqual(model.model_json_schema(), before)
+                self.assertEqual(unchanged_contract(normalized), unchanged_contract(original))
+                self.assertIsNone(model.model_fields["question"].default)
+
+        replies = (
+            reply_text("complete", "Review completed.", ["spec"]),
+            reply_text("recap", "Recall existing results.", ["spec"]),
+            reply_text("clarify", "Scope unclear.", question="Which material?"),
+            reply_text("needs_input", "Review remains incomplete.", unfinished=["spec"],
+                       question="Please provide the specification?"),
+            reply_text("unavailable", "Spec service is unavailable.", unfinished=["spec"]),
+            reply_text("out_of_scope", "This request is outside our capabilities."),
+        )
+        for text in replies:
+            with self.subTest(reply=json.loads(text)["disposition"]):
+                PrimaryReply.model_validate_json(text, strict=True)
+
+        review = review_text("spec", "Valid specification review.")
+        outcomes = (
+            review,
+            SpecialistOutcome(kind="needs_input", detail="Missing material.",
+                              question="Please provide the specification?").model_dump_json(),
+            SpecialistOutcome(kind="unavailable", detail="Synthetic service outage.").model_dump_json(),
+        )
+        for text in outcomes:
+            with self.subTest(outcome=json.loads(text)["kind"]):
+                SpecialistOutcome.model_validate_json(text, strict=True)
+        invalid = (
+            {"kind": "review", "review": None},
+            {"kind": "needs_input", "detail": "Missing material.", "question": None},
+            {"kind": "unavailable", "detail": " ", "review": None},
+            {**json.loads(review), "detail": "Contradictory blocked status."},
+            {**json.loads(review), "kind": "needs_input", "detail": "Missing.",
+             "question": "Please supply it?"},
+        )
+        for payload in invalid:
+            with self.subTest(invalid=payload["kind"]):
+                with self.assertRaises(ValidationError):
+                    SpecialistOutcome.model_validate_json(json.dumps(payload), strict=True)
+        wrong_category = ChatResponse(messages=[
+            Message("assistant", [review_text("coding", "Wrong role review.")]),
+        ])
+        with self.assertRaises(HandoffRoutingError):
+            _outcome(wrong_category, "spec")
+
+    async def test_ledger_identical_new_user_turns_create_revisions_then_recap(self):
+        previous_id = None
+        first_revision = None
+        first_turn = None
+        for index in (1, 2):
+            outcome = review_text("spec", f"REVIEW-REVISION-{index}")
+            host, roles, sources = self.ledger_host({
+                "primary": [
+                    ((), ("accept_review_plan", {"roles": ["spec"]})),
+                    (("START\n",), "spec"),
+                    ((reply_text("complete", "Spec reviewed.", ["spec"]),), None),
+                ],
+                "spec": [((outcome,), None)],
+            }, suffix="new-turns")
+            result, captured = await self.ledger_turn(
+                host, previous=previous_id, text="Review the same material again.",
+            )
+            self.assertEqual(result["status"], "completed", result)
+            self.assertEqual(len(self.ledger_transitions(captured)), 2)
+            ledger = required_ledger(sources[0].sessions_seen["primary"])
+            revision = required_revision(sources[0].sessions_seen["primary"])
+            self.assertEqual(ledger.turn.number, index)
+            self.assertEqual(len(ledger.revisions), index)
+            self.assertEqual(revision.accepted_turn, index)
+            self.assertEqual(revision.tasks[0].attempts, 1)
+            self.assertEqual(sources[0].clients[roles["spec"].agent_name].calls, 1)
+            self.assertEqual(sources[0].clients[roles["primary"].agent_name].calls, 3)
+            if index == 1:
+                first_revision, first_turn = revision.id, ledger.turn.id
+            else:
+                self.assertNotEqual(revision.id, first_revision)
+                self.assertNotEqual(ledger.turn.id, first_turn)
+                self.assertEqual(ledger.revisions[0].retired_turn, 2)
+                outcome = ledger.revisions[0].tasks[0].outcome
+                assert outcome is not None and outcome.review is not None
+                self.assertEqual(outcome.review.summary, "REVIEW-REVISION-1")
+                self.assertFalse(set(ledger.revisions[0].receipts) & set(revision.receipts))
+                self.assertIn("REVIEW-REVISION-1", json.dumps(
+                    sources[0].clients[roles["primary"].agent_name].requests[0]
+                ))
+            previous_id = result["id"]
+            del host
+            sources.clear()
+            gc.collect()
+        recap, _, recalled = self.ledger_host({
+            "primary": [((reply_text("recap", "Recall the verified Spec results.", ["spec"]),), None)],
+        }, suffix="new-turns")
+        result, captured = await self.ledger_turn(recap, previous=previous_id, text="Summarize the prior result.")
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(self.ledger_transitions(captured), [])
+        self.assertEqual(recalled[0].clients[roles["primary"].agent_name].calls, 1)
+        self.assertEqual(recalled[0].clients[roles["spec"].agent_name].calls, 0)
+        self.assertEqual(required_ledger(recalled[0].sessions_seen["primary"]).turn.number, 3)
+
+    async def test_ledger_blocked_ambiguous_input_preserves_then_explicitly_revises(self):
+        needs = SpecialistOutcome(
+            kind="needs_input", detail="Capacity target is missing.", question="What capacity is required?"
+        ).model_dump_json()
+        host, roles, sources = self.ledger_host({
+            "primary": [
+                ((), ("accept_review_plan", {"roles": ["spec", "architect"]})),
+                (("START\n",), "spec"), (("Process architecture later.\n",), None),
+                ((reply_text("needs_input", "Spec reviewed; architecture incomplete.", ["spec"],
+                             unfinished=["architect"], question="What capacity is required?"),), None),
+            ],
+            "spec": [((review_text("spec", "PRESERVED-SPEC"),), None)],
+            "architect": [((needs,), None)],
+        }, suffix="revisions")
+        first, _ = await self.ledger_turn(host)
+        self.assertEqual(first["status"], "completed", first)
+        original = required_revision(sources[0].sessions_seen["primary"]).model_dump(mode="json")
+        del host
+        sources.clear()
+        ambiguous, _, unclear = self.ledger_host({
+            "primary": [((reply_text(
+                "clarify", "Spec reviewed; architecture still incomplete.", ["spec"],
+                unfinished=["architect"], question="Resume architecture or change the review request?"
+            ),), None)],
+        }, suffix="revisions")
+        second, captured = await self.ledger_turn(ambiguous, previous=first["id"], text="Continue with this.")
+        self.assertEqual(second["status"], "completed", second)
+        self.assertEqual(self.ledger_transitions(captured), [])
+        self.assertEqual(required_revision(unclear[0].sessions_seen["primary"]).model_dump(mode="json"), original)
+        self.assertEqual(unclear[0].clients[roles["architect"].agent_name].calls, 0)
+        del ambiguous
+        unclear.clear()
+        replacement, _, changed = self.ledger_host({
+            "primary": [
+                ((), ("accept_review_plan", {
+                    "roles": ["coding"], "replace": True, "reason": "User explicitly changed to code review."
+                })),
+                (("START NEW REVIEW\n",), "coding"),
+                ((reply_text("complete", "Coding reviewed.", ["coding"]),), None),
+            ],
+            "coding": [((review_text("coding", "NEW-CODE"),), None)],
+        }, suffix="revisions")
+        third, captured = await self.ledger_turn(
+            replacement, previous=second["id"], text="Replace architecture review with a new code review.",
+        )
+        self.assertEqual(third["status"], "completed", third)
+        self.assertEqual(self.ledger_transitions(captured), [
+            (roles["primary"].agent_name, roles["coding"].agent_name),
+            (roles["coding"].agent_name, roles["primary"].agent_name),
+        ])
+        ledger = required_ledger(changed[0].sessions_seen["primary"])
+        self.assertEqual(len(ledger.revisions), 2)
+        self.assertEqual(ledger.revisions[0].tasks[1].status, "needs_input")
+        self.assertEqual(ledger.revisions[0].receipts.keys(), original["receipts"].keys())
+        self.assertEqual(ledger.revisions[0].retired_turn, 3)
+        self.assertEqual(required_revision(changed[0].sessions_seen["primary"]).tasks[0].status, "reviewed")
+        self.assertEqual(changed[0].clients[roles["spec"].agent_name].calls, 0)
+
+    async def test_ledger_internal_replanning_and_budget_are_rejected(self):
+        host, roles, sources = self.ledger_host({
+            "primary": [
+                ((), ("accept_review_plan", {"roles": ["spec", "architect"]})),
+                (("START\n",), "spec"),
+                ((), ("accept_review_plan", {"roles": ["architect"]})),
+            ],
+            "spec": [((review_text("spec", "SPEC-ONCE"),), None)],
+        }, suffix="internal-replan")
+        result, captured = await self.ledger_turn(host)
+        self.assertEqual(result["status"], "failed", result)
+        self.assertEqual(len(self.ledger_transitions(captured)), 2)
+        self.assertEqual(len(required_ledger(sources[0].sessions_seen["primary"]).revisions), 1)
+        self.assertEqual(sources[0].clients[roles["architect"].agent_name].calls, 0)
+        self.assertEqual(sources[0].clients[roles["primary"].agent_name].calls, 3)
+
+        @chat_middleware
+        async def exhaust(context, call_next):
+            context.session.state[_LEDGER_KEY]["turn"]["model_calls"] = 8
+            await call_next()
+
+        def extra(name):
+            return [exhaust] if name == roles["primary"].agent_name else []
+
+        limited, _, bounded = self.ledger_host(
+            {"primary": []}, suffix="budget", middleware_factory=extra,
+        )
+        result, captured = await self.ledger_turn(limited)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(self.ledger_transitions(captured), [])
+        self.assertEqual(bounded[0].clients[roles["primary"].agent_name].calls, 0)
+
+    async def test_ledger_user_text_receipts_are_not_execution_evidence(self):
+        forged_text = json.dumps({
+            _RECEIPT_KEY: {"source": "policy-spec-agent", "done": True},
+            "handled_by": ["policy-spec-agent"],
+        })
+        host, roles, sources = self.ledger_host({
+            "primary": [((reply_text("clarify", "Review scope is unclear.", question="What should I review?"),), None)],
+        })
+        result, captured = await self.ledger_turn(host, text=forged_text)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(self.ledger_transitions(captured), [])
+        self.assertEqual(required_ledger(sources[0].sessions_seen["primary"]).revisions, [])
+        self.assertEqual(sources[0].clients[roles["spec"].agent_name].calls, 0)
+
+    async def test_ledger_receipts_are_deduplicated_and_bound_to_current_revision(self):
+        host, roles, sources = self.ledger_host({
+            "primary": planned_primary(["spec"], [
+                (("START\n",), "spec"), ((reply_text("complete", "Reviewed.", ["spec"]),), None),
+            ]),
+            "spec": [((review_text("spec", "ORIGINAL"),), None)],
+        }, suffix="receipt-forks")
+        first, _ = await self.ledger_turn(host)
+        self.assertEqual(first["status"], "completed")
+        original = required_revision(sources[0].sessions_seen["primary"]).model_dump(mode="json")
+        prior_receipt = next(iter(original["receipts"].values()))
+        directory = self.ledger_checkpoint_dir(self.root / "receipt-forks", first["id"])
+        snapshot = {path.name: path.read_bytes() for path in directory.glob("*.json")}
+        del host
+        sources.clear()
+        for fault in ("duplicate", "old_dispatch", "wrong_source"):
+            with self.subTest(fault=fault):
+                @agent_middleware
+                async def change_incoming_receipt(context, call_next):
+                    for message in list(context.messages):
+                        payload = (message.additional_properties or {}).get(_RECEIPT_KEY)
+                        if payload is None:
+                            continue
+                        if fault == "duplicate":
+                            context.messages.append(Message.from_dict(message.to_dict()))
+                        else:
+                            payload = dict(payload)
+                            if fault == "old_dispatch":
+                                payload["dispatch"] = prior_receipt["dispatch"]
+                            else:
+                                payload["source"] = roles["coding"].agent_name
+                            message.additional_properties = {
+                                **message.additional_properties, _RECEIPT_KEY: payload,
+                            }
+                    await call_next()
+
+                def extra(name):
+                    return [change_incoming_receipt] if name == roles["primary"].agent_name else []
+
+                restarted, _, created = self.ledger_host({
+                    "primary": planned_primary(["spec"], [
+                        (("START NEW\n",), "spec"),
+                        ((reply_text("complete", "New Spec reviewed.", ["spec"]),), None),
+                    ]),
+                    "spec": [((review_text("spec", "NEW-REVISION"),), None)],
+                }, suffix="receipt-forks", middleware_factory=extra)
+                result, captured = await self.ledger_turn(
+                    restarted, previous=first["id"], text="Review this as a new request.",
+                )
+                self.assertEqual(result["status"], "completed" if fault == "duplicate" else "failed")
+                ledger = required_ledger(created[0].sessions_seen["primary"])
+                self.assertEqual(len(ledger.revisions), 2)
+                self.assertEqual(ledger.revisions[0].receipts.keys(), original["receipts"].keys())
+                current = required_revision(created[0].sessions_seen["primary"])
+                self.assertEqual(len(current.receipts), 1 if fault == "duplicate" else 0)
+                self.assertEqual(created[0].clients[roles["spec"].agent_name].calls, 1)
+                self.assertEqual(created[0].clients[roles["primary"].agent_name].calls, 3 if fault == "duplicate" else 2)
+                self.assertEqual(len(self.ledger_transitions(captured)), 2)
+                self.assertEqual({path.name: path.read_bytes() for path in directory.glob("*.json")}, snapshot)
+
+    async def test_ledger_blocked_work_requires_explicit_resume_or_replacement(self):
+        needs = SpecialistOutcome(
+            kind="needs_input", detail="Spec material is missing.", question="Please provide the specification?"
+        ).model_dump_json()
+        host, roles, sources = self.ledger_host({
+            "primary": planned_primary(["spec"], [
+                (("START\n",), "spec"),
+                ((reply_text("needs_input", "Spec incomplete.", unfinished=["spec"],
+                             question="Please provide the specification?"),), None),
+            ]),
+            "spec": [((needs,), None)],
+        }, suffix="explicit-actions")
+        first, _ = await self.ledger_turn(host)
+        self.assertEqual(first["status"], "completed")
+        original = required_revision(sources[0].sessions_seen["primary"]).id
+        for fault, script in (
+            ("implicit_resume", [(("Resume without an action.",), "spec")]),
+            ("implicit_replace", [((), ("accept_review_plan", {"roles": ["coding"]}))]),
+            ("false_completion", [((reply_text(
+                "complete", "Will process later.", unfinished=["spec"]
+            ),), None)]),
+        ):
+            with self.subTest(fault=fault):
+                restarted, _, created = self.ledger_host(
+                    {"primary": script}, suffix="explicit-actions",
+                )
+                result, captured = await self.ledger_turn(restarted, previous=first["id"])
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(self.ledger_transitions(captured), [])
+                revision = required_revision(created[0].sessions_seen["primary"])
+                self.assertEqual(revision.id, original)
+                self.assertEqual(revision.tasks[0].status, "needs_input")
+                for key in ("spec", "coding", "architect"):
+                    self.assertEqual(created[0].clients[roles[key].agent_name].calls, 0)
+
+    async def test_ledger_primary_legacy_service_id_is_not_erased(self):
+        sessions = []
+
+        @agent_middleware
+        async def legacy(context, call_next):
+            context.session.service_session_id = "resp_legacy_primary"
+            sessions.append(context.session)
+            await call_next()
+
+        def extra(name):
+            return [legacy] if name.endswith("-primary-agent") else []
+
+        host, roles, sources = self.ledger_host(
+            {"primary": []}, middleware_factory=extra,
+        )
+        result, _ = await self.ledger_turn(host)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(sessions[0].service_session_id, "resp_legacy_primary")
+        self.assertEqual(sources[0].clients[roles["primary"].agent_name].calls, 0)
 
     def test_handoff_log_source_priority(self):
         cases = (
@@ -779,8 +1922,10 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         primary_name = roles["primary"].agent_name
         coding_name = roles["coding"].agent_name
         preface = "<<<PRIMARY_PREFACE>>>\n"
-        summary = "<<<PRIMARY_SUMMARY>>>\nSummary: offline fixture reviewed.\n"
-        coding_text = (
+        summary = reply_text(
+            "complete", "<<<PRIMARY_SUMMARY>>>\nSummary: offline fixture reviewed.\n", ["coding"]
+        )
+        coding_text = review_text("coding", (
             "<<<CODING_BEGIN_OUTPUT_CONTRACT>>>\n"
             "Synthetic specialist review.\n"
             '{"category":"code","summary":"offline fixture"}\n'
@@ -788,20 +1933,16 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
             'value = {"fixture": True}\n'
             "```\n"
             "<<<CODING_END_OUTPUT_CONTRACT>>>\n"
-        )
+        ), indent=2) + "\n"
         coding_chunks = (
-            "<<<CODING_BEGIN_OUTPUT_CONTRACT>>>\nSynthetic specialist review.\n",
-            '{"category":"code",',
-            '"summary":"offline fixture"}\n```py',
-            'thon\nvalue = {"fixture": True}\n',
-            "```\n<<<CODING_END_OUTPUT_CONTRACT>>>\n",
+            coding_text[:45], coding_text[45:100], coding_text[100:155], coding_text[155:],
         )
         expected_text = preface + coding_text + summary
         clients: list[tuple[ScriptedHandoffClient, ScriptedHandoffClient]] = []
 
         def factory():
             source = ScriptedRoleClients({
-                primary_name: [((preface,), coding_name), ((summary,), None)],
+                primary_name: planned_primary(["coding"], [((preface,), coding_name), ((summary,), None)]),
                 coding_name: [(coding_chunks, None)],
             })
             participants = build_participants(source, roles, checkpoint_safe=True)
@@ -841,7 +1982,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                 ]
                 self.assertEqual(waiting, [primary_name])
                 primary_client, coding_client = clients[-1]
-                self.assertEqual((primary_client.calls, coding_client.calls), (2, 1))
+                self.assertEqual((primary_client.calls, coding_client.calls), (3, 1))
 
                 if stream:
                     events = [
@@ -889,10 +2030,14 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
             for already_returned in (False, True):
                 with self.subTest(specialist=key, already_returned=already_returned):
                     specialist_name = roles[key].agent_name
+                    review = review_text(key, "REVIEW-BEGIN\nREVIEW-END\n")
+                    summary = reply_text("complete", "SUMMARY", [key])
                     source = ScriptedRoleClients({
-                        primary_name: [(("PREFACE\n",), specialist_name), (("SUMMARY\n",), None)],
+                        primary_name: planned_primary(
+                            [key], [(("PREFACE\n",), specialist_name), ((summary,), None)]
+                        ),
                         specialist_name: [
-                            (("REVIEW-BEGIN\n", "REVIEW-END\n"), primary_name if already_returned else None)
+                            ((review[:40], review[40:]), primary_name if already_returned else None)
                         ],
                     })
                     participants = build_participants(source, roles, checkpoint_safe=True)
@@ -904,7 +2049,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertLogs("workflows.responses", level="INFO") as captured:
                         self.assertEqual(
                             await self.turn("Synthetic review input.", host=host),
-                            "PREFACE\nREVIEW-BEGIN\nREVIEW-END\nSUMMARY\n",
+                            "PREFACE\n" + review + summary,
                         )
                     transitions = [
                         record.args for record in captured.records
@@ -915,7 +2060,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                     ])
                     self.assertEqual(captured.records[-1].args[0], primary_name)
                     self.assertEqual(source.clients[specialist_name].calls, 1)
-                    self.assertEqual(source.clients[primary_name].calls, 2)
+                    self.assertEqual(source.clients[primary_name].calls, 3)
 
     async def test_http_provider_responses_lifecycle(self):
         review = {
@@ -924,7 +2069,10 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
             "evidence": ["Synthetic original code."], "recommendations": ["Synthetic advice."],
             "limitations": ["Offline fixture only."],
         }
-        text = json.dumps(review, indent=2) + "\n"
+        text = SpecialistOutcome(
+            kind="review", review=SpecialistReview.model_validate(review)
+        ).model_dump_json(indent=2) + "\n"
+        summary = reply_text("complete", "SUMMARY", ["coding"])
         chunks = (text[:32], text[32:75], text[75:])
         cases = (
             ("result_only", False, "completed", None),
@@ -946,6 +2094,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
 
                     def provider(request):
                         body = json.loads(request.content)
+                        assert_strict_request_schema(self, body)
                         self.assertIs(body["stream"], True)
                         self.assertIs(body["store"], False)
                         requests.append(body)
@@ -986,9 +2135,9 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                                 return ScriptedHandoffClient(name, script)
 
                             host, roles, sources = self.production_host({
-                                "primary": [
-                                    (("PREFACE\n",), "coding"), (("SUMMARY\n",), None),
-                                ],
+                                "primary": planned_primary(
+                                    ["coding"], [(("PREFACE\n",), "coding"), ((summary,), None)]
+                                ),
                             }, suffix=f"parser-{stream}-{case}", client_factory=client_factory)
                             async with AsyncClient(
                                 transport=ASGITransport(app=host), base_url="http://localhost"
@@ -1024,7 +2173,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                         and isinstance(record.args, tuple)
                     ], [primary] if completed else [])
                     self.assertEqual(len(requests), 1)
-                    self.assertEqual(sources[0].clients[primary].calls, 2 if completed else 1)
+                    self.assertEqual(sources[0].clients[primary].calls, 3 if completed else 2)
                     self.assertEqual(invoked_tools, [f"handoff_to_{primary}"] if completed else [])
                     if not completed:
                         self.assertEqual(payload["error"]["code"], "server_error")
@@ -1034,7 +2183,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNotNone(updates[0].continuation_token)
                     self.assertIsNotNone(updates[1].continuation_token)
                     self.assertIsNone(payload.get("error"))
-                    expected = "PREFACE\n" + text + "SUMMARY\n"
+                    expected = "PREFACE\n" + text + summary
                     actual = "".join(
                         part["text"]
                         for item in payload["output"] if item["type"] == "message"
@@ -1056,24 +2205,31 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(
                         final_responses[0].finish_reason, "tool_calls" if already_returned else "stop"
                     )
-                    self.assertEqual(final_responses[0].value, SpecialistReview.model_validate(review))
+                    self.assertEqual(final_responses[0].value, json.loads(text))
+                    self.assertEqual(
+                        SpecialistOutcome.model_validate(final_responses[0].value).review,
+                        SpecialistReview.model_validate(review),
+                    )
 
     async def test_production_return_policy_composite_sequences(self):
         for first in ("coding", "spec"):
             with self.subTest(first=first):
+                first_review = review_text(first, "FIRST-REVIEW")
+                architecture_review = review_text("architect", "ARCHITECT-REVIEW")
+                summary = reply_text("complete", "SUMMARY", [first, "architect"])
                 host, roles, sources = self.production_host({
-                    "primary": [
+                    "primary": planned_primary([first, "architect"], [
                         (("START\n",), first),
                         (("NEXT\n",), "architect"),
-                        (("SUMMARY\n",), None),
-                    ],
-                    first: [(("FIRST-REVIEW\n",), None)],
-                    "architect": [(("ARCHITECT-REVIEW\n",), None)],
+                        ((summary,), None),
+                    ]),
+                    first: [((first_review,), None)],
+                    "architect": [((architecture_review,), None)],
                 }, suffix=first)
                 with self.assertLogs("workflows.responses", level="INFO") as captured:
                     text = await self.turn("Synthetic composite material.", host=host)
                 self.assertEqual(
-                    text, "START\nFIRST-REVIEW\nNEXT\nARCHITECT-REVIEW\nSUMMARY\n"
+                    text, "START\n" + first_review + "NEXT\n" + architecture_review + summary
                 )
                 primary = roles["primary"].agent_name
                 first_name = roles[first].agent_name
@@ -1086,27 +2242,28 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                     (primary, architect), (architect, primary),
                 ])
                 self.assertEqual(captured.records[-1].args[0], primary)
-                self.assertEqual(sources[0].clients[primary].calls, 3)
+                self.assertEqual(sources[0].clients[primary].calls, 4)
                 self.assertEqual(sources[0].clients[first_name].calls, 1)
                 self.assertEqual(sources[0].clients[architect].calls, 1)
 
     async def test_production_return_policy_fresh_factory_continuation_and_history(self):
+        review = review_text("coding", "REVIEW")
+        summary = reply_text("complete", "SUMMARY", ["coding"])
         host, roles, sources = self.production_host({
-            "primary": [
-                (("START\n",), "coding"), (("SUMMARY\n",), None),
-                (("NEXT-START\n",), "coding"), (("NEXT-SUMMARY\n",), None),
-            ],
-            "coding": [(("REVIEW\n",), None), (("NEXT-REVIEW\n",), None)],
+            "primary": planned_primary(["coding"], [(("START\n",), "coding"), ((summary,), None)]),
+            "coding": [((review,), None)],
         })
-        self.assertEqual(await self.turn("Synthetic first turn.", host=host), "START\nREVIEW\nSUMMARY\n")
+        self.assertEqual(await self.turn("Synthetic first turn.", host=host), "START\n" + review + summary)
         # 新 factory 的 script 只表示下一輪必要呼叫，不重播前輪文字。
+        next_review = review_text("coding", "NEXT-REVIEW")
+        next_summary = reply_text("complete", "NEXT-SUMMARY", ["coding"])
         host2, _, restarted_sources = self.production_host({
-            "primary": [(("NEXT-START\n",), "coding"), (("NEXT-SUMMARY\n",), None)],
-            "coding": [(("NEXT-REVIEW\n",), None)],
+            "primary": planned_primary(["coding"], [(("NEXT-START\n",), "coding"), ((next_summary,), None)]),
+            "coding": [((next_review,), None)],
         })
         with self.assertLogs("workflows.responses", level="INFO") as captured:
             text = await self.turn("Synthetic follow-up.", host=host2)
-        self.assertEqual(text, "NEXT-START\nNEXT-REVIEW\nNEXT-SUMMARY\n")
+        self.assertEqual(text, "NEXT-START\n" + next_review + next_summary)
         self.assertEqual(captured.records[-1].args[0], roles["primary"].agent_name)
         primary = roles["primary"].agent_name
         coding = roles["coding"].agent_name
@@ -1124,15 +2281,17 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(calls)
             self.assertEqual(set(calls), set(results))
         self.assertEqual(restarted_sources[0].clients[coding].calls, 1)
-        self.assertEqual(restarted_sources[0].clients[primary].calls, 2)
+        self.assertEqual(restarted_sources[0].clients[primary].calls, 3)
 
     async def test_production_return_policy_nonstream_agent_path(self):
         roles = build_agent_roles("nonstream-")
         primary = roles["primary"].agent_name
         coding = roles["coding"].agent_name
+        review = review_text("coding", "CODING")
+        summary = reply_text("complete", "SUMMARY", ["coding"])
         source = ScriptedRoleClients({
-            primary: [(("PREFACE\n",), coding), (("SUMMARY\n",), None)],
-            coding: [(("CODING\n",), None)],
+            primary: planned_primary(["coding"], [(("PREFACE\n",), coding), ((summary,), None)]),
+            coding: [((review,), None)],
         })
         workflow = build_workflow(build_participants(source, roles, checkpoint_safe=True))
         result = await workflow.run("Synthetic nonstream material.")
@@ -1141,13 +2300,16 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
             for event in result if event.type == "handoff_sent"
         ], [(primary, coding), (coding, primary)])
         self.assertEqual(
-            "".join(output.text for output in result.get_outputs()), "PREFACE\nCODING\nSUMMARY\n"
+            "".join(output.text for output in result.get_outputs()), "PREFACE\n" + review + summary
         )
         self.assertEqual(source.clients[coding].calls, 1)
-        self.assertEqual(source.clients[primary].calls, 2)
+        self.assertEqual(source.clients[primary].calls, 3)
 
     async def test_production_return_policy_primary_and_lab1_isolation(self):
-        for text in ("Synthetic clarification question?", "Synthetic capability boundary."):
+        for text in (
+            reply_text("clarify", "Intent is unclear.", question="Synthetic clarification question?"),
+            reply_text("out_of_scope", "Synthetic capability boundary."),
+        ):
             with self.subTest(text=text):
                 host, roles, sources = self.production_host({
                     "primary": [((text,), None)],
@@ -1159,10 +2321,9 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                     for record in captured.records
                 ))
                 self.assertEqual(captured.records[-1].args[0], roles["primary"].agent_name)
-                self.assertEqual(
-                    sources[0].agents[roles["primary"].agent_name].default_options["instructions"],
-                    roles["primary"].instructions,
-                )
+                self.assertTrue(sources[0].agents[roles["primary"].agent_name].default_options["instructions"].startswith(
+                    roles["primary"].instructions
+                ))
                 self.assertTrue(all(
                     sources[0].clients[roles[key].agent_name].calls == 0
                     for key in ("coding", "architect", "spec")
@@ -1195,7 +2356,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                     return ScriptedHandoffClient(name, script)
 
                 host, roles, sources = self.production_host({
-                    "primary": [(("START\n",), "coding")],
+                    "primary": planned_primary(["coding"], [(("START\n",), "coding")]),
                     "coding": [],
                 }, suffix=fault, client_factory=client_factory)
                 with patch("workflows.handoff.AGENT_TIMEOUT_SECONDS", 0.05 if fault == "timeout" else 180):
@@ -1219,7 +2380,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                     for record in captured.records
                 ))
                 self.assertEqual(sources[0].clients[roles["coding"].agent_name].calls, 1)
-                self.assertEqual(sources[0].clients[roles["primary"].agent_name].calls, 1)
+                self.assertEqual(sources[0].clients[roles["primary"].agent_name].calls, 2)
 
     async def test_production_return_policy_cancellation_is_not_degraded(self):
         for fault in ("cancel", "cancel_reason"):
@@ -1231,7 +2392,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                     )
 
                 host, roles, sources = self.production_host({
-                    "primary": [(("START\n",), "coding")],
+                    "primary": planned_primary(["coding"], [(("START\n",), "coding")]),
                 }, suffix=fault, client_factory=client_factory)
                 with self.assertLogs("workflows.responses", level="INFO") as captured:
                     with self.assertRaises(asyncio.CancelledError):
@@ -1253,8 +2414,8 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
             return [failing_tool] if name.endswith("-coding-agent") else []
 
         host, roles, sources = self.production_host({
-            "primary": [(("START\n",), "coding")],
-            "coding": [(("REVIEW\n",), "primary")],
+            "primary": planned_primary(["coding"], [(("START\n",), "coding")]),
+            "coding": [((review_text("coding", "REVIEW"),), "primary")],
         }, middleware_factory=extra)
         with self.assertLogs("workflows.responses", level="INFO"):
             events = [
@@ -1277,7 +2438,10 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
             "evidence": ["Synthetic evidence."], "recommendations": ["Synthetic advice."],
             "limitations": ["Synthetic offline-only data."],
         }
-        coding_text = json.dumps(review, separators=(",", ":")) + "\n"
+        coding_text = SpecialistOutcome(
+            kind="review", review=SpecialistReview.model_validate(review)
+        ).model_dump_json() + "\n"
+        summary = reply_text("complete", "SUMMARY", ["coding"])
         for stream in (True, False):
             with self.subTest(stream=stream):
                 inner_results = []
@@ -1315,7 +2479,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                         return super().as_agent(**options)
 
                 source = ObservedClients({
-                    primary: [(("PREFACE\n",), coding), (("SUMMARY\n",), None)],
+                    primary: planned_primary(["coding"], [(("PREFACE\n",), coding), ((summary,), None)]),
                     coding: [((coding_text[:40], coding_text[40:]), None)],
                 })
                 original_instructions = {key: role.instructions for key, role in roles.items()}
@@ -1332,13 +2496,16 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                 ], [(primary, coding), (coding, primary)])
                 self.assertEqual(
                     "".join(event.data.text for event in events if event.type == "output"),
-                    "PREFACE\n" + coding_text + "SUMMARY\n",
+                    "PREFACE\n" + coding_text + summary,
                 )
                 self.assertEqual(len(inner_results), 1)
                 self.assertEqual(len(outer_results), 1)
                 self.assertIs(outer_results[0], inner_results[0])
                 result = outer_results[0]
-                self.assertEqual(result.value, SpecialistReview.model_validate(review))
+                self.assertEqual(result.value, json.loads(coding_text))
+                self.assertEqual(
+                    SpecialistOutcome.model_validate(result.value).review, SpecialistReview.model_validate(review)
+                )
                 self.assertEqual(result.additional_properties["synthetic_agent_metadata"], "kept")
                 client = source.clients[coding]
                 self.assertEqual(client.hook_counts["finalizer"], 1)
@@ -1349,7 +2516,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(client.response_updates[0][-1].continuation_token)
                 self.assertIsNone(client.finalized_responses[0].continuation_token)
                 self.assertEqual(client.finalized_responses[0].finish_reason, "stop")
-                self.assertEqual(client.finalized_responses[0].value, SpecialistReview.model_validate(review))
+                self.assertEqual(client.finalized_responses[0].value, json.loads(coding_text))
                 self.assertEqual(client.finalized_responses[0].additional_properties["synthetic_finalizer"], coding)
                 if stream:
                     self.assertEqual(client.hook_counts, {
@@ -1362,7 +2529,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                 for key in ("coding", "architect", "spec"):
                     self.assertEqual(
                         source.agents[roles[key].agent_name].default_options["response_format"],
-                        roles[key].response_format,
+                        _strict_runtime_schema(SpecialistOutcome.model_json_schema()),
                     )
 
     async def test_production_return_policy_rejects_nonunique_or_wrong_tool_binding(self):
@@ -1390,8 +2557,8 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                     return [invalid_binding] if name.endswith("-coding-agent") else []
 
                 host, roles, sources = self.production_host({
-                    "primary": [(("START\n",), "coding")],
-                    "coding": [(("REVIEW\n",), None)],
+                    "primary": planned_primary(["coding"], [(("START\n",), "coding")]),
+                    "coding": [((review_text("coding", "REVIEW"),), None)],
                 }, suffix=fault, middleware_factory=extra)
                 with self.assertLogs("workflows.responses", level="INFO"):
                     events = [
@@ -1406,34 +2573,40 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_production_return_policy_clarification_is_not_a_review(self):
         question = "Synthetic specialist needs one missing detail."
+        outcome = SpecialistOutcome(kind="needs_input", detail="Material is missing.", question=question).model_dump_json()
+        reply = reply_text(
+            "needs_input", "Coding remains incomplete.", unfinished=["coding"], question=question
+        )
         host, roles, sources = self.production_host({
-            "primary": [(("START\n",), "coding"), (("Synthetic Primary clarification?",), None)],
-            "coding": [((question,), None)],
+            "primary": planned_primary(["coding"], [(("START\n",), "coding"), ((reply,), None)]),
+            "coding": [((outcome,), None)],
         })
         with self.assertLogs("workflows.responses", level="INFO") as captured:
             actual = await self.turn("Synthetic partial material.", host=host)
-        self.assertEqual(actual, "START\n" + question + "Synthetic Primary clarification?")
+        self.assertEqual(actual, "START\n" + outcome + reply)
         self.assertEqual(captured.records[-1].args[0], roles["primary"].agent_name)
         self.assertEqual(sources[0].clients[roles["coding"].agent_name].calls, 1)
         self.assertNotIn('"category"', actual)
 
     async def test_production_return_policy_conversations_do_not_share_state(self):
+        review = review_text("coding", "REVIEW")
+        summary = reply_text("complete", "SUMMARY", ["coding"])
         host, roles, sources = self.production_host({
-            "primary": [(("START\n",), "coding"), (("SUMMARY\n",), None)],
-            "coding": [(("REVIEW\n",), None)],
+            "primary": planned_primary(["coding"], [(("START\n",), "coding"), ((summary,), None)]),
+            "coding": [((review,), None)],
         })
         with self.assertLogs("workflows.responses", level="INFO") as captured:
             results = await asyncio.gather(
                 self.turn("Synthetic first conversation.", host=host, conversation="first"),
                 self.turn("Synthetic second conversation.", host=host, conversation="second"),
             )
-        self.assertEqual(results, ["START\nREVIEW\nSUMMARY\n"] * 2)
+        self.assertEqual(results, ["START\n" + review + summary] * 2)
         self.assertEqual(len(sources), 2)
         for key in ("primary", "coding"):
             name = roles[key].agent_name
             self.assertIsNot(sources[0].clients[name], sources[1].clients[name])
             self.assertEqual(
-                [source.clients[name].calls for source in sources], [2, 2] if key == "primary" else [1, 1]
+                [source.clients[name].calls for source in sources], [3, 3] if key == "primary" else [1, 1]
             )
         self.assertEqual(sum(
             record.msg == "Handoff transition: source=%s target=%s"
@@ -1444,12 +2617,16 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         roles = build_agent_roles("nonstream-history-")
         primary = roles["primary"].agent_name
         coding = roles["coding"].agent_name
+        review = review_text("coding", "REVIEW")
+        next_review = review_text("coding", "NEXT-REVIEW")
+        summary = reply_text("complete", "SUMMARY", ["coding"])
+        next_summary = reply_text("complete", "NEXT-SUMMARY", ["coding"])
         source = ScriptedRoleClients({
             primary: [
-                (("START\n",), coding), (("SUMMARY\n",), None),
-                (("NEXT\n",), coding), (("NEXT-SUMMARY\n",), None),
+                *planned_primary(["coding"], [(("START\n",), coding), ((summary,), None)]),
+                *planned_primary(["coding"], [(("NEXT\n",), coding), ((next_summary,), None)]),
             ],
-            coding: [(("REVIEW\n",), None), (("NEXT-REVIEW\n",), None)],
+            coding: [((review,), None), ((next_review,), None)],
         })
         workflow = build_workflow(build_participants(source, roles))
         first = await workflow.run("Synthetic first nonstream turn.")
@@ -1463,7 +2640,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
             for event in second if event.type == "handoff_sent"
         ], [(primary, coding), (coding, primary)])
         for name in (primary, coding):
-            messages = source.clients[name].requests[2 if name == primary else 1]
+            messages = source.clients[name].requests[3 if name == primary else 1]
             calls = {
                 part["call_id"] for message in messages for part in message["contents"]
                 if part["type"] == "function_call"
@@ -1477,23 +2654,25 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source.clients[coding].calls, 2)
 
     async def test_production_return_policy_service_default_client_uses_local_history(self):
+        review = review_text("coding", "REVIEW")
+        summary = reply_text("complete", "SUMMARY", ["coding"])
         scripts = {
-            "primary": [(("START\n",), "coding"), (("SUMMARY\n",), None)],
-            "coding": [(("REVIEW\n",), None)],
+            "primary": planned_primary(["coding"], [(("START\n",), "coding"), ((summary,), None)]),
+            "coding": [((review,), None)],
         }
         host, roles, sources = self.production_host(
             scripts, client_factory=ServiceDefaultHandoffClient
         )
         self.assertEqual(
             await self.turn("Synthetic service-default first turn.", host=host),
-            "START\nREVIEW\nSUMMARY\n",
+            "START\n" + review + summary,
         )
         restarted, _, next_sources = self.production_host(
             scripts, client_factory=ServiceDefaultHandoffClient
         )
         self.assertEqual(
             await self.turn("Synthetic service-default follow-up.", host=restarted),
-            "START\nREVIEW\nSUMMARY\n",
+            "START\n" + review + summary,
         )
         coding = roles["coding"].agent_name
         primary = roles["primary"].agent_name
@@ -1504,7 +2683,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                 effective.get(key)
                 for key in ("previous_response_id", "conversation", "conversation_id")
             ))
-            self.assertNotIn("store", source.clients[primary].options_seen[0])
+            self.assertIs(source.clients[primary].options_seen[0]["store"], False)
         messages = next_sources[0].clients[coding].requests[0]
         calls = {
             part["call_id"] for message in messages for part in message["contents"]
@@ -1521,7 +2700,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
             for message in messages for part in message["contents"]
         ))
         self.assertEqual(next_sources[0].clients[coding].calls, 1)
-        self.assertEqual(next_sources[0].clients[primary].calls, 2)
+        self.assertEqual(next_sources[0].clients[primary].calls, 3)
 
     async def test_production_return_policy_rejects_legacy_service_session_without_erasing_it(self):
         sessions = []
@@ -1536,8 +2715,8 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
             return [legacy_session] if name.endswith("-coding-agent") else []
 
         host, roles, sources = self.production_host({
-            "primary": [(("START\n",), "coding")],
-            "coding": [(("REVIEW\n",), None)],
+            "primary": planned_primary(["coding"], [(("START\n",), "coding")]),
+            "coding": [((review_text("coding", "REVIEW"),), None)],
         }, middleware_factory=extra, client_factory=ServiceDefaultHandoffClient)
         with self.assertLogs("workflows.responses", level="INFO"):
             events = [

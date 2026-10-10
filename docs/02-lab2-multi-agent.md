@@ -144,28 +144,54 @@ Handoff 的實作機制**就是**注入交接工具——框架以「呼叫一�
 
 我們禁止的是「讓 agent 能對外部系統做事」——如此它才不會宣稱「我掃描了你的 repository」；禁止的並非「框架以工具機制實作交接」。
 
-### 專家正常回合由程式控制回交
+### Handoff-only outcome、需求 ledger 與程式控制回交
 
 `add_handoff` 只設定允許的路由，不保證模型完成審查後自行交回。Handoff runtime
-因此只對三位專家加入 completion-return middleware：模型已有合法回交 call 時不再補；
-正常回覆但沒有 call 時，程式補一個非文字的 Primary 回交控制 call，交由 SDK 真正處理。
-原串流文字不重播，Primary 仍負責彙整或釐清並等待使用者。這不是模型自發選工具的保證。
+因此對三位專家驗證 `SpecialistOutcome`：`review` 必須包含既有 `SpecialistReview`，
+且 category 符合實際角色；`needs_input` 必須說明缺少材料並提出一個問題；
+`unavailable` 必須說明原因。後兩者不製造 findings，也不算 reviewed。
+只有交接 call、沒有合法 outcome 會明確失敗。有效結果沒有回交 call 時，程式補一個
+非文字控制 call；已有合法 call 不重複補，仍由 SDK 真正處理，原串流文字不重播。
 
 空結果、未知工具、未完成的特殊使用者動作或技術降級不能冒充正常審查；
 外層 guard 會明確失敗，不默默停在專家等待。取消仍是取消，不注入回交。
-缺材料先由 Primary 釐清；專家的補充材料說明不代表業務審查完成。
-`SpecialistReview` 原 schema 的限制仍保留，不為了回交捏造結果。
+guard 允許中間 created/in_progress update 的暫時 continuation token，但只在原 stream
+完整消費後接受明確的 stop/tool_calls；pending、缺 terminal 或不完整回合仍失敗。
 
-此政策不啟用 autonomous mode，不增加專家用來「決定是否回交」的模型呼叫。
-相較於提前停在專家的失敗路徑，會多出原本就應有的 Primary 彙整呼叫與 Token 成本。
-Lab 1 單獨 Coding 的共用 instructions、schema 與行為不變，只有 Handoff runtime 有此補強。
+Primary 的公開 SDK session 是需求 ledger 的唯一 owner。內部 `accept_review_plan` action
+登記一至三位、不重複的有序角色；已驗證的 outcome 與真實 SDK receipt 更新進度，
+不採信模型自報的 source、done 或 handled_by。若 Primary 只說「稍後處理」而計畫仍有
+pending 任務，runtime 會最多補一個當前步驟的合法交接。錯序、重複、損壞狀態及超過
+budget 都明確失敗；每個 user turn 最多八次 Primary 模型呼叫，每個 revision 的 step
+最多執行兩次，第二次只能由使用者補材料或明確續辦後的 `resume_review_plan` action 觸發。
 
-程式補的控制 call 不存在於模型服務端的原始 response，因此只有 runtime specialists
-設定 `store=False`：模型 history 由 SDK 本機 provider 保存、載入，並隨既有 checkpoint
-持久化，包含配對的工具 call/result。Primary 保留原有服務端 history 行為。
-這不表示 Hosted session 或 checkpoint 不再持久化；後續專家回合會傳送完整本機上下文，
-輸入 Token 成本／快取效果可能不同。已有 service-managed conversation ID 不能安全自動
-遷移，程式會明確失敗，不清除 ID 或丟棄 history；新版驗證應建立新 session/conversation。
+新 user turn 與內部回交分開：完成計畫後的新審查建立新 revision，不清除材料或歷史；
+純回顧用既有結果。needs_input/unavailable 後可有效 resume；明確改需求才建立 replacement
+revision，保留舊未完成紀錄；無法判斷時只問一個釐清問題，不默默取消或擅自交接。
+相同本文的兩次 user turns 不會被合併成同一要求。
+
+Primary 最後以 Handoff-only `PrimaryReply` 明示 disposition、已 reviewed 與未完成角色。
+runtime 對照 ledger 驗證清單；正常釐清與能力邊界仍不交接。
+Responses protocol 的 completed 只表示本回合正常結束，**不代表所有業務需求 reviewed**：
+needs_input/unavailable 可以誠實結束一輪並保留未完成需求。
+這些 runtime 格式使用 JSON Schema mapping，ledger/receipts 保存普通 JSON 資料，
+不新增 checkpoint 反序列化允許型別；共用角色與 `SpecialistReview` 不變。
+Responses host 在已載入舊 checkpoint、交給 SDK 還原之前驗證 Primary owner
+session/state/ledger。缺失、損壞、版本不支援或進度矛盾均直接失敗，不以 SDK 的空字典
+缺省值重新初始化；真正全新對話才初始化 ledger。
+
+此政策不啟用 autonomous mode 或模型重試，不增加專家的回交決策呼叫。首次 planning
+通常增加一次 Primary 模型呼叫；正常單專家流程為 Primary 三次、專家一次，雙專家為
+Primary 四次、每位專家一次。有效 resume action 也需要對應的 Primary 呼叫。
+程式保證的是**已接受計畫**的有限、有序執行，不是意圖分類、計畫完整性或審查內容必然正確。
+
+程式補的控制 call 不存在於模型服務端的原始 response，因此 Handoff runtime 的
+**Primary 與 specialists 全部設定 `store=False`**。SDK 本機 history 保存配對的 call/result，
+並隨既有 checkpoint 持久化；restore 後也保留材料與已驗證結果。後續回合傳送完整本機
+上下文，輸入 Token 與快取效果可能不同，本機 history 並非免費。
+Hosted session 的持久化仍保留；legacy service-managed ID 不清除或假裝遷移，而是明確失敗。
+新部署必須用新 session/conversation 驗證；Lab 1 單獨 Coding 的 instructions/schema、
+共用 client 與角色 options 均不變。
 
 ---
 
