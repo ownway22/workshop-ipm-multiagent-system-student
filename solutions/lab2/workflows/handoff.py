@@ -316,10 +316,8 @@ def _check_response_actions(response: "ChatResponse | AgentResponse | AgentRespo
         raise asyncio.CancelledError()
     if (response.additional_properties or {}).get(_DEGRADED_RESULT):
         raise HandoffRoutingError("專家已降級，不能當成正常回交。")
-    if response.continuation_token is not None:
-        raise HandoffRoutingError("專家回合尚未完成，不能補上回交。")
     if response.finish_reason in (
-        "length", "content_filter", "error", "incomplete", "in_progress",
+        "length", "content_filter", "error", "incomplete", "failed",
     ):
         raise HandoffRoutingError("專家回合未正常完成，不能補上回交。")
     messages = [response] if isinstance(response, AgentResponseUpdate) else response.messages
@@ -330,6 +328,14 @@ def _check_response_actions(response: "ChatResponse | AgentResponse | AgentRespo
                 or content.exception or content.error_code or content.status in ("failed", "incomplete")
             ):
                 raise HandoffRoutingError("專家有錯誤或未完成的使用者動作。")
+
+
+def _check_response_complete(response: "ChatResponse | AgentResponse") -> None:
+    _check_response_actions(response)
+    if response.continuation_token is not None:
+        raise HandoffRoutingError("專家回合尚未完成，不能補上回交。")
+    if response.finish_reason not in ("stop", "tool_calls"):
+        raise HandoffRoutingError("專家回合未正常完成，不能補上回交。")
 
 
 def build_completion_return_middleware(primary_name: str):
@@ -369,7 +375,7 @@ def build_completion_return_middleware(primary_name: str):
             raise HandoffRoutingError("Primary 回交工具的目標或參數契約不符。")
 
         def return_control(response: ChatResponse) -> ChatResponse:
-            _check_response_actions(response)
+            _check_response_complete(response)
             calls = [
                 content for message in response.messages for content in message.contents
                 if content.type == "function_call"
@@ -409,7 +415,7 @@ def build_return_guard_middleware(primary_name: str):
     from agent_framework import AgentResponse, AgentResponseUpdate, ResponseStream, agent_middleware
 
     def verify(response: AgentResponse) -> None:
-        _check_response_actions(response)
+        _check_response_complete(response)
         if not response.messages:
             raise HandoffRoutingError("專家沒有 SDK 回交結果。")
         results = [

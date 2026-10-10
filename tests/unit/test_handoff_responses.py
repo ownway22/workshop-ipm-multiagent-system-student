@@ -9,7 +9,8 @@ from types import SimpleNamespace
 from typing import Any, Never
 from unittest.mock import patch
 
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, MockTransport, Response
+from openai import AsyncOpenAI
 from agent_framework import (
     AgentResponse,
     AgentResponseUpdate,
@@ -19,6 +20,7 @@ from agent_framework import (
     ChatResponseUpdate,
     Content,
     Executor,
+    FinishReason,
     FunctionInvocationLayer,
     FunctionTool,
     Message,
@@ -33,6 +35,7 @@ from agent_framework import (
     response_handler,
 )
 from agent_framework.orchestrations import HandoffAgentUserRequest, HandoffBuilder, HandoffSentEvent
+from agent_framework.openai import OpenAIChatClient, OpenAIContinuationToken
 from azure.ai.agentserver.responses.models import CreateResponse, ItemMessage
 
 from agents import build_agent_roles
@@ -129,6 +132,7 @@ class ScriptedHandoffClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseCh
         self.calls = 0
         self.requests = []
         self.options_seen = []
+        self.response_updates = []
         self.finalized_responses = []
         self.hook_counts = {"finalizer": 0, "transform": 0, "result": 0, "cleanup": 0}
 
@@ -149,13 +153,24 @@ class ScriptedHandoffClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseCh
         message_id = f"{self.name}-{self.calls}"
         updates = [
             ChatResponseUpdate(
+                role="assistant",
+                author_name=self.name,
+                message_id=message_id,
+                response_id=message_id,
+                continuation_token=OpenAIContinuationToken(response_id=message_id),
+                additional_properties={"provider_event": event},
+            )
+            for event in ("response.created", "response.in_progress")
+        ]
+        updates.extend(
+            ChatResponseUpdate(
                 contents=[Content.from_text(text)],
                 role="assistant",
                 author_name=self.name,
                 message_id=message_id,
             )
             for text in chunks
-        ]
+        )
         if target is not None:
             tool_name = f"handoff_to_{target}"
             if not any(
@@ -171,6 +186,14 @@ class ScriptedHandoffClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseCh
                 author_name=self.name,
                 message_id=message_id,
             ))
+        updates.append(ChatResponseUpdate(
+            role="assistant",
+            author_name=self.name,
+            message_id=message_id,
+            response_id=message_id,
+            finish_reason="tool_calls" if target is not None else "stop",
+        ))
+        self.response_updates.append(updates)
 
         async def generate():
             for update in updates:
@@ -265,18 +288,35 @@ class FaultHandoffClient(ScriptedHandoffClient):
                 raise RuntimeError("Synthetic provider failure")
             if self.fault == "timeout":
                 await asyncio.sleep(1)
+            if self.fault == "missing_terminal":
+                yield ChatResponseUpdate(
+                    role="assistant",
+                    continuation_token=OpenAIContinuationToken(response_id="resp_pending"),
+                )
             if contents:
                 yield ChatResponseUpdate(
                     contents=contents, role="assistant",
-                    finish_reason=(
-                        "length" if self.fault == "unfinished"
-                        else "cancelled" if self.fault == "cancel_reason" else None
-                    ),
                 )
             if self.fault == "midstream":
                 raise RuntimeError("Synthetic midstream failure")
             if self.fault == "cancel":
                 raise asyncio.CancelledError()
+            if self.fault != "missing_terminal":
+                yield ChatResponseUpdate(
+                    role="assistant",
+                    finish_reason=FinishReason(
+                        "length" if self.fault == "unfinished"
+                        else "cancelled" if self.fault == "cancel_reason"
+                        else "incomplete" if self.fault == "incomplete"
+                        else "content_filter" if self.fault == "content_filter"
+                        else "tool_calls" if self.fault in ("unknown_tool", "invalid_arguments")
+                        else "stop"
+                    ),
+                    continuation_token=(
+                        OpenAIContinuationToken(response_id="resp_pending")
+                        if self.fault == "pending" else None
+                    ),
+                )
 
         if stream:
             return ResponseStream(generate(), finalizer=ChatResponse.from_updates)
@@ -289,6 +329,80 @@ class FaultHandoffClient(ScriptedHandoffClient):
 
 class ServiceDefaultHandoffClient(ScriptedHandoffClient):
     STORES_BY_DEFAULT = True
+
+
+def provider_responses_events(
+    chunks: Sequence[str], *, target: str | None = None,
+    status: str | None = "completed", incomplete_reason: str | None = None,
+):
+    text = "".join(chunks)
+    response = {
+        "id": "resp_offline_provider", "object": "response", "created_at": 1,
+        "model": "offline-responses", "parallel_tool_calls": False,
+        "tool_choice": "auto", "tools": [], "output": [], "status": "in_progress",
+    }
+    part = {"type": "output_text", "text": text, "annotations": [], "logprobs": []}
+    message = {
+        "id": "msg_offline_provider", "type": "message", "role": "assistant",
+        "status": "completed", "content": [part],
+    }
+    location = {"item_id": message["id"], "output_index": 0, "content_index": 0}
+    events = [
+        {"type": "response.created", "response": response},
+        {"type": "response.in_progress", "response": response},
+        {
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {**message, "status": "in_progress", "content": []},
+        },
+        {
+            "type": "response.content_part.added", **location,
+            "part": {**part, "text": ""},
+        },
+        *[
+            {"type": "response.output_text.delta", **location, "delta": chunk, "logprobs": []}
+            for chunk in chunks
+        ],
+        {"type": "response.output_text.done", **location, "text": text, "logprobs": []},
+        {"type": "response.content_part.done", **location, "part": part},
+        {"type": "response.output_item.done", "output_index": 0, "item": message},
+    ]
+    output = [message]
+    if target is not None:
+        call = {
+            "type": "function_call", "id": "fc_offline_provider",
+            "call_id": "call_offline_provider", "name": f"handoff_to_{target}",
+            "arguments": "{}", "status": "completed",
+        }
+        call_location = {"item_id": call["id"], "output_index": 1}
+        events.extend([
+            {
+                "type": "response.output_item.added", "output_index": 1,
+                "item": {**call, "arguments": "", "status": "in_progress"},
+            },
+            {"type": "response.function_call_arguments.delta", **call_location, "delta": "{}"},
+            {
+                "type": "response.function_call_arguments.done", **call_location,
+                "name": call["name"], "arguments": "{}",
+            },
+            {"type": "response.output_item.done", "output_index": 1, "item": call},
+        ])
+        output.append(call)
+    if status is not None:
+        events.append({
+            "type": f"response.{status}",
+            "response": {
+                **response, "status": status, "output": output,
+                "error": (
+                    {"code": "server_error", "message": "Synthetic provider failure"}
+                    if status == "failed" else None
+                ),
+                "incomplete_details": {"reason": incomplete_reason} if incomplete_reason else None,
+            },
+        })
+    return "\n\n".join(
+        f"event: {event['type']}\ndata: {json.dumps({**event, 'sequence_number': index})}"
+        for index, event in enumerate(events)
+    ) + "\n\n"
 
 
 def context(text, conversation="conversation-a", user="user-a", response=None):
@@ -803,6 +917,147 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(source.clients[specialist_name].calls, 1)
                     self.assertEqual(source.clients[primary_name].calls, 2)
 
+    async def test_http_provider_responses_lifecycle(self):
+        review = {
+            "category": "code", "summary": "Synthetic parser review.",
+            "findings": ["Synthetic finding."], "severity": "LOW",
+            "evidence": ["Synthetic original code."], "recommendations": ["Synthetic advice."],
+            "limitations": ["Offline fixture only."],
+        }
+        text = json.dumps(review, indent=2) + "\n"
+        chunks = (text[:32], text[32:75], text[75:])
+        cases = (
+            ("result_only", False, "completed", None),
+            ("already_returned", True, "completed", None),
+            ("failed", False, "failed", None),
+            ("incomplete", False, "incomplete", None),
+            ("length", False, "incomplete", "max_output_tokens"),
+            ("content_filter", False, "incomplete", "content_filter"),
+            ("pending", False, "in_progress", None),
+            ("missing_terminal", False, None, None),
+        )
+        for stream in (True, False):
+            for case, already_returned, status, incomplete_reason in cases:
+                with self.subTest(stream=stream, case=case):
+                    requests = []
+                    updates = []
+                    final_responses = []
+                    invoked_tools = []
+
+                    def provider(request):
+                        body = json.loads(request.content)
+                        self.assertIs(body["stream"], True)
+                        self.assertIs(body["store"], False)
+                        requests.append(body)
+                        self.assertEqual(len(requests), 1)
+                        return Response(
+                            200,
+                            headers={"content-type": "text/event-stream"},
+                            text=provider_responses_events(
+                                chunks,
+                                target=roles["primary"].agent_name if already_returned else None,
+                                status=status, incomplete_reason=incomplete_reason,
+                            ),
+                        )
+
+                    @chat_middleware
+                    async def observe_parser(context, call_next):
+                        await call_next()
+                        context.result.with_transform_hook(updates.append)
+                        context.result.with_result_hook(final_responses.append)
+
+                    @function_middleware
+                    async def observe_tool(context, call_next):
+                        invoked_tools.append(context.function.name)
+                        await call_next()
+
+                    async with AsyncClient(transport=MockTransport(provider)) as provider_http:
+                        async with AsyncOpenAI(
+                            api_key="offline-fixture-not-a-real-key",
+                            base_url="http://offline.invalid/v1",
+                            http_client=provider_http, max_retries=0,
+                        ) as openai_client:
+                            def client_factory(name, script):
+                                if name == roles["coding"].agent_name:
+                                    return OpenAIChatClient(
+                                        model="offline-responses", async_client=openai_client,
+                                        middleware=[observe_parser, observe_tool],
+                                    )
+                                return ScriptedHandoffClient(name, script)
+
+                            host, roles, sources = self.production_host({
+                                "primary": [
+                                    (("PREFACE\n",), "coding"), (("SUMMARY\n",), None),
+                                ],
+                            }, suffix=f"parser-{stream}-{case}", client_factory=client_factory)
+                            async with AsyncClient(
+                                transport=ASGITransport(app=host), base_url="http://localhost"
+                            ) as client:
+                                with self.assertLogs("workflows.responses", level="INFO") as captured:
+                                    response = await client.post(
+                                        "/responses", json={"input": "Synthetic material.", "stream": stream}
+                                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    events: list[dict[str, Any]] = []
+                    if stream:
+                        events = [
+                            json.loads(line.removeprefix("data: "))
+                            for line in response.text.splitlines() if line.startswith("data: {")
+                        ]
+                        payload = events[-1]["response"]
+                    else:
+                        payload = response.json()
+                    completed = status == "completed"
+                    self.assertEqual(
+                        payload["status"], "completed" if completed else "failed",
+                        "\n".join(captured.output),
+                    )
+                    primary = roles["primary"].agent_name
+                    coding = roles["coding"].agent_name
+                    self.assertEqual([
+                        record.args for record in captured.records
+                        if record.msg == "Handoff transition: source=%s target=%s"
+                    ], [(primary, coding), (coding, primary)] if completed else [(primary, coding)])
+                    self.assertEqual([
+                        record.args[0] for record in captured.records
+                        if record.msg == "Handoff waiting for user input: source=%s request_id=%s"
+                        and isinstance(record.args, tuple)
+                    ], [primary] if completed else [])
+                    self.assertEqual(len(requests), 1)
+                    self.assertEqual(sources[0].clients[primary].calls, 2 if completed else 1)
+                    self.assertEqual(invoked_tools, [f"handoff_to_{primary}"] if completed else [])
+                    if not completed:
+                        self.assertEqual(payload["error"]["code"], "server_error")
+                        continue
+                    self.assertEqual(updates[0].contents, [])
+                    self.assertEqual(updates[1].contents, [])
+                    self.assertIsNotNone(updates[0].continuation_token)
+                    self.assertIsNotNone(updates[1].continuation_token)
+                    self.assertIsNone(payload.get("error"))
+                    expected = "PREFACE\n" + text + "SUMMARY\n"
+                    actual = "".join(
+                        part["text"]
+                        for item in payload["output"] if item["type"] == "message"
+                        for part in item["content"] if part["type"] == "output_text"
+                    )
+                    self.assertEqual(actual, expected)
+                    self.assertEqual(actual.count(text), 1)
+                    if stream:
+                        self.assertEqual("".join(
+                            event["delta"] for event in events
+                            if event["type"] == "response.output_text.delta"
+                        ), expected)
+                        self.assertEqual("".join(
+                            event["text"] for event in events
+                            if event["type"] == "response.output_text.done"
+                        ), expected)
+                    self.assertEqual(len(final_responses), 1)
+                    self.assertIsNone(final_responses[0].continuation_token)
+                    self.assertEqual(
+                        final_responses[0].finish_reason, "tool_calls" if already_returned else "stop"
+                    )
+                    self.assertEqual(final_responses[0].value, SpecialistReview.model_validate(review))
+
     async def test_production_return_policy_composite_sequences(self):
         for first in ("coding", "spec"):
             with self.subTest(first=first):
@@ -931,6 +1186,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         for fault in (
             "empty", "unknown_tool", "invalid_arguments", "user_action",
             "technical", "midstream", "timeout", "error_content", "unfinished",
+            "pending", "missing_terminal", "incomplete", "content_filter",
         ):
             with self.subTest(fault=fault):
                 def client_factory(name, script):
@@ -1086,11 +1342,18 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result.additional_properties["synthetic_agent_metadata"], "kept")
                 client = source.clients[coding]
                 self.assertEqual(client.hook_counts["finalizer"], 1)
+                self.assertTrue(all(
+                    update.continuation_token is not None
+                    for update in client.response_updates[0][:2]
+                ))
+                self.assertIsNone(client.response_updates[0][-1].continuation_token)
+                self.assertIsNone(client.finalized_responses[0].continuation_token)
+                self.assertEqual(client.finalized_responses[0].finish_reason, "stop")
                 self.assertEqual(client.finalized_responses[0].value, SpecialistReview.model_validate(review))
                 self.assertEqual(client.finalized_responses[0].additional_properties["synthetic_finalizer"], coding)
                 if stream:
                     self.assertEqual(client.hook_counts, {
-                        "finalizer": 1, "transform": 2, "result": 1, "cleanup": 1,
+                        "finalizer": 1, "transform": 5, "result": 1, "cleanup": 1,
                     })
                     self.assertTrue(client.finalized_responses[0].additional_properties["synthetic_result_hook"])
                 self.assertEqual(
