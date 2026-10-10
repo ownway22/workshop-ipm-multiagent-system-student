@@ -46,7 +46,7 @@ from models.specialist_review import ReviewCategory, SpecialistReview
 
 if TYPE_CHECKING:  # 只為型別標註；執行期不匯入，維持本模組「用到才 import」的一致風格
     from agent_framework import (
-        Agent, AgentResponse, AgentResponseUpdate, AgentSession, ChatResponse, CheckpointStorage,
+        Agent, AgentResponse, AgentResponseUpdate, AgentSession, ChatResponse, CheckpointStorage, Content,
         Message, ResponseStream, WorkflowCheckpoint,
     )
 
@@ -626,16 +626,50 @@ def _empty_arguments(arguments: object) -> bool:
     return isinstance(arguments, Mapping) and not arguments
 
 
-def _check_response_actions(response: "ChatResponse | AgentResponse | AgentResponseUpdate") -> None:
+_GuardActor = Literal["primary", "specialist"]
+_GuardPhase = Literal["stream_update", "final_response"]
+
+
+def _log_response_rejection(
+    *, actor: _GuardActor, phase: _GuardPhase, reason: str, content: "Content | None" = None,
+) -> None:
+    content_type = "none"
+    content_status = "none"
+    if content is not None:
+        content_type = content.type if content.type in (
+            "text", "text_reasoning", "function_call", "function_result",
+            "function_approval_request", "function_approval_response", "error", "usage",
+        ) else "unknown"
+        if content.status is not None:
+            content_status = content.status if content.status in (
+                "queued", "in_progress", "completed", "failed", "incomplete", "cancelled",
+            ) else "unknown"
+    logger.warning(
+        "Handoff guard rejection: actor=%s phase=%s reason=%s content_type=%s content_status=%s "
+        "has_exception=%s has_error_code=%s user_input_request=%s",
+        actor, phase, reason, content_type, content_status,
+        bool(content.exception) if content is not None else False,
+        bool(content.error_code) if content is not None else False,
+        bool(content.user_input_request) if content is not None else False,
+    )
+
+
+def _check_response_actions(
+    response: "ChatResponse | AgentResponse | AgentResponseUpdate", *,
+    actor: _GuardActor, phase: _GuardPhase,
+) -> None:
     from agent_framework import AgentResponseUpdate
 
     if response.finish_reason == "cancelled":
+        _log_response_rejection(actor=actor, phase=phase, reason="cancelled")
         raise asyncio.CancelledError()
     if (response.additional_properties or {}).get(_DEGRADED_RESULT):
+        _log_response_rejection(actor=actor, phase=phase, reason="degraded")
         raise HandoffRoutingError("專家已降級，不能當成正常回交。")
     if response.finish_reason in (
         "length", "content_filter", "error", "incomplete", "failed",
     ):
+        _log_response_rejection(actor=actor, phase=phase, reason=f"finish_{response.finish_reason}")
         raise HandoffRoutingError("專家回合未正常完成，不能補上回交。")
     messages = [response] if isinstance(response, AgentResponseUpdate) else response.messages
     for message in messages:
@@ -644,14 +678,34 @@ def _check_response_actions(response: "ChatResponse | AgentResponse | AgentRespo
                 content.user_input_request or content.type == "error"
                 or content.exception or content.error_code or content.status in ("failed", "incomplete")
             ):
+                if content.user_input_request:
+                    reason = "user_input_request"
+                elif content.type == "error":
+                    reason = "error_content"
+                elif content.exception:
+                    reason = "content_exception"
+                elif content.error_code:
+                    reason = "content_error_code"
+                elif content.status == "failed":
+                    reason = "content_failed"
+                else:
+                    reason = "content_incomplete"
+                _log_response_rejection(actor=actor, phase=phase, reason=reason, content=content)
                 raise HandoffRoutingError("專家有錯誤或未完成的使用者動作。")
 
 
-def _check_response_complete(response: "ChatResponse | AgentResponse") -> None:
-    _check_response_actions(response)
+def _check_response_complete(
+    response: "ChatResponse | AgentResponse", *, actor: _GuardActor,
+) -> None:
+    _check_response_actions(response, actor=actor, phase="final_response")
     if response.continuation_token is not None:
+        _log_response_rejection(actor=actor, phase="final_response", reason="pending_continuation")
         raise HandoffRoutingError("專家回合尚未完成，不能補上回交。")
     if response.finish_reason not in ("stop", "tool_calls"):
+        _log_response_rejection(
+            actor=actor, phase="final_response",
+            reason="missing_finish_reason" if response.finish_reason is None else "unsupported_finish_reason",
+        )
         raise HandoffRoutingError("專家回合未正常完成，不能補上回交。")
 
 
@@ -796,7 +850,7 @@ def build_primary_guard_middleware(roles: dict[str, AgentRole]):
         _save_ledger(session, ledger)
 
         def verify(response: AgentResponse) -> None:
-            _check_response_complete(response)
+            _check_response_complete(response, actor="primary")
             current = load_review_ledger(session)
             if current is None:
                 raise HandoffRoutingError("Primary 執行後 ledger 遺失。")
@@ -844,7 +898,7 @@ def build_primary_guard_middleware(roles: dict[str, AgentRole]):
 
             async def checked_updates() -> AsyncIterator[AgentResponseUpdate]:
                 async for update in inner:
-                    _check_response_actions(update)
+                    _check_response_actions(update, actor="primary", phase="stream_update")
                     yield update
                 verify(await inner.get_final_response())
 
@@ -889,7 +943,7 @@ def build_primary_policy_middleware(roles: dict[str, AgentRole]):
         }
 
         def finalized(response: ChatResponse) -> ChatResponse:
-            _check_response_complete(response)
+            _check_response_complete(response, actor="primary")
             calls = [
                 content for message in response.messages for content in message.contents
                 if content.type == "function_call"
@@ -1059,7 +1113,7 @@ def build_completion_return_middleware(primary_name: str, role: SpecialistKey):
             raise HandoffRoutingError("Primary 回交工具的目標或參數契約不符。")
 
         def return_control(response: ChatResponse) -> ChatResponse:
-            _check_response_complete(response)
+            _check_response_complete(response, actor="specialist")
             _outcome(response, role)
             calls = [
                 content for message in response.messages for content in message.contents
@@ -1100,7 +1154,7 @@ def build_return_guard_middleware(primary_name: str, role: SpecialistKey):
     from agent_framework import AgentResponse, AgentResponseUpdate, ResponseStream, agent_middleware
 
     def verify(response: AgentResponse, dispatch: HandoffDispatch) -> None:
-        _check_response_complete(response)
+        _check_response_complete(response, actor="specialist")
         call_id, target = _handoff_result(response)
         if target != primary_name:
             raise HandoffRoutingError("SDK 回交結果未指向 Primary。")
@@ -1125,7 +1179,7 @@ def build_return_guard_middleware(primary_name: str, role: SpecialistKey):
                 async for update in inner:
                     if not isinstance(update, AgentResponseUpdate):
                         raise HandoffRoutingError("專家 stream 更新型別不符。")
-                    _check_response_actions(update)
+                    _check_response_actions(update, actor="specialist", phase="stream_update")
                     yield update
                 verify(await inner.get_final_response(), dispatch)
 

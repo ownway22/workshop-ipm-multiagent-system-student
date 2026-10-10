@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Mapping, Sequence
 from copy import deepcopy
 from pathlib import Path
 from types import GenericAlias, SimpleNamespace
-from typing import Any, Never
+from typing import Any, Literal, Never
 from unittest.mock import patch
 
 from httpx import ASGITransport, AsyncClient, MockTransport, Response
@@ -57,6 +57,8 @@ from workflows.handoff import (
     SpecialistOutcome,
     _LEDGER_KEY,
     _RECEIPT_KEY,
+    _check_response_actions,
+    _check_response_complete,
     _outcome,
     _strict_runtime_schema,
     build_checkpoint_safe_middleware,
@@ -1613,6 +1615,202 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(sessions[0].service_session_id, "resp_legacy_primary")
         self.assertEqual(sources[0].clients[roles["primary"].agent_name].calls, 0)
+
+    def test_response_action_rejections_log_only_safe_metadata(self):
+        private = "PRIVATE_REJECTION_DATA"
+        cases = (
+            ("user_input_request", Content.from_function_approval_request(
+                id=private, function_call=Content.from_function_call(
+                    call_id=private, name=private, arguments={"secret": private},
+                ),
+            ), ("function_approval_request", "none", False, False, True)),
+            ("error_content", Content("error", message=private),
+             ("error", "none", False, False, False)),
+            ("content_exception", Content.from_function_result(
+                call_id=private, result=private, exception=private,
+            ), ("function_result", "none", True, False, False)),
+            ("content_error_code", Content("text", text=private, error_code=private),
+             ("text", "none", False, True, False)),
+            ("content_failed", Content("text", text=private, status="failed"),
+             ("text", "failed", False, False, False)),
+            ("content_incomplete", Content("text", text=private, status="incomplete"),
+             ("text", "incomplete", False, False, False)),
+            ("content_exception", Content("text", text=private, status=private, exception=private),
+             ("text", "unknown", True, False, False)),
+            ("user_input_request", Content(
+                "error", message=private, user_input_request=True, exception=private,
+                error_code=private, status="failed",
+            ), ("error", "failed", True, True, True)),
+        )
+        actors: tuple[Literal["primary", "specialist"], ...] = ("primary", "specialist")
+        for actor in actors:
+            for response_type in ("stream_update", "chat_final", "agent_final"):
+                for reason, content, expected in cases:
+                    with self.subTest(actor=actor, response_type=response_type, reason=reason):
+                        content.raw_representation = {"Authorization": private, "provider_payload": private}
+                        content.additional_properties = {"tool_arguments": private}
+                        message = Message(
+                            "assistant", [content], author_name=private, message_id=private,
+                            additional_properties={_RECEIPT_KEY: private}, raw_representation=private,
+                        )
+                        phase = "stream_update" if response_type == "stream_update" else "final_response"
+                        with self.assertLogs("workflows.handoff", level="WARNING") as captured:
+                            with self.assertRaisesRegex(
+                                HandoffRoutingError, "專家有錯誤或未完成的使用者動作。",
+                            ):
+                                if response_type == "stream_update":
+                                    _check_response_actions(
+                                        AgentResponseUpdate(
+                                            contents=[content], author_name=private, response_id=private,
+                                            additional_properties={"ledger": private}, raw_representation=private,
+                                        ), actor=actor, phase="stream_update",
+                                    )
+                                else:
+                                    response = (
+                                        ChatResponse(messages=[message], finish_reason="stop")
+                                        if response_type == "chat_final"
+                                        else AgentResponse(messages=[message], finish_reason="stop")
+                                    )
+                                    _check_response_complete(response, actor=actor)
+                        self.assertEqual(len(captured.records), 1)
+                        self.assertEqual(captured.records[0].args, (actor, phase, reason, *expected))
+                        self.assertIsNone(captured.records[0].exc_info)
+                        self.assertNotIn(private, captured.records[0].getMessage())
+                        self.assertNotIn("Authorization", captured.records[0].getMessage())
+                        self.assertNotIn(_RECEIPT_KEY, captured.records[0].getMessage())
+
+    def test_response_completion_and_cancellation_diagnostics_preserve_behavior(self):
+        actors: tuple[Literal["primary", "specialist"], ...] = ("primary", "specialist")
+        for actor in actors:
+            with self.subTest(actor=actor):
+                with self.assertNoLogs("workflows.handoff", level="WARNING"):
+                    _check_response_actions(AgentResponseUpdate(
+                        continuation_token=OpenAIContinuationToken(response_id="PRIVATE_PENDING_ID"),
+                    ), actor=actor, phase="stream_update")
+                    _check_response_actions(AgentResponseUpdate(
+                        contents=[Content.from_function_call(
+                            call_id="PRIVATE_CALL_ID", name="accept_review_plan", arguments={},
+                        )],
+                    ), actor=actor, phase="stream_update")
+                    _check_response_complete(
+                        ChatResponse(messages=[Message("assistant", ["Synthetic valid response."])],
+                                     finish_reason="stop"),
+                        actor=actor,
+                    )
+                for reason, response in (
+                    ("pending_continuation", ChatResponse(
+                        finish_reason="stop",
+                        continuation_token=OpenAIContinuationToken(response_id="PRIVATE_PENDING_ID"),
+                    )),
+                    ("missing_finish_reason", ChatResponse()),
+                    ("unsupported_finish_reason", ChatResponse(finish_reason=FinishReason("in_progress"))),
+                    ("degraded", ChatResponse(additional_properties={"handoff_degraded": True})),
+                ):
+                    with self.subTest(reason=reason):
+                        with self.assertLogs("workflows.handoff", level="WARNING") as captured:
+                            with self.assertRaises(HandoffRoutingError):
+                                _check_response_complete(response, actor=actor)
+                        self.assertEqual(captured.records[0].args, (
+                            actor, "final_response", reason, "none", "none", False, False, False,
+                        ))
+                        self.assertNotIn("PRIVATE_PENDING_ID", captured.records[0].getMessage())
+                for finish in ("length", "content_filter", "error", "incomplete", "failed", "cancelled"):
+                    with self.subTest(finish=finish):
+                        with self.assertLogs("workflows.handoff", level="WARNING") as captured:
+                            if finish == "cancelled":
+                                with self.assertRaises(asyncio.CancelledError):
+                                    _check_response_actions(
+                                        AgentResponseUpdate(finish_reason=FinishReason(finish)),
+                                        actor=actor, phase="stream_update",
+                                    )
+                            else:
+                                with self.assertRaises(HandoffRoutingError):
+                                    _check_response_actions(
+                                        AgentResponseUpdate(finish_reason=FinishReason(finish)),
+                                        actor=actor, phase="stream_update",
+                                    )
+                        reason = "cancelled" if finish == "cancelled" else f"finish_{finish}"
+                        self.assertEqual(captured.records[0].args, (
+                            actor, "stream_update", reason, "none", "none", False, False, False,
+                        ))
+
+    async def test_primary_parser_rejections_are_labeled_without_sensitive_content(self):
+        cases = (
+            ("bad_plan_arguments", "stream_update", "content_exception", "function_result"),
+            ("approval", "stream_update", "user_input_request", "function_approval_request"),
+            ("provider_failed", "final_response", "missing_finish_reason", "none"),
+        )
+        for fault, phase, reason, content_type in cases:
+            with self.subTest(fault=fault):
+                requests = []
+
+                def provider(request):
+                    body = json.loads(request.content)
+                    assert_strict_request_schema(self, body)
+                    requests.append(body)
+                    self.assertEqual(len(requests), 1)
+                    if fault == "bad_plan_arguments":
+                        events = provider_responses_events(
+                            (), call=("accept_review_plan", {"roles": []}),
+                        )
+                    elif fault == "approval":
+                        events = provider_responses_events((), status=None)
+                        item = {
+                            "type": "mcp_approval_request", "id": "PRIVATE_APPROVAL_ID",
+                            "name": "PRIVATE_APPROVAL_TOOL", "arguments": '{"secret":"PRIVATE_ARGUMENT"}',
+                            "server_label": "PRIVATE_SERVER",
+                        }
+                        approval = {
+                            "type": "response.output_item.added", "sequence_number": 9,
+                            "output_index": 1, "item": item,
+                        }
+                        events += "event: response.output_item.added\ndata: " + json.dumps(approval) + "\n\n"
+                    else:
+                        events = provider_responses_events(("PRIVATE_PROVIDER_TEXT",), status="failed")
+                    return Response(200, headers={"content-type": "text/event-stream"}, text=events)
+
+                async with AsyncClient(transport=MockTransport(provider)) as provider_http:
+                    async with AsyncOpenAI(
+                        api_key="offline-fixture-not-a-real-key", base_url="http://offline.invalid/v1",
+                        http_client=provider_http, max_retries=0,
+                    ) as openai_client:
+                        def client_factory(name, script):
+                            if name.endswith("-primary-agent"):
+                                return StoredResponsesClient(model="offline-responses", async_client=openai_client)
+                            return ScriptedHandoffClient(name, script)
+
+                        host, roles, sources = self.production_host(
+                            {"primary": []}, suffix=f"primary-diagnostic-{fault}",
+                            client_factory=client_factory,
+                        )
+                        async with AsyncClient(
+                            transport=ASGITransport(app=host), base_url="http://localhost"
+                        ) as client:
+                            with self.assertLogs("workflows", level="INFO") as captured:
+                                response = await client.post(
+                                    "/responses", json={"input": "Synthetic diagnostic material.", "stream": False},
+                                )
+                payload = response.json()
+                self.assertEqual(payload["status"], "failed")
+                self.assertEqual(payload["error"]["code"], "server_error")
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(self.ledger_transitions(captured), [])
+                self.assertTrue(all(
+                    sources[0].clients[roles[key].agent_name].calls == 0
+                    for key in ("coding", "spec", "architect")
+                ))
+                diagnostics = [
+                    record for record in captured.records
+                    if record.msg.startswith("Handoff guard rejection:")
+                ]
+                self.assertTrue(any(
+                    isinstance(record.args, tuple)
+                    and record.args[:4] == ("primary", phase, reason, content_type)
+                    for record in diagnostics
+                ), "\n".join(record.getMessage() for record in diagnostics))
+                for record in diagnostics:
+                    self.assertIsNone(record.exc_info)
+                    self.assertNotIn("PRIVATE_", record.getMessage())
 
     def test_handoff_log_source_priority(self):
         cases = (
