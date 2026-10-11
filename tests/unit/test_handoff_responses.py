@@ -433,6 +433,7 @@ def event_payload(event):
 class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name) / "handoff"
         self.root.mkdir()
         environment = patch.dict(os.environ, {
@@ -443,9 +444,6 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         self.host = HandoffResponsesHost(
             workflow, checkpoint_root=self.root, configure_observability=None
         )
-
-    async def asyncTearDown(self):
-        self.directory.cleanup()
 
     async def turn(self, text, *, host=None, previous=None, **kwargs):
         request = CreateResponse(input=text, stream=True, previous_response_id=previous)
@@ -893,6 +891,10 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                         path.relative_to(checkpoint_root): path.read_bytes()
                         for path in checkpoint_root.rglob("*") if path.is_file()
                     }
+                    previous_calls = [
+                        (model, model.calls)
+                        for source in sources for model in source.clients.values()
+                    ]
                     pointer = host._conversation_pointer("user-a", "conv_same")
                     previous = await host._latest_checkpoint(host._response_dir(
                         "user-a", pointer.read_text(encoding="utf-8")
@@ -916,6 +918,9 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                         self.assertNotIn("private-a", response.text)
                         self.assertTrue(all(
                             model.calls == 0 for model in sources[-1].clients.values()
+                        ))
+                        self.assertTrue(all(
+                            model.calls == calls for model, calls in previous_calls
                         ))
                         self.assertEqual({
                             path.relative_to(checkpoint_root): path.read_bytes()
@@ -954,9 +959,17 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(users.count(material), 1)
                     self.assertEqual(users[-1], text)
                     foreign = {"private-a", "private-b", "separate-a"} - {material}
+                    forbidden = foreign | {"private-b attempt", "continue-b attempt"}
                     self.assertTrue(
-                        (foreign | {"private-b attempt", "continue-b attempt"}).isdisjoint(users)
+                        forbidden.isdisjoint(users)
                     )
+                    for agent in sources[-1].clients.values():
+                        for messages in agent.requests:
+                            history_text = "\n".join(
+                                Message.from_dict(message).text for message in messages
+                            )
+                            for private_text in forbidden:
+                                self.assertNotIn(private_text, history_text)
 
     async def test_http_input_errors_keep_invalid_prompt_contract(self):
         for stream in (False, True):
