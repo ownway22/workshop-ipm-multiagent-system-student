@@ -221,15 +221,16 @@ Container Registry 與 Bot Service 要另外處理，見 [收尾與清理](docs/
 
 ## 版本
 
-### Native hosting 遷移狀態
+### Handoff adapter 的 SDK 相容性準備
 
-2026-10-11 的 native workflow hosting 可行性驗證**未通過**：真正 Handoff 等待後的純文字
-追問在 stream／nonstream 均失敗，官方線性 lineage 也不保留 #4 既有分岔契約。
-正式 pins、lock 與預設 host 不變；現有 adapter 已做最小 public API 相容修正並同步救援程式。
-Baseline 與隔離候選皆通過 **43 tests、103 subtests**，但這**不是 native migration 完成**。
-候選套件仍只在隔離測試環境。
-詳見 [重現、官方來源與後續門檻](docs/native-hosting-migration.md)、
-[known gaps](references/known-gaps.md)。本次沒有 Azure 部署或 end-to-end 驗收。
+正式 SDK **尚未升級**，pins、lock 與預設 host 不變。現有 adapter 的最小 public API
+相容修正已同步救援程式，baseline 與隔離候選皆通過 **43 tests、103 subtests**。
+正式容器 smoke 仍受本機 Docker daemon 不可用阻擋；沒有 Azure 部署或 end-to-end 驗收。
+
+Native 純文字續接能力與官方線性 lineage／既有分岔契約是**獨立 migration blockers**，
+不是正式 adapter 的 regression failures，也不在本次相容性準備的解決範圍。
+實驗版本與證據保留於 [相容性報告、Docker 設定與後續門檻](docs/native-hosting-migration.md)、
+[known gaps](references/known-gaps.md)；不宣稱 native migration 完成。
 
 所有相依都**釘死版本**。升級任一 `agent-framework` 套件時，
 **必須**重跑 Lab 2 → Lab 3 → Lab 4 全鏈路——

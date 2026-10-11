@@ -1,13 +1,67 @@
-# Native Foundry hosting：SDK 相容性已修復，native 門檻仍未通過
+# Handoff adapter 的 SDK 相容性準備
 
-查證日期：2026-10-11。正式 baseline：`origin/main` 的 `1e1cb78`（已合併 PR #4）。
+版本查證日期：2026-10-11；收斂 review：2026-10-12。
+正式 baseline：`origin/main` 的 `1e1cb78`（已合併 PR #4）。
 
-**SDK 相容性完成不等於 native migration 完成。** 正式 [進入點](../src/main.py)、
+**PR #5 僅交付現有 adapter 的 SDK 相容性準備，正式 SDK 尚未升級。** 正式 [進入點](../src/main.py)、
 [相依定義](../src/pyproject.toml)、[lock](../src/uv.lock)、預設 host 與部署設定維持 baseline；
 [HandoffResponsesHost](../src/workflows/responses.py) 僅加入下述最小 API 相容修改，
 [完成版程式](../solutions/lab2/) 已同步。
 沒有移除任何自訂 plumbing，也沒有新增另一套 checkpoint、binding、projection 或鎖。
 Manual permissions 不變；沒有 provision、deploy、變更 credentials、刪除 Azure 資源或 merge。
+
+## Review 與合併驗證邊界
+
+已直接 review 相對 `main` 的 runtime／測試差異，未發現需要改變 runtime 契約的
+高信心問題。補強測試 cleanup（setup 失敗仍回收 state）、拒絕時所有既有 clients
+的 call count，以及所有模型完整 history 不含其他使用者材料；沒有刪除或放寬原斷言。
+正式與候選的 adapter regression 重驗皆為 **43 passed、103 subtests passed**。
+
+相容性準備的本機程式／測試條件已滿足，可供 maintainer review；
+**尚欠正式容器 build／啟動 smoke 與人工 review，保持 Draft，不宣稱完整合併驗證完成**。
+GitHub 目前沒有回報 PR checks；不把本機測試寫成 CI 綠燈。
+下方隔離的 native gate 是未來 migration 的證據，**不是正式 adapter regression failures，
+也不是要求本 PR 強行解決的合併條件**。沒有重做既有版本調查或新增 hosting 機制。
+
+### Docker 阻擋與使用者設定
+
+2026-10-12 檢查：Docker CLI **29.4.0** 可用，context 為 `default`，
+但 `/var/run/docker.sock` 不存在，`docker info` 無法連到 daemon。
+因此正式 [Dockerfile](../deploy/Dockerfile) 的 build／容器啟動 smoke **未執行**；
+沒有自行安裝 Docker、啟動系統服務、調整 socket 權限或改用 Azure remote build。
+
+請由你或環境維護者完成：
+
+- 若使用 Docker Desktop：確認 Linux containers／WSL 2 backend，
+  在 **Settings → Resources → WSL Integration** 啟用目前的 Ubuntu，
+  並由你啟動 Docker Desktop、重新開啟 WSL terminal。
+- 若使用 Ubuntu 內既有 Docker Engine：由環境維護者確認 daemon 與 socket 可用，
+  並授予合適的使用權限；本 PR 不修改系統或全域 Docker 設定。
+- 在同一個 WSL terminal 確認 `docker info` 成功；build engine 必須支援
+  `linux/amd64`（arm64 主機可能需要已配置的 emulation）。
+
+Docker 可用後，從 repository 根目錄執行**正式 Dockerfile／正式 lock**：
+
+```bash
+docker build --platform linux/amd64 -f deploy/Dockerfile -t ipm-handoff-compat:pr5 .
+docker run --rm --name ipm-handoff-compat-pr5 \
+  -p 127.0.0.1:18088:8088 \
+  -e FOUNDRY_PROJECT_ENDPOINT=https://offline.invalid/api/projects/offline \
+  -e MODEL_DEPLOYMENT_NAME=offline \
+  -e OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false \
+  ipm-handoff-compat:pr5
+```
+
+另一個 terminal：
+
+```bash
+curl --fail --retry 6 --retry-delay 2 --retry-connrefused http://127.0.0.1:18088/readiness
+docker stop ipm-handoff-compat-pr5
+```
+
+上述值都是合成的非秘密設定；不要載入真實 `.env`、掛載 credentials 或呼叫模型。
+這項 smoke 只確認正式入口可啟動、readiness 與停止，不等於 Azure model authentication、
+Playground／Teams 或 native continuation 驗收。這些命令本次沒有執行。
 
 ## 本階段：現有 adapter 的 SDK 相容性
 
@@ -54,7 +108,7 @@ pending request IDs／payload 與所有既有 checkpoint bytes 不變；
 下方 native 純文字、線性 lineage、`store=False`、ownership 與 error contract blockers
 仍維持；原 native gate 不使用 skip／xfail，既有調查與四個 gate 本階段不重跑。
 
-## 官方來源與實際版本
+## 隔離實驗：官方來源與實際版本
 
 以 [PyPI 的精確版本 metadata](https://pypi.org/pypi/agent-framework-foundry-hosting/1.0.0b261008/json)
 及 released wheel 為準，不以 GitHub `main` 推測 API。Hosting wheel 的 SHA256：
@@ -103,6 +157,8 @@ python-dotenv **1.2.2**、pytest **9.1.1**、httpx **0.28.1**。
 Lock 限制發行截止日，並保留所有不需改變的 baseline transitive pins；不是全量 upgrade。
 
 ## 最小重現與主要 blocker
+
+以下是 **native host 的隔離實驗**，不是本 PR 正式 adapter 的 regression runner。
 
 WSL 內使用 Dockerfile 同版 **uv 0.9.25**、Linux **Python 3.13.11**：
 
@@ -230,6 +286,15 @@ client 重送同一 trusted call ID 的 contract、telemetry、實際模型的 T
 不將這兩種 runner 問題誤列為 SDK blocker。
 
 ## 最小可行替代方案與後續門檻
+
+### 後續正式 SDK upgrade
+
+必須另行明確升級正式 pins／lock，逐項查證必要相依與 protocol／API 相容性，
+使用實際升級的 image 完成 build／入口 smoke，並以新 session／conversation
+人工驗收 Lab 2 → Lab 3 → Lab 4、12 題、多輪、完整輸出與 Token／history。
+本 PR 的 candidate 假模型測試不能取代那些驗收；不得假定 checkpoint 跨版本相容。
+
+### 後續 native migration（獨立工作）
 
 目前不改 UX、不破壞分岔契約的路徑是**維持 #4 的 adapter 行為與正式 lock**，
 並使用上節的最小 SDK 相容修改；不能把它描述為 native hosting 已接線。
