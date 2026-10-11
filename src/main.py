@@ -12,7 +12,7 @@
 | 模式      | 包裝方式                                      | 用途                |
 | --------- | --------------------------------------------- | ------------------- |
 | DevUI     | `serve(entities=[agent 實體, workflow 實體])` | 開發時觀察交接      |
-| Responses | `ResponsesHostServer(workflow.as_agent(...))` | 與 Lab 3 部署後相同 |
+| Responses | `HandoffResponsesHost(workflow_factory)` | 與 Lab 3 部署後相同 |
 
 `--responses` 存在的理由：通訊協定的選擇必須在**寫程式碼的階段**就確立，不是部署時才改。
 先在本機用 Responses 跑起來，Lab 3 部署時才不會出現跨協定的意外。
@@ -35,8 +35,8 @@
 > ⚠️ workflow 類別實體的**每一次送出都是新的一輪**，不是交接續接，而且狀態會跨對話殘留。
 > 詳見 `docs/02-lab2-multi-agent.md` 與 `references/known-gaps.md`。
 
-> 本專案不提供 Invocations、WebSocket 或 A2A 端點。`WorkflowAgent` 並非 `Agent` 子類，
-> 但 `ResponsesHostServer` 接受的是 `SupportsAgentRun` protocol，因此可直接包裝（實測）。
+> 本專案不提供 Invocations、WebSocket 或 A2A 端點。Responses 模式使用公開的
+> host handler 接口，將 Playground 文字轉成 Handoff 請求的回應並保存 checkpoint。
 
 ## 兩處必須明確指定、不可依賴預設值的設定
 
@@ -77,7 +77,7 @@ from workflows.handoff import (
     WORKFLOW_ENTITY_NAME,
     WORKFLOW_NAME,
     create_devui_entities,
-    create_workflow,
+    create_workflow_factory,
 )
 
 #: 備援路徑的繫結位址。
@@ -145,26 +145,14 @@ def _resolve_auth(forward: bool) -> tuple[str, bool, str | None]:
     return _FORWARD_HOST, True, token
 
 
-def _serve_responses(workflow, host: str, port: int) -> None:
-    """以 Responses 通訊協定啟動。
+def _serve_responses(workflow_factory, host: str, port: int) -> None:
+    """以 Responses 啟動，保留 Handoff 的等待、續接與使用者隔離。
 
-    `workflow.as_agent()` 回傳的 `WorkflowAgent` **並非** `Agent` 子類（實測
-    `isinstance(...) is False`），但 `ResponsesHostServer` 接受的是 `SupportsAgentRun`
-    protocol，因此可以直接包裝——這就是「整個多代理系統對外看起來就像一個 agent」的落點。
-
-    `ResponsesHostServer` 本身**就是** ASGI 應用（Starlette 子類），並自帶 `run()`。
-    不可去取 `.app` 屬性再交給 uvicorn——那個屬性不存在。
-
-    `run()` 的預設是 `0.0.0.0`，本檔一律**明確傳入** host，不依賴那個預設值：
-    本機開發繫 loopback（避免把一個免驗證的模型端點暴露到區域網路），容器內才繫 `0.0.0.0`。
-
-    來源 M14（Foundry Hosted Agents，Agent Framework 側 hosting 文件）：
-    https://learn.microsoft.com/en-us/agent-framework/hosting/foundry-hosted-agent
-    —— 說明如何以最少程式碼把任何 MAF agent 或 workflow 以 Responses protocol 暴露。
+    明確傳入 host：本機繫 loopback，容器才繫 0.0.0.0。
     """
-    from agent_framework_foundry_hosting import ResponsesHostServer
+    from workflows.responses import HandoffResponsesHost
 
-    server = ResponsesHostServer(workflow.as_agent(name=WORKFLOW_NAME))
+    server = HandoffResponsesHost(workflow_factory)
     server.run(host=host, port=port)
 
 
@@ -174,21 +162,27 @@ def main() -> None:
     devui_host, auth_enabled, auth_token = _resolve_auth(args.forward)
     port = _resolve_port(args.port, settings.devui_port)
 
-    from azure.identity.aio import AzureCliCredential
+    from azure.ai.agentserver.core import AgentConfig
+    from azure.identity.aio import AzureCliCredential, ManagedIdentityCredential
 
     # 伺服器自己管理事件迴圈，因此這裡不可用 `async with` 包 credential
     # ——那樣 credential 會在伺服器開始前就被關閉。交給行程結束時回收即可。
     #
-    # 容器內沒有 `az login`，但 `AzureCliCredential` 這一行不用改：託管環境會以
-    # 受控識別提供權杖，並自動注入 `FOUNDRY_PROJECT_ENDPOINT`。
-    credential = AzureCliCredential()
+    # AzureCliCredential 不會自動切換身分；容器必須明確使用平台提供的受控識別。
+    credential = (
+        ManagedIdentityCredential(
+            client_id=os.environ.get("FOUNDRY_AGENT_INSTANCE_CLIENT_ID")
+        )
+        if AgentConfig.from_env().is_hosted
+        else AzureCliCredential()
+    )
 
     print(f"Foundry 專案：{settings.foundry_project_endpoint}")
     print(f"模型部署　　：{settings.model_deployment_name}")
 
     if args.responses:
         # Responses 模式對外**只暴露一個**實體，與 Lab 3 部署後完全一致。
-        workflow = create_workflow(
+        workflow_factory = create_workflow_factory(
             settings.foundry_project_endpoint,
             settings.model_deployment_name,
             credential,
@@ -197,7 +191,7 @@ def main() -> None:
         print(f"Responses　 ：http://{host}:{port}/responses")
         print("註：此模式沒有 UI，請以 curl 或 SDK 呼叫；協定與 Lab 3 部署後相同。")
         print()
-        _serve_responses(workflow, host, port)
+        _serve_responses(workflow_factory, host, port)
         return
 
     from agent_framework_devui import serve

@@ -25,22 +25,33 @@
 可依前置詞清理）。`HandoffBuilder` 需要的則是**執行期參與者**：它會 clone 參與者、
 注入交接工具、掛上 middleware，因此要求參與者支援本地工具呼叫。
 
-兩者由同一份定義檔（`src/agents/`）產生，內容一致但物件不同。
+兩者由同一份定義檔（`src/agents/`）產生，角色與資料契約一致但物件不同。
+Handoff runtime 另附內部控制規則與 specialists-only 回交政策；Lab 1 的角色文字不變。
 `.env` 換一個專案端點，這裡就會連到另一個專案，不需要改任何程式碼。
 """
 
 import asyncio
+import json
 import logging
-from collections.abc import AsyncIterable
+import uuid
+from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from agents import build_agent_roles
 from models.agent_role import AgentRole
 
 if TYPE_CHECKING:  # 只為型別標註；執行期不匯入，維持本模組「用到才 import」的一致風格
-    from agent_framework import CheckpointStorage
+    from agent_framework import (
+        Agent, AgentResponse, AgentResponseUpdate, ChatResponse, CheckpointStorage, ResponseStream,
+    )
 
 logger = logging.getLogger(__name__)
+
+_DEGRADED_RESULT = "handoff_degraded"
+
+
+class HandoffRoutingError(RuntimeError):
+    """專家回合沒有完成合法回交；不能當成正常審查或使用者等待。"""
 
 #: 專家角色的 key（Primary 以外的三個）。順序即 `add_handoff` 的建邊順序。
 SPECIALIST_KEYS: tuple[str, ...] = ("coding", "architect", "spec")
@@ -168,7 +179,8 @@ def _degraded_response(agent_name: str, error: BaseException):
 
     reason, remediation = _classify(error)
     return AgentResponse(
-        messages=[Message("assistant", [_degraded_text(agent_name, reason, remediation)])]
+        messages=[Message("assistant", [_degraded_text(agent_name, reason, remediation)])],
+        additional_properties={_DEGRADED_RESULT: True},
     )
 
 
@@ -178,32 +190,47 @@ def _degraded_update(agent_name: str, error: BaseException):
 
     reason, remediation = _classify(error)
     message = Message("assistant", [_degraded_text(agent_name, reason, remediation)])
-    return AgentResponseUpdate(contents=message.contents, role="assistant")
+    return AgentResponseUpdate(
+        contents=message.contents, role="assistant",
+        additional_properties={_DEGRADED_RESULT: True},
+    )
 
 
 def build_degraded_reply_middleware(agent_name: str):
     """建立單一 agent 的降級 middleware。
 
-    掛上之後，`handed_off(X)` 遇到 X 不可用時會走 `degraded_reply → idle`：
-    工作流照常收束、發出 `request_info` 等使用者，而不是整條 workflow 拋例外中斷。
+    沒有回交 guard 時，不可用的 agent 會產生降級回覆並等待使用者。
+    Handoff specialists 的外層 guard 則將此 metadata 標記視為明確失敗，
+    不冒充正常審查或 completed 的專家等待；Primary 的既有降級行為保留。
 
     **為什麼串流與非串流要分開處理**：`await call_next()` 在串流模式下**很快就返回**，
     此時 `context.result` 只是一個尚未消費的 `ResponseStream`，真正的錯誤要等到疊代時才發生
     ——那已經在 middleware 之外了。因此串流路徑必須另外包一層，在疊代時攬截。
     """
-    from agent_framework import AgentResponse, ResponseStream, agent_middleware
+    from agent_framework import AgentResponse, AgentResponseUpdate, ResponseStream, agent_middleware
 
-    def _guard(inner: AsyncIterable[object]) -> AsyncIterable[object]:
-        async def generate():
+    def _guard(
+        inner: "ResponseStream[AgentResponseUpdate, AgentResponse]",
+    ) -> "ResponseStream[AgentResponseUpdate, AgentResponse]":
+        failed = False
+
+        async def generate() -> AsyncIterator[AgentResponseUpdate]:
+            nonlocal failed
             try:
                 async with asyncio.timeout(AGENT_TIMEOUT_SECONDS):
                     async for update in inner:
                         yield update
             except Exception as error:  # noqa: BLE001 — 降級的目的就是攔下所有失敗
+                failed = True
                 logger.warning("%s 不可用，改以降級回覆：%r", agent_name, error)
                 yield _degraded_update(agent_name, error)
 
-        return generate()
+        async def finalize(updates: Sequence[AgentResponseUpdate]) -> AgentResponse:
+            if failed:
+                return AgentResponse.from_updates(updates)
+            return await inner.get_final_response()
+
+        return ResponseStream(generate(), finalizer=finalize)
 
     @agent_middleware
     async def degraded_reply(context, call_next) -> None:
@@ -218,15 +245,223 @@ def build_degraded_reply_middleware(agent_name: str):
         if context.stream and isinstance(context.result, ResponseStream):
             # `ResponseStream` 本身就是 AsyncIterable，直接迭代即可。
             # 不可用 `.updates`——那是「已收集的更新」串列，不是可疊代來源。
-            inner = context.result
-            context.result = ResponseStream(
-                _guard(inner), finalizer=AgentResponse.from_updates
-            )
+            context.result = _guard(context.result)
 
     return degraded_reply
 
 
-def build_participants(client, roles: dict[str, AgentRole]) -> dict[str, object]:
+def build_checkpoint_safe_middleware():
+    """在寫進 checkpoint 前，清掉 SDK 附帶的 `raw_representation` 除錯物件。
+
+    `raw_representation` 是模型供應商的原始回應物件，不一定能序列化，留著可能讓 checkpoint
+    寫入失敗。這裡只清掉它，文字、工具呼叫與結構化結果都保留。
+    只用在 Responses 主機（`create_workflow_factory()`）；DevUI 的行為不變。
+    """
+    from agent_framework import AgentResponse, AgentResponseUpdate, ResponseStream, agent_middleware
+
+    def clear_raw(response: AgentResponse | AgentResponseUpdate) -> None:
+        response.raw_representation = None
+        messages = response.messages if isinstance(response, AgentResponse) else [response]
+        for message in messages:
+            message.raw_representation = None
+            for content in message.contents:
+                content.raw_representation = None
+
+    @agent_middleware
+    async def checkpoint_safe(context, call_next):
+        await call_next()
+        if context.stream and isinstance(context.result, ResponseStream):
+            context.result.with_transform_hook(clear_raw)
+            context.result.with_result_hook(clear_raw)
+        elif isinstance(context.result, AgentResponse):
+            clear_raw(context.result)
+
+    return checkpoint_safe
+
+
+def _return_description(primary_name: str) -> str:
+    return (
+        f"將本回合控制權交回協調者 {primary_name}，由協調者彙整或釐清。"
+        "這是框架內部交接，不查詢或執行外部系統；不重複已輸出的專家文字。"
+    )
+
+
+def _runtime_instructions(primary_name: str) -> str:
+    return (
+        "\n\n## Handoff 執行期控制規則\n"
+        "角色定義中的「沒有任何工具」指沒有外部查詢或執行工具；"
+        "本工作流另有框架提供的內部交接控制工具。\n"
+        f"本回合控制權必須交回 {primary_name}，由協調者彙整或向使用者釐清。"
+        "程式會補上必要的回交控制 call，不是只靠 prompt 保證。\n"
+        "原審查結果只輸出一次；需要補充材料的說明不代表審查完成，"
+        "不得捏造審查結果。業務與 schema 的原有限制不變。"
+    )
+
+
+def _empty_arguments(arguments: object) -> bool:
+    if arguments is None or arguments == "":
+        return True
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            return False
+    return isinstance(arguments, Mapping) and not arguments
+
+
+def _check_response_actions(response: "ChatResponse | AgentResponse | AgentResponseUpdate") -> None:
+    from agent_framework import AgentResponseUpdate
+
+    if response.finish_reason == "cancelled":
+        raise asyncio.CancelledError()
+    if (response.additional_properties or {}).get(_DEGRADED_RESULT):
+        raise HandoffRoutingError("專家已降級，不能當成正常回交。")
+    if response.finish_reason in (
+        "length", "content_filter", "error", "incomplete", "failed",
+    ):
+        raise HandoffRoutingError("專家回合未正常完成，不能補上回交。")
+    messages = [response] if isinstance(response, AgentResponseUpdate) else response.messages
+    for message in messages:
+        for content in message.contents:
+            if (
+                content.user_input_request or content.type == "error"
+                or content.exception or content.error_code or content.status in ("failed", "incomplete")
+            ):
+                raise HandoffRoutingError("專家有錯誤或未完成的使用者動作。")
+
+
+def _check_response_complete(response: "ChatResponse | AgentResponse") -> None:
+    _check_response_actions(response)
+    if response.continuation_token is not None:
+        raise HandoffRoutingError("專家回合尚未完成，不能補上回交。")
+    if response.finish_reason not in ("stop", "tool_calls"):
+        raise HandoffRoutingError("專家回合未正常完成，不能補上回交。")
+
+
+def build_completion_return_middleware(primary_name: str):
+    """在原 chat stream 的 result hook 補控制 call，保留原 finalizer 與 hooks。"""
+    from agent_framework import (
+        ChatResponse, Content, FunctionTool, ResponseStream, chat_middleware,
+    )
+
+    expected_name = f"handoff_to_{primary_name}"
+    expected_description = _return_description(primary_name)
+
+    @chat_middleware
+    async def completion_return(context, call_next):
+        if (context.options or {}).get("store") is not False:
+            raise HandoffRoutingError("專家回交需要本機模型 history，store 必須為 False。")
+        if context.session is not None and context.session.service_session_id:
+            raise HandoffRoutingError(
+                "既有服務端 conversation 無法安全轉成本機 history，請建立新的 session／conversation。"
+            )
+        if any((context.options or {}).get(key) for key in ("previous_response_id", "conversation")):
+            raise HandoffRoutingError("專家回交不能引用既有服務端 response 或 conversation。")
+        candidates = [
+            tool for tool in (context.options or {}).get("tools", []) or []
+            if isinstance(tool, FunctionTool) and tool.name == expected_name
+        ]
+        if len(candidates) != 1:
+            raise HandoffRoutingError("無法唯一辨識框架的 Primary 回交工具。")
+        tool = candidates[0]
+        parameters = tool.parameters()
+        if (
+            tool.description != expected_description
+            or tool.approval_mode != "never_require"
+            or parameters.get("type") != "object"
+            or parameters.get("properties") != {}
+            or parameters.get("required", []) != []
+        ):
+            raise HandoffRoutingError("Primary 回交工具的目標或參數契約不符。")
+
+        def return_control(response: ChatResponse) -> ChatResponse:
+            _check_response_complete(response)
+            calls = [
+                content for message in response.messages for content in message.contents
+                if content.type == "function_call"
+            ]
+            if calls:
+                if (
+                    len(calls) != 1 or calls[0].name != tool.name
+                    or not calls[0].call_id or calls[0].informational_only
+                    or not _empty_arguments(calls[0].arguments)
+                ):
+                    raise HandoffRoutingError("專家要求的工具或參數不是合法回交。")
+                return response
+            if not response.text.strip():
+                raise HandoffRoutingError("專家沒有正常文字或合法回交。")
+            assistants = [message for message in response.messages if message.role == "assistant"]
+            if not assistants:
+                raise HandoffRoutingError("專家正常回覆缺少 assistant 訊息。")
+            assistants[-1].contents.append(Content.from_function_call(
+                call_id=f"handoff_{uuid.uuid4().hex}", name=tool.name, arguments={},
+            ))
+            return response
+
+        await call_next()
+        if context.stream and isinstance(context.result, ResponseStream):
+            # 沿用原 stream 的 hooks；控制 call 留在同一份訊息中供本機 history 配對。
+            context.stream_result_hooks.insert(0, return_control)
+        elif isinstance(context.result, ChatResponse):
+            context.result = return_control(context.result)
+        else:
+            raise HandoffRoutingError("專家 chat 結果型別不符合回交契約。")
+
+    return completion_return
+
+
+def build_return_guard_middleware(primary_name: str):
+    """位於降級處理外層，消費完 stream 後仍核對 SDK 產生的回交結果。"""
+    from agent_framework import AgentResponse, AgentResponseUpdate, ResponseStream, agent_middleware
+
+    def verify(response: AgentResponse) -> None:
+        _check_response_complete(response)
+        if not response.messages:
+            raise HandoffRoutingError("專家沒有 SDK 回交結果。")
+        results = [
+            content for content in response.messages[-1].contents
+            if content.type == "function_result"
+        ]
+        if len(results) != 1 or not results[0].call_id:
+            raise HandoffRoutingError("專家沒有唯一的 SDK 回交結果。")
+        payload = results[0].result
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                raise HandoffRoutingError("SDK 回交結果格式不符。") from None
+        if not isinstance(payload, Mapping) or dict(payload) != {"handoff_to": primary_name}:
+            raise HandoffRoutingError("SDK 回交結果未指向 Primary。")
+
+    @agent_middleware
+    async def return_guard(context, call_next):
+        await call_next()
+        if context.stream and isinstance(context.result, ResponseStream):
+            inner = context.result
+
+            async def checked_updates() -> AsyncIterator[AgentResponseUpdate]:
+                async for update in inner:
+                    if not isinstance(update, AgentResponseUpdate):
+                        raise HandoffRoutingError("專家 stream 更新型別不符。")
+                    _check_response_actions(update)
+                    yield update
+                verify(await inner.get_final_response())
+
+            async def original_finalizer(_updates: Sequence[AgentResponseUpdate]) -> AgentResponse:
+                return await inner.get_final_response()
+
+            context.result = ResponseStream(checked_updates(), finalizer=original_finalizer)
+        elif isinstance(context.result, AgentResponse):
+            verify(context.result)
+        else:
+            raise HandoffRoutingError("專家 agent 結果型別不符合回交契約。")
+
+    return return_guard
+
+
+def build_participants(
+    client, roles: dict[str, AgentRole], *, checkpoint_safe: bool = False
+) -> "dict[str, Agent]":
     """依定義檔建構四個 Handoff 執行期參與者。
 
     `require_per_service_call_history_persistence=True` 是**必要**的：漏掉任何一個，
@@ -235,29 +470,42 @@ def build_participants(client, roles: dict[str, AgentRole]) -> dict[str, object]
 
     `response_format` 一律取自定義檔（Primary 為 `None`，三位專家為 `SpecialistReview`）。
     這裡不可另外指定，否則就多出一份會與定義檔分歧的設定。
+    只有 specialists 新建的 options 加上 `store=False`，由 SDK 本機 history 保存
+    程式補的控制 call；不修改共用 client、角色定義或 Primary 的 storage 選擇。
 
     來源 M04（microsoft/agent-framework 官方 handoff sample 與原始碼）：
     https://github.com/microsoft/agent-framework
     —— 本旗標的強制性與失敗訊息的內容以該 repository 的實際實作為準。
     """
-    participants: dict[str, object] = {}
+    participants: dict[str, Agent] = {}
+    primary_name = roles["primary"].agent_name
     for key, role in roles.items():
         default_options: dict[str, object] = {}
         if role.response_format is not None:
             default_options["response_format"] = role.response_format
+        if key in SPECIALIST_KEYS:
+            default_options["store"] = False
         participants[key] = client.as_agent(
             name=role.agent_name,
             description=role.description,
-            instructions=role.instructions,
+            instructions=(
+                role.instructions + _runtime_instructions(primary_name)
+                if key in SPECIALIST_KEYS else role.instructions
+            ),
             default_options=default_options or None,
             require_per_service_call_history_persistence=True,
-            middleware=[build_degraded_reply_middleware(role.agent_name)],
+            middleware=[
+                *([build_return_guard_middleware(primary_name)] if key in SPECIALIST_KEYS else []),
+                *([build_checkpoint_safe_middleware()] if checkpoint_safe else []),
+                build_degraded_reply_middleware(role.agent_name),
+                *([build_completion_return_middleware(primary_name)] if key in SPECIALIST_KEYS else []),
+            ],
         )
     return participants
 
 
 def build_workflow(
-    participants: dict[str, object],
+    participants: "dict[str, Agent]",
     *,
     name: str = WORKFLOW_NAME,
     checkpoint_storage: "CheckpointStorage | None" = None,
@@ -308,7 +556,9 @@ def build_workflow(
     # 每位專家只有一條出邊：交回 Primary。
     # 專家之間不建邊，「同時分派給多位專家」因此在圖上不可能發生。
     for specialist in specialists:
-        builder = builder.add_handoff(specialist, [primary])
+        builder = builder.add_handoff(
+            specialist, [primary], description=_return_description(primary.name or primary.id)
+        )
     if checkpoint_storage is not None:
         builder = builder.with_checkpointing(checkpoint_storage)
     return builder.build()
@@ -335,6 +585,23 @@ def create_workflow(endpoint: str, model_deployment_name: str, credential):
     """
     client = _create_client(endpoint, model_deployment_name, credential)
     return build_workflow(build_participants(client, build_agent_roles()))
+
+
+def create_workflow_factory(endpoint: str, model_deployment_name: str, credential):
+    """建立工作流工廠，給 `src/main.py` 的 Responses 模式使用。
+
+    聊天用戶端只建一次、共用；工作流則**每一輪重新建立**，讓不同使用者與不同對話的
+    executor 狀態互不干擾，也避免共用實例時撞上「Workflow is already running」。
+    建構工作流不發任何網路請求，所以每輪重建的成本很低。
+    """
+    client = _create_client(endpoint, model_deployment_name, credential)
+
+    def factory():
+        return build_workflow(
+            build_participants(client, build_agent_roles(), checkpoint_safe=True)
+        )
+
+    return factory
 
 
 def _build_workflow_entity(

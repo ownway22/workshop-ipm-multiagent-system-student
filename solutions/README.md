@@ -32,7 +32,7 @@ cp -r solutions/lab2/* src/
 ```text
 src/agents/      四個 agent 的定義檔
 src/models/      資料模型
-src/workflows/   Handoff 拓撲
+src/workflows/   Handoff 拓撲與 Responses 主機（續接用 checkpoint）
 src/registry/    agent 建立腳本
 src/main.py      DevUI 與 Responses 進入點
 ```

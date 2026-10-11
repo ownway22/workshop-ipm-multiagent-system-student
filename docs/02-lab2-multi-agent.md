@@ -132,7 +132,7 @@ uv run python -c "from fixtures.test_items import TEST_ITEMS, render_prompt; pri
 
 ## 事件流中的工具呼叫
 
-DevUI 的事件流中會出現類似 `transfer_to_qvn-coding-agent` 的工具呼叫。課程一開始說過「所有 agent 都不掛任何工具」，這裡**並不矛盾**。
+DevUI 的事件流中會出現類似 `handoff_to_qvn-coding-agent` 的工具呼叫。課程一開始說過「所有 agent 都不掛任何工具」，指的是外部業務工具，不包含框架內部交接控制工具。
 
 Handoff 的實作機制**就是**注入交接工具——框架以「呼叫一個工具」表達「把控制權交給誰」。`HandoffBuilder` 的官方說明明確寫出它依賴 cloning、**tool injection** 與 middleware，且參與者必須支援本地工具呼叫。
 
@@ -143,6 +143,48 @@ Handoff 的實作機制**就是**注入交接工具——框架以「呼叫一�
 | 有外部副作用嗎 | 有                           | **沒有**             |
 
 我們禁止的是「讓 agent 能對外部系統做事」——如此它才不會宣稱「我掃描了你的 repository」；禁止的並非「框架以工具機制實作交接」。
+
+### 專家正常回合由程式控制回交
+
+`add_handoff` 只設定允許的路由，不保證模型完成審查後自行交回。Handoff runtime
+因此只對三位專家加入 completion-return middleware：模型已有合法回交 call 時不再補；
+正常回覆但沒有 call 時，程式補一個非文字的 Primary 回交控制 call，交由 SDK 真正處理。
+原串流文字不重播，Primary 仍負責彙整或釐清並等待使用者。這不是模型自發選工具的保證。
+
+空結果、未知工具、未完成的特殊使用者動作或技術降級不能冒充正常審查；
+外層 guard 會明確失敗，不默默停在專家等待。取消仍是取消，不注入回交。
+缺材料先由 Primary 釐清；專家的補充材料說明不代表業務審查完成。
+`SpecialistReview` 原 schema 的限制仍保留，不為了回交捏造結果。
+
+此政策不啟用 autonomous mode，不增加專家用來「決定是否回交」的模型呼叫。
+相較於提前停在專家的失敗路徑，會多出原本就應有的 Primary 彙整呼叫與 Token 成本。
+Lab 1 單獨 Coding 的共用 instructions、schema 與行為不變，只有 Handoff runtime 有此補強。
+
+程式補的控制 call 不存在於模型服務端的原始 response，因此只有 runtime specialists
+設定 `store=False`：模型 history 由 SDK 本機 provider 保存、載入，並隨既有 checkpoint
+持久化，包含配對的工具 call/result。Primary 保留原有服務端 history 行為。
+這不表示 Hosted session 或 checkpoint 不再持久化；後續專家回合會傳送完整本機上下文，
+輸入 Token 成本／快取效果可能不同。已有 service-managed conversation ID 不能安全自動
+遷移，程式會明確失敗，不清除 ID 或丟棄 history；新版驗證應建立新 session/conversation。
+
+### 本 hotfix 的驗證邊界與已知限制
+
+本次短期 hotfix 的程式與測試收斂至歷史遠端驗證的 version 11／commit `6dea353`：
+保留 credential、Responses 純文字續接、checkpoint／隔離及專家回交、stream finalization 修正。
+後續 outcome／需求 ledger、Primary planning／storage 改變、ledger restore validator 與大型
+診斷以新的 forward revert 撤回，不改寫原作者或實驗 commit 歷史。
+Primary 仍負責彙整與下一段路由；本 hotfix 不保證所有跨領域子需求完成。
+
+已保存的 SDK runtime regression 中，T01、同題續接與 T11 為 PASS，最後 waiting source
+都是 Primary。T12 僅有 `primary → spec → primary`，未執行 Architect、缺實質彙整，
+仍為 **FAIL／已知限制**。Responses 的 `completed` 不等於全部業務需求完成；
+完整結果與部署狀態見 [Lab 3 的 hotfix 驗證紀錄](03-lab3-deploy.md#短期-hotfix-的歷史驗證與範圍)。
+
+原 12 題與完整 workshop 驗收標準不變，這不是全部 Playground 驗收通過。
+A365 ImportError／exporter Bad Request 尚未解決，Tracing 不宣稱通過；
+沒有直接因果證據，不拿 telemetry 錯誤解釋 T12。
+後續另開 SDK／hosting 升級工作並保留 T12 regression；
+目前沒有證據證明舊 SDK 無法克服此限制，也不承諾升級必然修好。
 
 ---
 

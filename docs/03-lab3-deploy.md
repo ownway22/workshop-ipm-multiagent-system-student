@@ -76,7 +76,7 @@ azd provision
 
 ### 身分從「你」變成「容器」
 
-本機執行時，`AzureCliCredential` 用的是你 `az login` 的身分；容器內沒有 `az login`，託管後改以**受控識別**（managed identity）向 Foundry 取權杖。此事平台會處理，你只需確認權限給對。
+本機執行時，`AzureCliCredential` 用的是你 `az login` 的身分；容器內沒有 Azure CLI，不能沿用這個 credential。`main.py` 透過 `AgentConfig.from_env().is_hosted` 判斷託管環境，改用 `ManagedIdentityCredential` 與平台注入的 `FOUNDRY_AGENT_INSTANCE_CLIENT_ID` 向 Foundry 取權杖。平台提供身分與端點，但**不會自動替換程式建立的 `AzureCliCredential`**；仍需確認身分具備所需權限。
 
 | 角色                               | 範圍     | 用途               |
 | ---------------------------------- | -------- | ------------------ |
@@ -164,19 +164,102 @@ uv run python -c "from fixtures.test_items import TEST_ITEMS, render_prompt; pri
 | T09–T10 | （無交接）說明能力邊界                          |
 | T11–T12 | `primary → 專家 A → primary → 專家 B → primary` |
 
-如果結果不一致，**通常是環境變數沒帶上去**（例如 `MODEL_DEPLOYMENT_NAME` 在 azd 環境的值與 `src/.env` 不同）。
+### 短期 hotfix 的歷史驗證與範圍
 
-Playground 對話的對象是整個多代理系統；`workflow.as_agent()` 讓四個 agent 對外呈現為一個。
+PR #4 以新的 forward revert 撤回後續 outcome／需求 ledger、Primary planning／storage、
+ledger restore validator 與大型診斷，保留原作者和實驗 commit 歷史。
+程式與測試回到 version 11／commit `6dea353` 的已驗證內容；
+本 hotfix 修正續接與專家回交，不保證所有跨領域子需求完成。
+上方 12 題預期及下方完整 workshop 驗收標準仍保留，不因縮小 hotfix 範圍而降低。
+
+以下是 **2026-10-10 保存的 version 11 SDK runtime regression**，不是本次重新執行：
+
+| 案例 | 實際路由／內容核對 | 耗時 | 結論 |
+| ---- | ------------------ | ---- | ---- |
+| T01 | `primary → coding → primary` | 13.379 秒 | PASS |
+| 同題續接 | 同路由；checkpoint restore 成功、引用原材料正確 | 11.357 秒 | PASS |
+| T11 | `primary → coding → primary → architect → primary`；兩類實質發現分開並標示來源 | 12.546 秒 | PASS |
+| T12 | 僅 `primary → spec → primary`；未執行 Architect、缺實質彙整 | 8.952 秒 | **FAIL／已知限制** |
+
+四次回應都是 `status=completed`、`error=null`，最後 waiting source 都是 Primary；
+但 protocol completed **不等於全部業務需求完成**，不能將 T12 改判 PASS。
+這些 SDK 結果也不代表全部 Playground 驗收完成。
+本次範圍收斂沒有重新部署；截至 2026-10-11，Azure 最後已知仍為 **version 13**，
+不能把歷史 version 11 結果描述成雲端已切回 hotfix。
+後續若部署收斂版，應使用新 session/conversation，不遷移實驗版 state。
+
+A365 ImportError／exporter Bad Request 是未解的 telemetry 問題，Tracing 不宣稱通過；
+沒有直接因果證據，不用它們解釋 T12 路由或工具失敗。
+後續另開 SDK／hosting 升級工作，保留 T12 作為跨領域 regression，
+並另行驗證相容性、續接與完整 workshop 鏈路。
+目前沒有證據證明 T12 是舊 SDK 的不可克服限制，也不承諾升級必然修好。
+
+結果不一致時，應以本次 session 的 framework transition、waiting source 與錯誤記錄判讀，
+不要只用回覆中的「來源：專家」或假定是環境變數問題。環境值不一致仍是可能原因，
+但 `add_handoff` 本身只允許路由，不會強制正常完成後回交。
+
+Playground 對話的對象是整個多代理系統。`HandoffResponsesHost` 將四代理工作流包成單一
+Responses 端點，使用公開的 `response_handler` 與 `Workflow.run(responses=...)` 接口，
+把「繼續」等文字交回正在等待的 Handoff 請求，而不是要求 Playground 傳送工具回傳值。
+
+Handoff runtime 的三位專家有程式控制的 completion-return policy：
+正常回合沒有合法回交 call 時，middleware 補一個非文字控制 call，由 SDK 真正交回 Primary；
+已有 call 就不重複補，原審查文字只傳遞一次。Primary 不被強制交接，仍負責彙整與釐清。
+這與「業務審查完成」是不同的判定；需要補充材料不能被當成成功審查。
+
+外層 guard 在 stream 真正消費後仍核對回交結果。空結果、工具錯誤、特殊未完成動作、
+降級或技術失敗不會冒充 completed 的專家等待，而是走既有 host 的明確失敗路徑；
+取消不被吞掉。原 schema 不擴充，也不靠 autonomous mode 或模型重試完成回交。
+此補強不增加專家的回交決策 model call；相較於提前停在專家的失敗路徑，
+會增加應有的 Primary 彙整呼叫與 Token 成本。Lab 1 的單獨 Coding 不受影響。
+
+僅 runtime specialists 的模型請求使用 `store=False`，避免程式補的控制 call
+與服務端原始 response 的工具 history 不一致。SDK 會將本機 call/result history
+保存到既有 checkpoint，下一輪還原後傳送完整上下文；Primary 的 storage 行為不變。
+Hosted session 與 `$HOME` checkpoint 的持久化仍保留，輸入 Token 成本／快取效果可能不同。
+舊 service-managed conversation ID 不會被清除或假裝成功遷移；如不相容會明確失敗。
+部署這項政策後，請用新 session/conversation 驗證，不沿用 version 9 的既有對話。
+
+每輪重新建立工作流，並依使用者與 conversation 還原 checkpoint；不共用上一輪的 executor
+記憶體狀態，不同對話也不必互相排隊（同一個 conversation 的追問才會依序處理）。
+checkpoint 僅額外允許 Handoff 請求、`list[Message]` 型別描述與 Azure role enum，
+不關閉反序列化限制。保存前移除 SDK 的 `raw_representation` 除錯物件，保留文字、
+工具資料與結構化結果；若最後一輪 checkpoint 無法保存，回傳失敗而非假裝可以繼續對話。
+
+checkpoint 存在哪裡、留多久：
+
+| 環境 | 位置                             | 保留期限                                            |
+| ---- | -------------------------------- | --------------------------------------------------- |
+| 本機 | `src/.handoff-checkpoints/`      | 直到你手動刪除（已排除於版控與容器映像）            |
+| 託管 | `$HOME/.handoff-checkpoints/`    | 跟著 session，最長 30 天；容器根目錄不是持久儲存    |
+
+每一輪只保留最後一份 checkpoint，續接時只讀這一份，不會隨對話變長而變慢。
+檔案內含完整對話內容，請當成機密資料看待。
+
+> ⚠️ **用 `previous_response_id` 續接時，託管環境必須一併帶上同一個 `agent_session_id`。**
+> 沒帶的話，平台會把請求分到新的 sandbox，看不到上一輪的 checkpoint，回應會以
+> `invalid_prompt` 失敗。改用 `conversation` 則會自動綁定同一個 session，不必另外處理。
+> 來源：[Manage hosted agent sessions](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/manage-hosted-sessions)
+
+這個端點只接受文字訊息；程式碼與架構材料請直接貼成文字，不使用附件或外部工具回傳值。
+輸入有問題（空白訊息、附件、找不到可續接的 checkpoint）時，回應狀態為 `failed`、
+error code 為 `invalid_prompt`，訊息會說明原因；其他錯誤一律是 `server_error`，細節只寫在 log。
 
 ---
 
 ## 步驟七：用 CLI 呼叫
 
 ```bash
-azd ai agent invoke --message "請幫我看這段程式碼有沒有問題：result = eval(user_input)"
+azd ai agent invoke "請幫我看這段程式碼有沒有問題：result = eval(user_input)"
 ```
 
 確認端點可由程式呼叫。
+
+多行材料建議寫成 UTF-8 JSON 檔（`{"input":"完整提示與材料","stream":true}`），
+再用 `azd ai agent invoke --input-file request.json`，避免 Windows 命令列只送出第一行。
+同一題的追問保留原 session 與 conversation；獨立題目可加上 `--new-conversation`。
+如果從舊版 generic WorkflowAgent host 升級，第一次須加上 `--new-session --new-conversation`，
+因為舊 session 綁定舊版本，且舊 checkpoint 不會自動遷移。
 
 ---
 
