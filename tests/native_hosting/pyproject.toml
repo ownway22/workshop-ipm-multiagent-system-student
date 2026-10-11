@@ -1,0 +1,33 @@
+# 可行性驗證專用；不改動 src/ 的正式環境與 uv.lock。
+[project]
+name = "ipm-native-hosting-feasibility"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "agent-framework-core==1.21.0",
+    "agent-framework-foundry==1.14.1",
+    "agent-framework-orchestrations==1.3.1",
+    "agent-framework-devui==1.0.0b261008",
+    "agent-framework-foundry-hosting==1.0.0b261008",
+    "azure-ai-agentserver-core==2.1.0",
+    "azure-ai-agentserver-responses==2.2.0b1",
+    "azure-ai-projects==2.3.0",
+    "azure-identity==1.25.3",
+    "pydantic==2.13.4",
+    "python-dotenv==1.2.2",
+]
+
+[tool.uv]
+package = false
+exclude-newer = "2026-10-11T23:59:59Z"
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "httpx==0.28.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+pythonpath = ["../../src"]
+markers = ["gate: 必須通過才能切換正式入口的純文字 Handoff 續接門檻"]
