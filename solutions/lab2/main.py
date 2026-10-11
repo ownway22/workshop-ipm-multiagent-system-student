@@ -76,7 +76,6 @@ from config import DEFAULT_DEVUI_HOST, load_settings_or_exit
 from workflows.handoff import (
     WORKFLOW_ENTITY_NAME,
     WORKFLOW_NAME,
-    build_review_checkpoint_validator,
     create_devui_entities,
     create_workflow_factory,
 )
@@ -153,9 +152,7 @@ def _serve_responses(workflow_factory, host: str, port: int) -> None:
     """
     from workflows.responses import HandoffResponsesHost
 
-    server = HandoffResponsesHost(
-        workflow_factory, checkpoint_validator=build_review_checkpoint_validator(),
-    )
+    server = HandoffResponsesHost(workflow_factory)
     server.run(host=host, port=port)
 
 

@@ -100,12 +100,10 @@ class HandoffResponsesHost(ResponsesAgentServerHost):
         workflow_factory: Callable[[], Workflow],
         *,
         checkpoint_root: Path | None = None,
-        checkpoint_validator: Callable[[WorkflowCheckpoint], None] | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self._workflow_factory = workflow_factory
-        self._checkpoint_validator = checkpoint_validator
         # 託管時容器根目錄不是持久儲存，只有 $HOME 會在 session 停止後保留。
         self._checkpoint_root = checkpoint_root or (
             (Path.home() if self.config.is_hosted else Path.cwd()) / ".handoff-checkpoints"
@@ -230,10 +228,7 @@ class HandoffResponsesHost(ResponsesAgentServerHost):
                     for part in item.content
                 ):
                     raise HandoffRequestError("不支援附件，請把程式碼或文件內容直接貼成文字。")
-                text = "\n".join(
-                    part.text for part in item.content
-                    if isinstance(part, MessageContentInputTextContent)
-                )
+                text = "\n".join(part.text for part in item.content)
             if text.strip():
                 messages.append(Message("user", [text]))
         if not messages:
@@ -268,8 +263,6 @@ class HandoffResponsesHost(ResponsesAgentServerHost):
                     raise HandoffRequestError(
                         "這段對話的 checkpoint 屬於其他工作流，無法續接。請開新的 conversation。"
                     )
-                if self._checkpoint_validator is not None:
-                    self._checkpoint_validator(checkpoint)
                 # 還原本身也會寫出一份 checkpoint。先把前一輪的 checkpoint 複製到這一輪的目錄
                 # 再從這裡還原，前一輪的目錄因此維持唯讀：從同一個 response 分岔的請求
                 # 互不干擾，也不會改寫歷史。
