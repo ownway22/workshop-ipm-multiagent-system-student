@@ -202,6 +202,11 @@ Playground 對話的對象是整個多代理系統。`HandoffResponsesHost` 將�
 Responses 端點，使用公開的 `response_handler` 與 `Workflow.run(responses=...)` 接口，
 把「繼續」等文字交回正在等待的 Handoff 請求，而不是要求 Playground 傳送工具回傳值。
 
+2026-10-11 查證的 native `ResponsesHostServer(workflow=..., parse_response=...)`
+仍無法保留這項純文字續接，也改為不允許分岔的線性 lineage。
+[遷移門檻未通過](native-hosting-migration.md)，因此本 Lab 的正式 host、lock、protocol、
+credential 選擇與部署配置均未改變；沒有執行新的 Azure 部署／驗收。
+
 Handoff runtime 的三位專家有程式控制的 completion-return policy：
 正常回合沒有合法回交 call 時，middleware 補一個非文字控制 call，由 SDK 真正交回 Primary；
 已有 call 就不重複補，原審查文字只傳遞一次。Primary 不被強制交接，仍負責彙整與釐清。
