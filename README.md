@@ -225,7 +225,9 @@ Container Registry 與 Bot Service 要另外處理，見 [收尾與清理](docs/
 
 2026-10-11 的 native workflow hosting 可行性驗證**未通過**：真正 Handoff 等待後的純文字
 追問在 stream／nonstream 均失敗，官方線性 lineage 也不保留 #4 既有分岔契約。
-正式入口、host、相依與救援程式不變，候選套件只在隔離測試環境。
+正式 pins、lock 與預設 host 不變；現有 adapter 已做最小 public API 相容修正並同步救援程式。
+Baseline 與隔離候選皆通過 **43 tests、103 subtests**，但這**不是 native migration 完成**。
+候選套件仍只在隔離測試環境。
 詳見 [重現、官方來源與後續門檻](docs/native-hosting-migration.md)、
 [known gaps](references/known-gaps.md)。本次沒有 Azure 部署或 end-to-end 驗收。
 

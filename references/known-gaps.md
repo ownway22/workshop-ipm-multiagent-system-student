@@ -17,6 +17,18 @@
 正式 [進入點](../src/main.py)、[host](../src/workflows/responses.py)、
 [相依與 lock](../src/pyproject.toml)、[完成版](../solutions/lab2/) 均未遷移。
 
+## 現有 adapter 的 SDK 相容性與隔離邊界
+
+CreateResponse／input items／event 的 model → dict，以及候選移除 `atext_content()` 的
+相容性已修復；baseline 與隔離候選皆 **43 tests、103 subtests 通過**，
+包含真正 Handoff 三輪純文字、完整輸出、host 重建、分岔、原完整 regression 與 strict restore。
+正式 pins／lock／預設 host 不變，救援程式同步；**不是 native hosting 已完成**。
+
+不同使用者重用既有 conversation ID，但沒有自己的 checkpoint 時，
+兩環境均明確拒絕：不回傳前位內容、不呼叫模型、不消耗 pending request、不改寫 checkpoint。
+各自合法 conversation 的多輪續接已測試。Maintainer 同意保留此既有邊界，
+不要求跨使用者共用 ID；這不是 SDK upgrade regression，也不是 Foundry 平台授權隔離驗收。
+
 ## 沿用的 workshop 限制
 
 - 舊 DevUI 的 Handoff 多輪／新對話狀態問題仍以 [Lab 2 已知限制](../docs/02-lab2-multi-agent.md#devui-已知限制)

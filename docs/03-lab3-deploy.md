@@ -204,8 +204,10 @@ Responses 端點，使用公開的 `response_handler` 與 `Workflow.run(response
 
 2026-10-11 查證的 native `ResponsesHostServer(workflow=..., parse_response=...)`
 仍無法保留這項純文字續接，也改為不允許分岔的線性 lineage。
-[遷移門檻未通過](native-hosting-migration.md)，因此本 Lab 的正式 host、lock、protocol、
-credential 選擇與部署配置均未改變；沒有執行新的 Azure 部署／驗收。
+[遷移門檻未通過](native-hosting-migration.md)。現有 adapter 僅做必要的 public API
+相容修改，baseline／候選 regression 均通過；正式 pins、lock、預設 host、protocol、
+credential 選擇與部署配置均未改變，沒有執行新的 Azure 部署／驗收。
+本機 ASGI 的隔離與續接測試不代表 Foundry 平台授權或 Playground 已驗收。
 
 Handoff runtime 的三位專家有程式控制的 completion-return policy：
 正常回合沒有合法回交 call 時，middleware 補一個非文字控制 call，由 SDK 真正交回 Primary；

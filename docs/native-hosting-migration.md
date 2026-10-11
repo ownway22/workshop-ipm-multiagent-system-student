@@ -1,12 +1,58 @@
-# Native Foundry hosting 遷移：可行性未通過
+# Native Foundry hosting：SDK 相容性已修復，native 門檻仍未通過
 
 查證日期：2026-10-11。正式 baseline：`origin/main` 的 `1e1cb78`（已合併 PR #4）。
 
-**本次是 blocker 重現，不是完成遷移。** 正式 [進入點](../src/main.py)、
-[HandoffResponsesHost](../src/workflows/responses.py)、[相依定義](../src/pyproject.toml)、
-[lock](../src/uv.lock)、[完成版程式](../solutions/lab2/) 與部署設定全部維持 baseline。
+**SDK 相容性完成不等於 native migration 完成。** 正式 [進入點](../src/main.py)、
+[相依定義](../src/pyproject.toml)、[lock](../src/uv.lock)、預設 host 與部署設定維持 baseline；
+[HandoffResponsesHost](../src/workflows/responses.py) 僅加入下述最小 API 相容修改，
+[完成版程式](../solutions/lab2/) 已同步。
 沒有移除任何自訂 plumbing，也沒有新增另一套 checkpoint、binding、projection 或鎖。
 Manual permissions 不變；沒有 provision、deploy、變更 credentials、刪除 Azure 資源或 merge。
+
+## 本階段：現有 adapter 的 SDK 相容性
+
+在 PR #5 接續修正候選相依下的 failures，沒有重跑下方已證實的 release／native capability 調查：
+
+- `CreateResponse`、input items：舊 Azure model 與新版 dict 都使用 public `Mapping`／`get`。
+  保留只接受 user text 的限制，完整保存文字、JSON、code fences 與多段換行；
+  不接受 assistant／system、tool results、附件或錯誤型別。
+- Event：測試以舊版 public `as_dict()` 或新版 `dict()` 取得相同 wire payload，
+  **原 event 順序、內容、錯誤、routing、history 與 checkpoint 斷言全部保留**。
+- 候選版移除 `atext_content()`：改用兩版共通的 public text content builder，
+  由 SDK 累積 chunks 與產生 done events；沒有版本猜測、私有 API 或額外 projection 系統。
+- 測試使用各案例自己的 `AGENTSERVER_STATE_ROOT`，避免新版 file-backed outer history
+  殘留影響重跑；offline 測試明確傳 `configure_observability=None`，
+  不初始化 SDK exporter／IMDS 探測。正式 observability 與 metadata-only diagnostics 未改。
+
+| 本階段驗證 | 結果 |
+| ---------- | ---- |
+| `cd src && uv lock --check && uv run --no-sync pytest -q --tb=short` | **43 passed、103 subtests passed** |
+| `cd tests/native_hosting && uv lock --check && uv run --no-sync pytest -q -c ../../src/pyproject.toml ../unit/test_handoff_responses.py --tb=short` | **43 passed、103 subtests passed** |
+| Pylance syntax／`git diff --check` | 通過 |
+| `src`／`solutions/lab2` 的 Python 副本 | 16 份逐檔完全一致 |
+| 正式與候選 pins／lock、預設 host、credential、拓撲／prompts、部署配置、native gate tests | 全部未變 |
+
+新增真正 Handoff 的 **12 個 ASGI 情境**：stream／nonstream × 同 host／重建 host ×
+conversation／previous_response_id chain／同 response 分岔；每個情境都執行三輪普通文字，
+核對完整專家 schema JSON、中文與 code fences 只出現一次，SSE delta／done／final text 相同，
+原材料沒有重複 replay、pending Handoff 與 history 正確，原 response 的 checkpoint bytes 不變。
+另保留全部原 regression，補上 model／dict input guards 及實際 HTTP／SSE `invalid_prompt` 契約。
+
+### 使用者隔離的既有邊界
+
+Maintainer 確認：**本次不要求不同使用者共用同一 conversation ID**。
+重用另一使用者已有 outer history 的 ID，但沒有自己的 checkpoint 時，
+baseline 與候選均維持明確 `invalid_prompt` 拒絕，不默默建立新對話。
+這是兩套環境一致的既有契約，**不是 SDK upgrade regression**。
+
+真正 Handoff 的 ASGI 測試核對拒絕時沒有 model call、不回傳前位使用者文字、
+pending request IDs／payload 與所有既有 checkpoint bytes 不變；
+使用者各自的合法 conversation 可多輪續接，拒絕後原使用者仍能續接。
+**此處只驗證本機 handler／storage 的行為，不代表 Foundry 平台授權隔離已驗收。**
+
+本階段沒有接入 native host，也沒有移除 #4 的 checkpoint／鎖／續接機制。
+下方 native 純文字、線性 lineage、`store=False`、ownership 與 error contract blockers
+仍維持；原 native gate 不使用 skip／xfail，既有調查與四個 gate 本階段不重跑。
 
 ## 官方來源與實際版本
 
@@ -113,7 +159,7 @@ agent、client；host 自己管理 checkpoint、scope、event lifecycle 與資�
 
 ## 分岔：官方設計限制，不直接判定為 SDK bug
 
-原 [分岔 regression](../tests/unit/test_handoff_responses.py) 保留不變且在 baseline 通過：
+原 [分岔 regression](../tests/unit/test_handoff_responses.py) 的完整斷言保留，在 baseline 與候選均通過：
 同一 `previous_response_id` 可分岔，各自續接，原 checkpoint 維持唯讀。
 
 Native 對照組第一個 correlated reply 通過；第二次由同一 response 分岔被拒絕：
@@ -148,7 +194,7 @@ Maintainer 已選擇：**保留 #4 的分岔契約，本次不批准改為線性
 | history／private service state | native public contract 使用 checkpoint history，對 storing clients 強制 `store=False`。Fake 中 Primary 與 Coding 均驗證此值；與 baseline 保留 Primary 的服務端 storage 選擇不同。真實 Foundry history／Token 成本尚未驗收 |
 | resource ownership | 成功與拒絕的 requests 均實測 fresh clients 各 enter／exit 一次、穩定 graph／executor identity；原共用單一 FoundryChatClient factory 不可直接搬用。真正 Azure project client／credential／transport cleanup 尚未接線或驗收 |
 | HTTP／SSE | 本重現的 application validation／continuation errors：nonstream HTTP 200 + failed JSON；stream HTTP 200 + created → in_progress → failed SSE，code 均為 `server_error`。原 adapter 的使用者錯誤是 `invalid_prompt`；不能假設新版自動 HTTP 400 |
-| 舊 adapter 直接換相依 | 在候選環境跑**未修改**原 regression：`74 failed, 13 passed, 11 subtests passed`。已觀察 `CreateResponse` 是 dict，舊 attribute access／event `.as_dict()` 不相容；不是 main baseline 的既有失敗，本次不修舊 host 的 candidate-only compatibility |
+| 舊 adapter 的 SDK 相容性 | 第一階段未修改 adapter 時為 `74 failed, 13 passed, 11 subtests passed`。本階段已修 public mapping／event／text builder 相容性，兩套環境皆 **43 passed、103 subtests passed**；不是 native migration 通過 |
 
 Checkpoint allowlist 只加入 Handoff request、`GenericAlias`（`list[Message]`）與 Azure role enum；
 沒有停用反序列化限制。測試只透過 public store／checkpoint methods 製造刪除或不匹配，
@@ -159,7 +205,9 @@ Checkpoint allowlist 只加入 Handoff request、`GenericAlias`（`list[Message]
 client 重送同一 trusted call ID 的 contract、telemetry、實際模型的 Token usage。
 本次沒有把來源中的保證寫成上述案例已通過。
 
-## 驗證紀錄
+## 第一階段歷史驗證紀錄
+
+以下保留最初 blocker 調查的結果，不是本階段重新執行；相容性 failures 的修正結果見上節。
 
 | 環境與 command | 結果 |
 | -------------- | ---- |
@@ -183,7 +231,8 @@ client 重送同一 trusted call ID 的 contract、telemetry、實際模型的 T
 
 ## 最小可行替代方案與後續門檻
 
-目前唯一不改 UX、不破壞分岔契約的替代方案是**維持 #4 的正式 adapter 與 lock**。
+目前不改 UX、不破壞分岔契約的路徑是**維持 #4 的 adapter 行為與正式 lock**，
+並使用上節的最小 SDK 相容修改；不能把它描述為 native hosting 已接線。
 必要的薄型 input/reply adapter 可以接受，但必須依賴 upstream 的 public extension point：
 
 1. 讓 `parse_response` 取得 host 已驗證的 scoped pending Handoff request／response type，
@@ -198,7 +247,7 @@ client 重送同一 trusted call ID 的 contract、telemetry、實際模型的 T
 
 ### 舊 checkpoint、新 session 與 rollback
 
-此次正式 runtime 不變，**沒有新增**既有學員必須換 session 的要求。
+此次正式 pins、預設 host 與 runtime 契約不變，**沒有新增**既有學員必須換 session 的要求。
 實驗只讀自己的隔離 state，不匯入 `.handoff-checkpoints/`。
 
 未來 native 上線不能假設舊 checkpoint 相容；官方不讀 legacy unscoped state。
