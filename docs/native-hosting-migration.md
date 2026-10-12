@@ -25,43 +25,86 @@ GitHub 目前沒有回報 PR checks；不把本機測試寫成 CI 綠燈。
 
 ### Docker 阻擋與使用者設定
 
-2026-10-12 檢查：Docker CLI **29.4.0** 可用，context 為 `default`，
-但 `/var/run/docker.sock` 不存在，`docker info` 無法連到 daemon。
-因此正式 [Dockerfile](../deploy/Dockerfile) 的 build／容器啟動 smoke **未執行**；
-沒有自行安裝 Docker、啟動系統服務、調整 socket 權限或改用 Azure remote build。
-
-請由你或環境維護者完成：
-
-- 若使用 Docker Desktop：確認 Linux containers／WSL 2 backend，
-  在 **Settings → Resources → WSL Integration** 啟用目前的 Ubuntu，
-  並由你啟動 Docker Desktop、重新開啟 WSL terminal。
-- 若使用 Ubuntu 內既有 Docker Engine：由環境維護者確認 daemon 與 socket 可用，
-  並授予合適的使用權限；本 PR 不修改系統或全域 Docker 設定。
-- 在同一個 WSL terminal 確認 `docker info` 成功；build engine 必須支援
-  `linux/amd64`（arm64 主機可能需要已配置的 emulation）。
-
-Docker 可用後，從 repository 根目錄執行**正式 Dockerfile／正式 lock**：
+先前 daemon socket 不存在的阻擋已由使用者啟動 Docker Desktop／Ubuntu WSL Integration 解決。
+2026-10-12 本次實際執行：
 
 ```bash
-docker build --platform linux/amd64 -f deploy/Dockerfile -t ipm-handoff-compat:pr5 .
-docker run --rm --name ipm-handoff-compat-pr5 \
-  -p 127.0.0.1:18088:8088 \
-  -e FOUNDRY_PROJECT_ENDPOINT=https://offline.invalid/api/projects/offline \
-  -e MODEL_DEPLOYMENT_NAME=offline \
-  -e OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false \
-  ipm-handoff-compat:pr5
+docker info --format '{{.ServerVersion}} {{.OSType}}/{{.Architecture}}'
 ```
 
-另一個 terminal：
+成功回傳 **`29.8.2 linux/aarch64`**。Worktree 乾淨，待建置 source commit：
+**`dde72ec64c5234f79a946277d64c4cd13b89f62e`**。
+使用該 commit 的 tracked-only archive，排除本機真實 `.env`／credentials／checkpoints；
+唯一 tracked env 檔是非秘密 `.env.template`。正式 [Dockerfile](../deploy/Dockerfile)、
+[manifest](../src/pyproject.toml) 與 [lock](../src/uv.lock) 未改。
 
 ```bash
-curl --fail --retry 6 --retry-delay 2 --retry-connrefused http://127.0.0.1:18088/readiness
-docker stop ipm-handoff-compat-pr5
+set -o pipefail
+git archive --format=tar dde72ec64c5234f79a946277d64c4cd13b89f62e |
+  docker build --platform linux/amd64 --progress plain \
+    -f deploy/Dockerfile \
+    --label org.opencontainers.image.revision=dde72ec64c5234f79a946277d64c4cd13b89f62e \
+    --label workshop.pr=5 \
+    -t ipm-handoff-compat:pr5-dde72ec-d9efd9f3 -
 ```
 
-上述值都是合成的非秘密設定；不要載入真實 `.env`、掛載 credentials 或呼叫模型。
-這項 smoke 只確認正式入口可啟動、readiness 與停止，不等於 Azure model authentication、
-Playground／Teams 或 native continuation 驗收。這些命令本次沒有執行。
+同一 command 執行兩次，**兩次 exit code 1，image build 未完成**：
+
+| 嘗試 | 失敗階段 | 錯誤摘要 |
+| ---- | -------- | -------- |
+| 第一次 | Dockerfile 的 `RUN uv sync --locked --no-dev`，下載 `websockets==16.1.1` wheel | 3 次 download retries 後，`client error (Connect)`／`received fatal alert: HandshakeFailure` |
+| 相同參數重試一次 | 同一 `RUN`，下載 `httpx==0.28.1` wheel | 相同 TLS `HandshakeFailure` |
+
+Build 已解析正式 lock 的 **117 packages**，使用 uv **0.9.25**、
+正式 base tag 所提供的 Linux CPython **3.13.16**；target 明確為 **linux/amd64**。
+這些值來自 build output，不代表修改正式 Python／SDK pins。
+`docker image inspect ipm-handoff-compat:pr5-dde72ec-d9efd9f3` 回報 **No such image**；
+因此沒有完成的 image ID／digest，也沒有可驗收的 application container。
+
+只做有限的標準 TLS 診斷：同一公開 `httpx` wheel URL 在 WSL 的 `urllib` 回傳 **HTTP 200**
+（73,517 bytes）；本次短命 `python:3.13-slim-bookworm` probe 在 Docker default network
+及單一 command 的 `--network host` 均得到 `SSLV3_ALERT_HANDSHAKE_FAILURE`。
+**這僅為環境差異證據，根本原因未確認；沒有證據將其歸為程式 regression。**
+沒有降低 TLS 驗證、使用 insecure host／mirror、匯入憑證或修改全域 Docker／proxy 設定。
+
+兩個 probe 都使用 `--rm`，名稱僅為 `ipm-pr5-netcheck-d9efd9f3`、
+`ipm-pr5-netcheck-host-d9efd9f3`。清理核對：
+
+```bash
+docker ps -a --filter 'name=^/ipm-pr5-netcheck(-host)?-d9efd9f3$' \
+  --format '{{.ID}} {{.Names}} {{.Status}}'
+```
+
+結果為空。本次沒有建立 application smoke container，不清理其他容器、不執行 prune。
+**`/readiness`、空白 `/responses` 的 failed／invalid_prompt、application 啟動／請求 logs
+及 application 停止 smoke 全部未執行**，不能寫成通過。
+使用者已要求停止重試，正式 Dockerfile／pins／lock 不改。
+本次只更新文件，未重跑既有 SDK／native migration 調查或已完成的 regression。
+
+### GitHub-hosted runner 最小方案（尚待同意）
+
+目前只提出方案，**沒有新增 workflow、沒有觸發執行**：
+
+1. 一個 job，GitHub-hosted `ubuntu-24.04`（x64），`permissions: contents: read`，
+   有限 timeout；不使用 Azure secrets、OIDC、environment 或部署步驟。
+2. 明確 checkout 本次 PR 的 head SHA（不把 merge ref 當成 image source），
+   不保留 checkout credentials；使用相同 tracked archive、正式 Dockerfile／lock、
+   `--platform linux/amd64` 與 revision label 建 image，記錄 source SHA／image ID。
+3. 只啟動本次唯一命名的 `--rm` 容器，無 credentials mounts，
+   `127.0.0.1` published port；使用 `FOUNDRY_PROJECT_ENDPOINT=https://offline.invalid/api/projects/offline`、
+   `MODEL_DEPLOYMENT_NAME=offline` 與敏感內容 capture=false。
+4. 有限等待 `/readiness` HTTP 200；再送 `{"input":" ","stream":false}` 至 `/responses`，
+   assert HTTP 200、`status=failed`、`error.code=invalid_prompt`，不得是 `server_error`。
+   不送有效模型 prompt，不呼叫真實模型。
+5. 檢查／保存合成 startup/request logs；成功或失敗均只停止／移除本次容器，
+   不使用 `docker system prune`，不 push image／deploy。
+
+建議同意後才加入受限的 `pull_request` workflow（僅此 PR 的相關 paths／明確批准的
+push 觸發），避免假設未在 default branch 的新 `workflow_dispatch` 可直接使用。
+**新增 workflow 與其 push 所造成的 run 都須先取得使用者同意**；不為了 CI merge 本 PR。
+Runner 成功後才補錄實際結果；不能預先保證其網路或 smoke 會通過。
+即使 smoke 通過，也不等於 Azure／Playground／Teams 授權、模型驗收，
+不表示正式 SDK 已升級或 native migration 已完成。
 
 ## 本階段：現有 adapter 的 SDK 相容性
 

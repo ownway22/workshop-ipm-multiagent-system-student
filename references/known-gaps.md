@@ -2,8 +2,10 @@
 
 PR #5 僅為 **Handoff adapter 的 SDK 相容性準備**，正式 pins／lock／預設 host 不變。
 以下 native 限制屬於隔離實驗，不是正式 adapter regression；
-本機兩套 adapter suites 皆通過。正式容器 build／啟動 smoke 尚受 Docker daemon
-socket 不存在阻擋，設定步驟見 [相容性報告](../docs/native-hosting-migration.md#docker-阻擋與使用者設定)。
+本機兩套 adapter suites 皆通過。Docker daemon 已可用，但正式 image build 在
+`uv sync --locked --no-dev` 的 PyPI TLS handshake 失敗，image 未完成、smoke 未執行。
+WSL／Docker 的連線差異不是根因判定或程式 regression；實際 commands、source SHA、
+清理與待同意的 runner 方案見 [相容性報告](../docs/native-hosting-migration.md#docker-阻擋與使用者設定)。
 
 ## Native hosting：遷移尚未通過可行性門檻
 
