@@ -5,7 +5,8 @@ PR #5 已合併，本階段正式 pins／lock 升級為其已驗證組合，
 正式新版 **45 tests、105 subtests 通過**，CLI／DevUI public API 及限定舊 SDK
 合成 checkpoint 還原通過。這不保證任意真實舊 state 相容；
 首次部署驗收必須新 session／conversation，不自動遷移或刪除舊資料。
-新版 image 仍須本階段新的 runner 證據，不能引用 #5 的舊 image；
+本階段 [新版 runner](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38206422208)
+已獨立通過新版正式 image／readiness／空白輸入 smoke，並非引用 #5 舊 image；
 版本、checkpoint 與人工 Azure 未驗收邊界見 [升級報告](../docs/native-hosting-migration.md)。
 
 ## Native hosting：遷移尚未通過可行性門檻

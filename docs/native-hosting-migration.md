@@ -5,6 +5,8 @@
 2026-10-12，PR #5 已以一般 merge commit
 `f880de981017d9995845f0735e915851c1bb4e15` 合併。
 本階段從該最新 `main` 建立獨立 branch／worktree；沒有修改或刪除 #5 的 branch／worktree。
+新 [Draft PR #6](https://github.com/ownway22/workshop-ipm-multiagent-system-student/pull/6)
+尚未合併，也沒有部署。
 正式 [manifest](../src/pyproject.toml) 與 [lock](../src/uv.lock) 採用 #5 已驗證的組合，
 預設仍是 [HandoffResponsesHost](../src/workflows/responses.py)，不接入 native host。
 以下是 source 的 dependency 升級，**不是 Azure 已部署、模型／Playground／Teams 已驗收**。
@@ -50,9 +52,27 @@ Locked prod／dev sync、CLI 成功；Linux Python **3.13.11**／uv **0.9.25**�
 降級／timeout、取消與 metadata-only diagnostics 斷言不變，沒有 skip／xfail。
 DevUI API 通過不等於真實模型下的 DevUI UX 已驗收；新版的實際對話行為仍須人工確認。
 
-新版正式 image 的 GitHub-hosted build／readiness／空白 `failed/invalid_prompt` smoke
-**待本 PR 的新 run 回填**；不引用下方 #5 舊 image 作為新版通過證據。
-現有最小權限 PR workflow 不需修改；native gate 留在隔離實驗、不混入正式 runner，
+新版正式 image 的
+**[GitHub-hosted run 38206422208](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38206422208)
+全部成功**，不是 #5 的舊 image／skipped run：
+
+| 新版 container 證據 | 結果 |
+| ------------------ | ---- |
+| 實際受測 head SHA／image revision | `5c0f935093813b336cebddfd9c53ffa62c70f10e` |
+| Image ID／platform | `sha256:8748803dc7a98f94e61040e10190277ada90fc24c24972de9b60927072fad157`；`linux/amd64` |
+| 正式 build | 原 `deploy/Dockerfile`／新版正式 lock，`uv sync --locked --no-dev`；解析 119／安裝 112 packages |
+| Runtime | base tag 的 Python 3.13.16、uv 0.9.25；build log 核對全部新版 SDK pins |
+| Container entry | 原 `main.py --responses --host 0.0.0.0`；合成 env、mounts=[]、僅 `127.0.0.1:32768` |
+| readiness | HTTP 200，`{"status":"healthy"}` |
+| 空白 input／stream=false | HTTP 200，`status=failed`、`error.code=invalid_prompt`，不是 `server_error` |
+| Logs／cleanup | input rejection log 已核對；僅本次 container ID stop／rm 並確認不存在 |
+| Artifact | [handoff-container-smoke-38206422208-1](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38206422208/artifacts/11727332609) |
+
+SDK log 的 experimental／「resilience disabled」警告是未驗收的 crash-recovery 邊界，
+不把成功 smoke 宣稱為 process hard-kill 後的可恢復性保證。
+本次沒有送有效模型 prompt、registry login／image push、Azure secrets 或部署。
+最後的文件回填不更改正式 build inputs，若 workflow 明確 skip，不能當成新的 image 驗證。
+現有最小權限 PR workflow 未修改；native gate 留在隔離實驗、不混入正式 runner，
 也沒有重跑已完成的 upstream 調查。
 
 ### Checkpoint 版本邊界、新 session 與 rollback

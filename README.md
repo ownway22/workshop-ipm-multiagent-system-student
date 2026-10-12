@@ -229,7 +229,9 @@ agentserver core **2.1.0**／Responses **2.2.0b1**，其他非必要相依不升
 預設仍為 `HandoffResponsesHost`，與救援程式一致；新版正式環境
 **45 tests、105 subtests 通過**，沒有部署 Azure 或完成 end-to-end 驗收。
 
-新 image 必須由本階段的新 GitHub run 驗證，不能沿用 #5 舊 smoke。
+[新版正式 image run](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38206422208)
+已通過 `linux/amd64` build、readiness、空白 `failed/invalid_prompt`、logs 與清理，
+受測 SHA 為 `5c0f935093813b336cebddfd9c53ffa62c70f10e`，不是沿用 #5 舊 smoke。
 首次部署驗收使用新 session／conversation；舊 checkpoint 僅有合成案例相容證據，
 不做自動遷移或刪除。
 
