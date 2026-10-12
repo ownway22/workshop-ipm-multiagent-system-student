@@ -209,6 +209,10 @@ A365 ImportError／exporter Bad Request 尚未解決，Tracing 不宣稱通過�
 
 ## DevUI 已知限制
 
+Native hosting 候選環境不代表本 Lab 已升級：[真正 Handoff 的純文字續接門檻未通過](native-hosting-migration.md)，
+正式與完成版仍使用原精確 lock。候選 DevUI 只查證 imports／API 相容性，
+沒有用模型重新驗收此介面；以下既有已知限制不變。
+
 目前版本無法將 Handoff 狀態完整隔離在單一對話。2026-07-28 實測確認：
 
 1. **workflow 實體**：按「新對話」後，仍讀得到上一段對話的內容。

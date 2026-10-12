@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 import uuid
@@ -36,7 +37,9 @@ from agent_framework import (
 )
 from agent_framework.orchestrations import HandoffAgentUserRequest, HandoffBuilder, HandoffSentEvent
 from agent_framework.openai import OpenAIChatClient, OpenAIContinuationToken
-from azure.ai.agentserver.responses.models import CreateResponse, ItemMessage
+from azure.ai.agentserver.responses.models import (
+    CreateResponse, ItemMessage, MessageContentInputTextContent,
+)
 
 from agents import build_agent_roles
 from models.specialist_review import SpecialistReview
@@ -422,14 +425,25 @@ def context(text, conversation="conversation-a", user="user-a", response=None):
     )
 
 
+def event_payload(event):
+    """保留相同 wire 斷言，只轉換舊 model／新版 dict 的公開表示法。"""
+    return event.as_dict() if hasattr(event, "as_dict") else dict(event)
+
+
 class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.directory = tempfile.TemporaryDirectory()
-        self.root = Path(self.directory.name)
-        self.host = HandoffResponsesHost(workflow, checkpoint_root=self.root)
-
-    async def asyncTearDown(self):
-        self.directory.cleanup()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name) / "handoff"
+        self.root.mkdir()
+        environment = patch.dict(os.environ, {
+            "AGENTSERVER_STATE_ROOT": str(Path(self.directory.name) / "agentserver"),
+        })
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.host = HandoffResponsesHost(
+            workflow, checkpoint_root=self.root, configure_observability=None
+        )
 
     async def turn(self, text, *, host=None, previous=None, **kwargs):
         request = CreateResponse(input=text, stream=True, previous_response_id=previous)
@@ -501,6 +515,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                 host = HandoffResponsesHost(
                     lambda: logging_workflow(intermediate=intermediate),
                     checkpoint_root=self.root,
+                    configure_observability=None,
                 )
                 with self.assertLogs("workflows.responses", level="INFO") as captured:
                     result = await self.turn(
@@ -543,7 +558,9 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn(forbidden, "\n".join(messages))
 
     async def test_streaming_output_is_logged_once_per_source_per_turn(self):
-        host = HandoffResponsesHost(logging_workflow, checkpoint_root=self.root)
+        host = HandoffResponsesHost(
+            logging_workflow, checkpoint_root=self.root, configure_observability=None
+        )
         with self.assertLogs("workflows.responses", level="INFO") as captured:
             for conversation in ("first-turn", "second-turn"):
                 await self.turn("private-input-body", host=host, conversation=conversation)
@@ -559,9 +576,11 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private-input-body", "\n".join(captured.output))
 
     async def test_logging_keeps_responses_event_order_and_text(self):
-        host = HandoffResponsesHost(logging_workflow, checkpoint_root=self.root)
+        host = HandoffResponsesHost(
+            logging_workflow, checkpoint_root=self.root, configure_observability=None
+        )
         payloads = [
-            event.as_dict()
+            event_payload(event)
             async for event in host._respond(
                 CreateResponse(input="private-input-body", stream=True),
                 context("private-input-body"),
@@ -588,7 +607,9 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_plain_text_resumes_after_host_recreation(self):
         self.assertEqual(await self.turn("review architecture next"), "review architecture next")
-        restarted = HandoffResponsesHost(workflow, checkpoint_root=self.root)
+        restarted = HandoffResponsesHost(
+            workflow, checkpoint_root=self.root, configure_observability=None
+        )
         self.assertEqual(
             await self.turn("no, go ahead", host=restarted),
             "review architecture next -> no, go ahead",
@@ -622,6 +643,63 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_input_fails(self):
         with self.assertRaisesRegex(HandoffRequestError, "非空白"):
             await self.turn(" ")
+
+    async def test_model_and_mapping_inputs_preserve_user_text(self):
+        cases = [
+            ([ItemMessage(role="user", content="完整文字\n```python\nvalue = 42\n```")],
+             ["完整文字\n```python\nvalue = 42\n```"]),
+            ([{"type": "message", "role": "user", "content": "原樣保留"}],
+             ["原樣保留"]),
+            ([{"role": "user", "content": "type 可省略"}], ["type 可省略"]),
+            ([ItemMessage(role="user", content=[
+                MessageContentInputTextContent(type="input_text", text="第一段"),
+                MessageContentInputTextContent(type="input_text", text="第二段"),
+            ])], ["第一段\n第二段"]),
+            ([{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "程式碼"},
+                {"type": "input_text", "text": "```python\nvalue = 42\n```"},
+            ]}], ["程式碼\n```python\nvalue = 42\n```"]),
+            ([{"role": "user", "content": " \t"}, {"role": "user", "content": "有效材料"}],
+             ["有效材料"]),
+        ]
+        for items, expected in cases:
+            with self.subTest(items=items):
+                async def get_input_items():
+                    return items
+
+                result = await self.host._input_messages(SimpleNamespace(
+                    get_input_items=get_input_items,
+                ))
+                self.assertEqual([message.text for message in result], expected)
+                self.assertTrue(all(message.role == "user" for message in result))
+
+    async def test_mapping_inputs_reject_non_user_or_non_text_items(self):
+        cases = [
+            (["not-an-item"], "文字訊息"),
+            ([{"role": "assistant", "content": "不得接受 assistant"}], "文字訊息"),
+            ([{"role": "system", "content": "不得接受 system"}], "文字訊息"),
+            ([{"type": "function_call_output", "role": "user", "output": "不得配對"}],
+             "文字訊息"),
+            ([{"role": "user", "content": None}], "不支援附件"),
+            ([{"role": "user", "content": {"text": "不是 content list"}}], "不支援附件"),
+            ([{"role": "user", "content": [
+                {"type": "input_text", "text": "不能只取這段"},
+                {"type": "input_image", "image_url": "https://example.invalid/image"},
+            ]}], "不支援附件"),
+            ([{"role": "user", "content": [{"text": "缺少 part type"}]}], "不支援附件"),
+            ([{"role": "user", "content": [{"type": "input_text", "text": 42}]}],
+             "文字訊息"),
+            ([{"role": "user", "content": []}], "非空白"),
+        ]
+        for items, reason in cases:
+            with self.subTest(items=items):
+                async def get_input_items():
+                    return items
+
+                with self.assertRaisesRegex(HandoffRequestError, reason):
+                    await self.host._input_messages(SimpleNamespace(
+                        get_input_items=get_input_items,
+                    ))
 
     async def test_previous_response_after_conversation_turn(self):
         # 前一輪用 conversation 送出，下一輪改用 previous_response_id 也要接得上。
@@ -664,7 +742,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalid_input_reports_reason_not_server_error(self):
         events = [
-            event.as_dict()
+            event_payload(event)
             async for event in self.host._respond(
                 CreateResponse(input=" ", stream=True), context(" "), asyncio.Event()
             )
@@ -678,9 +756,11 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         def broken_factory():
             raise RuntimeError("secret internal detail")
 
-        host = HandoffResponsesHost(broken_factory, checkpoint_root=self.root)
+        host = HandoffResponsesHost(
+            broken_factory, checkpoint_root=self.root, configure_observability=None
+        )
         events = [
-            event.as_dict()
+            event_payload(event)
             async for event in host._respond(
                 CreateResponse(input="hello", stream=True), context("hello"), asyncio.Event()
             )
@@ -745,7 +825,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                     asyncio.Event(),
                 )
             ]
-            payloads = [event.as_dict() for event in events]
+            payloads = [event_payload(event) for event in events]
             self.assertEqual(payloads[-1]["type"], "response.completed")
             output = payloads[-1]["response"]["output"]
             self.assertEqual(output[0]["type"], "message")
@@ -773,6 +853,158 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("code reviewed -> no, go ahead", second.text)
             self.assertIn("response.completed", second.text)
             self.assertNotIn("response.failed", second.text)
+
+    async def test_http_users_and_conversations_are_isolated(self):
+        class EchoHandoffClient(ScriptedHandoffClient):
+            def _inner_get_response(self, *, messages, stream, options, **kwargs):
+                material = next(message.text for message in messages if message.role == "user")
+                chunks, target = self.script[self.calls]
+                self.script[self.calls] = (
+                    tuple(chunk.replace("{material}", material) for chunk in chunks), target,
+                )
+                return super()._inner_get_response(
+                    messages=messages, stream=stream, options=options, **kwargs
+                )
+
+        host, roles, sources = self.production_host({
+            "primary": [(("START\n",), "coding"), (("SUMMARY:{material}\n",), None)],
+            "coding": [(("REVIEW:{material}\n",), None)],
+        }, suffix="http-isolation", client_factory=EchoHandoffClient)
+        checkpoint_root = self.root / "http-isolation"
+        primary = roles["primary"].agent_name
+        async with AsyncClient(
+            transport=ASGITransport(app=host), base_url="http://localhost"
+        ) as client:
+            for user, conversation, text, material in (
+                ("user-a", "conv_same", "private-a", "private-a"),
+                ("user-b", "conv_same", "private-b attempt", None),
+                ("user-a", "conv_separate", "separate-a", "separate-a"),
+                ("user-b", "conv_own_b", "private-b", "private-b"),
+                ("user-a", "conv_same", "continue-a", "private-a"),
+                ("user-b", "conv_own_b", "continue-b", "private-b"),
+                ("user-a", "conv_separate", "continue", "separate-a"),
+                ("user-b", "conv_same", "continue-b attempt", None),
+                ("user-a", "conv_same", "再繼續", "private-a"),
+            ):
+                with self.subTest(user=user, conversation=conversation, text=text):
+                    before = {
+                        path.relative_to(checkpoint_root): path.read_bytes()
+                        for path in checkpoint_root.rglob("*") if path.is_file()
+                    }
+                    previous_calls = [
+                        (model, model.calls)
+                        for source in sources for model in source.clients.values()
+                    ]
+                    pointer = host._conversation_pointer("user-a", "conv_same")
+                    previous = await host._latest_checkpoint(host._response_dir(
+                        "user-a", pointer.read_text(encoding="utf-8")
+                    )) if pointer.is_file() else None
+                    response = await client.post(
+                        "/responses",
+                        headers={"x-agent-user-id": user},
+                        json={"input": text, "conversation": conversation, "stream": False},
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    payload = response.json()
+                    if material is None:
+                        self.assertEqual(payload["status"], "failed")
+                        self.assertEqual(payload["error"]["code"], "invalid_prompt")
+                        self.assertIn("已有歷史紀錄", payload["error"]["message"])
+                        self.assertEqual("".join(
+                            part["text"] for item in payload["output"]
+                            if item["type"] == "message"
+                            for part in item["content"] if part["type"] == "output_text"
+                        ), "")
+                        self.assertNotIn("private-a", response.text)
+                        self.assertTrue(all(
+                            model.calls == 0 for model in sources[-1].clients.values()
+                        ))
+                        self.assertTrue(all(
+                            model.calls == calls for model, calls in previous_calls
+                        ))
+                        self.assertEqual({
+                            path.relative_to(checkpoint_root): path.read_bytes()
+                            for path in checkpoint_root.rglob("*") if path.is_file()
+                        }, before)
+                        pending = await host._latest_checkpoint(host._response_dir(
+                            "user-a", pointer.read_text(encoding="utf-8")
+                        ))
+                        self.assertIsNotNone(previous)
+                        self.assertIsNotNone(pending)
+                        self.assertEqual(
+                            set(pending.pending_request_info_events),
+                            set(previous.pending_request_info_events),
+                        )
+                        for request_id, event in pending.pending_request_info_events.items():
+                            self.assertIsInstance(event.data, HandoffAgentUserRequest)
+                            self.assertEqual(
+                                event.data.agent_response.to_dict(),
+                                previous.pending_request_info_events[request_id]
+                                .data.agent_response.to_dict(),
+                            )
+                        self.assertFalse(host._conversation_pointer(user, conversation).exists())
+                        continue
+                    self.assertEqual(payload["status"], "completed", payload)
+                    self.assertIsNone(payload.get("error"))
+                    self.assertEqual(
+                        payload["output"][0]["content"][0]["text"],
+                        f"START\nREVIEW:{material}\nSUMMARY:{material}\n",
+                    )
+                    model = sources[-1].clients[primary]
+                    self.assertEqual(model.calls, 2)
+                    users = [
+                        message.text for message in map(Message.from_dict, model.requests[0])
+                        if message.role == "user"
+                    ]
+                    self.assertEqual(users.count(material), 1)
+                    self.assertEqual(users[-1], text)
+                    foreign = {"private-a", "private-b", "separate-a"} - {material}
+                    forbidden = foreign | {"private-b attempt", "continue-b attempt"}
+                    self.assertTrue(
+                        forbidden.isdisjoint(users)
+                    )
+                    for agent in sources[-1].clients.values():
+                        for messages in agent.requests:
+                            history_text = "\n".join(
+                                Message.from_dict(message).text for message in messages
+                            )
+                            for private_text in forbidden:
+                                self.assertNotIn(private_text, history_text)
+
+    async def test_http_input_errors_keep_invalid_prompt_contract(self):
+        for stream in (False, True):
+            for input_value, reason in (
+                (" ", "非空白"),
+                ([{"role": "assistant", "content": "private-assistant-text"}], "文字訊息"),
+                ([{"role": "user", "content": [
+                    {"type": "input_image", "image_url": "https://example.invalid/image"},
+                ]}], "不支援附件"),
+            ):
+                with self.subTest(stream=stream, reason=reason):
+                    async with AsyncClient(
+                        transport=ASGITransport(app=self.host), base_url="http://localhost"
+                    ) as client:
+                        response = await client.post(
+                            "/responses", json={"input": input_value, "stream": stream}
+                        )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    if stream:
+                        events = [
+                            json.loads(line.removeprefix("data: "))
+                            for line in response.text.splitlines() if line.startswith("data: {")
+                        ]
+                        self.assertEqual(events[0]["type"], "response.created")
+                        self.assertEqual(events[-1]["type"], "response.failed")
+                        self.assertFalse(any(
+                            event["type"] == "response.completed" for event in events
+                        ))
+                        payload = events[-1]["response"]
+                    else:
+                        payload = response.json()
+                    self.assertEqual(payload["status"], "failed")
+                    self.assertEqual(payload["error"]["code"], "invalid_prompt")
+                    self.assertIn(reason, payload["error"]["message"])
+                    self.assertNotIn("private-assistant-text", payload["error"]["message"])
 
     async def test_http_preserves_real_handoff_specialist_text(self):
         roles = build_agent_roles("contract-")
@@ -881,6 +1113,154 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(clients), 2)
         self.assertIsNot(clients[0][0], clients[1][0])
         self.assertIsNot(clients[0][1], clients[1][1])
+
+    async def test_http_real_handoff_three_plain_text_turns_and_forks(self):
+        roles = build_agent_roles("continuity-")
+        primary, coding = roles["primary"].agent_name, roles["coding"].agent_name
+        material = "固定材料：fixture_value = 42"
+        prefaces = [f"<<<PRIMARY_{index}>>>\n" for index in range(3)]
+        summaries = [f"<<<SUMMARY_{index}>>>\n等待使用者。\n" for index in range(3)]
+        reviews = [
+            f"<<<CODING_BEGIN_{index}>>>\n"
+            + SpecialistReview(
+                category="code", summary=f"第 {index} 輪固定材料健檢",
+                findings=["材料使用固定值。"], severity="LOW",
+                evidence=["fixture_value = 42（來源：使用者訊息）"],
+                recommendations=["以測試確認用途。"], limitations=["未執行程式碼。"],
+            ).model_dump_json()
+            + f"\n```python\nfixture_value = 42\n```\n<<<CODING_END_{index}>>>\n"
+            for index in range(3)
+        ]
+        for stream in (False, True):
+            for mode in ("conversation", "chain", "fork"):
+                for recreate in (False, True):
+                    with self.subTest(stream=stream, mode=mode, recreate=recreate):
+                        sources = []
+                        checkpoint_root = self.root / f"{stream}-{mode}-{recreate}"
+
+                        def factory():
+                            index = len(sources)
+                            source = ScriptedRoleClients({
+                                primary: [
+                                    ((prefaces[index],), coding),
+                                    ((summaries[index],), None),
+                                ],
+                                coding: [(
+                                    tuple(
+                                        reviews[index][offset:offset + 17]
+                                        for offset in range(0, len(reviews[index]), 17)
+                                    ), None,
+                                )],
+                            })
+                            sources.append(source)
+                            return build_workflow(
+                                build_participants(source, roles, checkpoint_safe=True),
+                                name="plain-text-continuity",
+                            )
+
+                        host = HandoffResponsesHost(
+                            factory, checkpoint_root=checkpoint_root,
+                            configure_observability=None,
+                        )
+                        first_id = previous_id = None
+                        original_files = None
+                        for index, text in enumerate((material, "繼續", "再繼續")):
+                            if recreate and index:
+                                host = HandoffResponsesHost(
+                                    factory, checkpoint_root=checkpoint_root,
+                                    configure_observability=None,
+                                )
+                            request = {"input": text, "stream": stream}
+                            if mode == "conversation":
+                                request["conversation"] = f"conv_{stream}_{recreate}"
+                            elif index:
+                                request["previous_response_id"] = (
+                                    first_id if mode == "fork" else previous_id
+                                )
+                            async with AsyncClient(
+                                transport=ASGITransport(app=host), base_url="http://localhost"
+                            ) as client:
+                                response = await client.post("/responses", json=request)
+                            self.assertEqual(response.status_code, 200, response.text)
+                            if stream:
+                                events = [
+                                    json.loads(line.removeprefix("data: "))
+                                    for line in response.text.splitlines()
+                                    if line.startswith("data: {")
+                                ]
+                                self.assertEqual(events[0]["type"], "response.created")
+                                self.assertEqual(events[-1]["type"], "response.completed")
+                                self.assertFalse(any(
+                                    event["type"] == "response.failed" for event in events
+                                ))
+                                payload = events[-1]["response"]
+                            else:
+                                payload = response.json()
+                            expected = prefaces[index] + reviews[index] + summaries[index]
+                            actual = "".join(
+                                part["text"]
+                                for item in payload["output"]
+                                for part in item["content"]
+                                if part["type"] == "output_text"
+                            )
+                            self.assertEqual(payload["status"], "completed")
+                            self.assertIsNone(payload.get("error"))
+                            self.assertTrue(all(
+                                item["type"] == "message" for item in payload["output"]
+                            ))
+                            self.assertEqual(actual, expected)
+                            self.assertEqual(actual.count(reviews[index]), 1)
+                            if stream:
+                                for event_type, key in (
+                                    ("response.output_text.delta", "delta"),
+                                    ("response.output_text.done", "text"),
+                                ):
+                                    self.assertEqual("".join(
+                                        event[key] for event in events
+                                        if event["type"] == event_type
+                                    ), expected)
+                            primary_client = sources[index].clients[primary]
+                            self.assertEqual(primary_client.calls, 2)
+                            self.assertEqual(sources[index].clients[coding].calls, 1)
+                            history = [
+                                Message.from_dict(item) for item in primary_client.requests[0]
+                            ]
+                            users = [message.text for message in history if message.role == "user"]
+                            self.assertEqual(users.count(material), 1)
+                            self.assertEqual(users[-1], text)
+                            if index:
+                                prior = 0 if mode == "fork" else index - 1
+                                self.assertIn(summaries[prior], "\n".join(
+                                    message.text for message in history
+                                ))
+                                if mode == "fork" and index == 2:
+                                    self.assertNotIn("繼續", users)
+                                    self.assertNotIn(summaries[1], "\n".join(
+                                        message.text for message in history
+                                    ))
+                            directory = host._response_dir(None, payload["id"])
+                            checkpoint = await host._latest_checkpoint(directory)
+                            self.assertIsNotNone(checkpoint)
+                            pending = checkpoint.pending_request_info_events
+                            self.assertEqual(len(pending), 1)
+                            waiting = next(iter(pending.values())).data
+                            self.assertIsInstance(waiting, HandoffAgentUserRequest)
+                            self.assertEqual(waiting.agent_response.text, summaries[index])
+                            if index == 0:
+                                first_id = payload["id"]
+                                original_files = {
+                                    path.name: path.read_bytes() for path in directory.glob("*.json")
+                                }
+                            previous_id = payload["id"]
+                        self.assertEqual(len(sources), 3)
+                        for name in (primary, coding):
+                            self.assertEqual(len({
+                                id(source.clients[name]) for source in sources
+                            }), 3)
+                        first_dir = host._response_dir(None, first_id)
+                        self.assertEqual({
+                            path.name: path.read_bytes() for path in first_dir.glob("*.json")
+                        }, original_files)
 
     async def test_production_return_policy_for_all_specialists(self):
         roles = build_agent_roles("routing-")
@@ -1201,7 +1581,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                 with patch("workflows.handoff.AGENT_TIMEOUT_SECONDS", 0.05 if fault == "timeout" else 180):
                     with self.assertLogs("workflows.responses", level="INFO") as captured:
                         events = [
-                            event.as_dict() async for event in host._respond(
+                            event_payload(event) async for event in host._respond(
                                 CreateResponse(input="Synthetic failure material.", stream=True),
                                 context("Synthetic failure material."),
                                 asyncio.Event(),
@@ -1258,7 +1638,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         }, middleware_factory=extra)
         with self.assertLogs("workflows.responses", level="INFO"):
             events = [
-                event.as_dict() async for event in host._respond(
+                event_payload(event) async for event in host._respond(
                     CreateResponse(input="Synthetic tool failure.", stream=True),
                     context("Synthetic tool failure."), asyncio.Event(),
                 )
@@ -1395,7 +1775,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                 }, suffix=fault, middleware_factory=extra)
                 with self.assertLogs("workflows.responses", level="INFO"):
                     events = [
-                        event.as_dict() async for event in host._respond(
+                        event_payload(event) async for event in host._respond(
                             CreateResponse(input="Synthetic binding check.", stream=True),
                             context("Synthetic binding check."), asyncio.Event(),
                         )
@@ -1541,7 +1921,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         }, middleware_factory=extra, client_factory=ServiceDefaultHandoffClient)
         with self.assertLogs("workflows.responses", level="INFO"):
             events = [
-                event.as_dict() async for event in host._respond(
+                event_payload(event) async for event in host._respond(
                     CreateResponse(input="Synthetic legacy history.", stream=True),
                     context("Synthetic legacy history."), asyncio.Event(),
                 )

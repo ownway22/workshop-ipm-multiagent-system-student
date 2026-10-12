@@ -221,6 +221,20 @@ Container Registry 與 Bot Service 要另外處理，見 [收尾與清理](docs/
 
 ## 版本
 
+### Handoff adapter 的 SDK 相容性準備
+
+正式 SDK **尚未升級**，pins、lock 與預設 host 不變。現有 adapter 的最小 public API
+相容修正已同步救援程式，baseline 與隔離候選皆通過 **43 tests、103 subtests**。
+Docker daemon 已可用，但正式 image build 在 PyPI wheel 的 TLS handshake 失敗，
+本機 smoke 未完成。已授權的 [GitHub-hosted container smoke](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38197154016)
+則通過正式 amd64 build、readiness、空白輸入 `failed/invalid_prompt` 與 logs／清理；
+沒有 Azure 部署或 end-to-end 驗收，兩個環境結果不混同。
+
+Native 純文字續接能力與官方線性 lineage／既有分岔契約是**獨立 migration blockers**，
+不是正式 adapter 的 regression failures，也不在本次相容性準備的解決範圍。
+實驗版本與證據保留於 [相容性報告、Docker 設定與後續門檻](docs/native-hosting-migration.md)、
+[known gaps](references/known-gaps.md)；不宣稱 native migration 完成。
+
 所有相依都**釘死版本**。升級任一 `agent-framework` 套件時，
 **必須**重跑 Lab 2 → Lab 3 → Lab 4 全鏈路——
 `agent-framework-foundry-hosting` 的版本會決定 `deploy/agent.yaml` 的 protocol 版本號。

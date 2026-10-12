@@ -42,7 +42,7 @@ import os
 import shutil
 import uuid
 import weakref
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from pathlib import Path
 from types import GenericAlias
 
@@ -59,8 +59,6 @@ from azure.ai.agentserver.responses import ResponseContext, ResponseEventStream
 from azure.ai.agentserver.responses.hosting import ResponsesAgentServerHost
 from azure.ai.agentserver.responses.models import (
     CreateResponse,
-    ItemMessage,
-    MessageContentInputTextContent,
     MessageRole,
     ResponseStreamEvent,
 )
@@ -181,8 +179,9 @@ class HandoffResponsesHost(ResponsesAgentServerHost):
         self, request: CreateResponse, context: ResponseContext, user_id: str | None
     ) -> Path | None:
         """決定要從哪一輪還原；全新對話回傳 `None`。"""
-        if request.previous_response_id:
-            directory = self._response_dir(user_id, request.previous_response_id)
+        previous_response_id = request.get("previous_response_id")
+        if previous_response_id:
+            directory = self._response_dir(user_id, previous_response_id)
             if not directory.is_dir():
                 raise HandoffRequestError(
                     "找不到 previous_response_id 對應的 Handoff checkpoint。"
@@ -218,17 +217,28 @@ class HandoffResponsesHost(ResponsesAgentServerHost):
     async def _input_messages(self, context: ResponseContext) -> list[Message]:
         messages = []
         for item in await context.get_input_items():
-            if not isinstance(item, ItemMessage) or item.role != "user":
+            # 舊 SDK 的 model 與新版 dict 都支援 public Mapping；message 的 type 可省略。
+            if (
+                not isinstance(item, Mapping)
+                or item.get("type", "message") != "message"
+                or item.get("role") != "user"
+            ):
                 raise HandoffRequestError("這個 Handoff 端點只接受使用者的文字訊息。")
-            if isinstance(item.content, str):
-                text = item.content
+            content = item.get("content")
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                parts: list[str] = []
+                for part in content:
+                    if not isinstance(part, Mapping) or part.get("type") != "input_text":
+                        raise HandoffRequestError("不支援附件，請把程式碼或文件內容直接貼成文字。")
+                    part_text = part.get("text")
+                    if not isinstance(part_text, str):
+                        raise HandoffRequestError("這個 Handoff 端點只接受使用者的文字訊息。")
+                    parts.append(part_text)
+                text = "\n".join(parts)
             else:
-                if any(
-                    not isinstance(part, MessageContentInputTextContent)
-                    for part in item.content
-                ):
-                    raise HandoffRequestError("不支援附件，請把程式碼或文件內容直接貼成文字。")
-                text = "\n".join(part.text for part in item.content)
+                raise HandoffRequestError("不支援附件，請把程式碼或文件內容直接貼成文字。")
             if text.strip():
                 messages.append(Message("user", [text]))
         if not messages:
@@ -238,7 +248,7 @@ class HandoffResponsesHost(ResponsesAgentServerHost):
     async def _text_chunks(
         self, request: CreateResponse, context: ResponseContext, cancelled: asyncio.Event
     ) -> AsyncIterator[str]:
-        if request.previous_response_id and context.conversation_id:
+        if request.get("previous_response_id") and context.conversation_id:
             raise HandoffRequestError("conversation 與 previous_response_id 只能擇一使用。")
         if self.config.is_hosted and context.platform_context.call_id is None:
             raise HandoffRequestError("此 agent 需要 Responses protocol 2.0.0。")
@@ -347,16 +357,18 @@ class HandoffResponsesHost(ResponsesAgentServerHost):
     async def _respond(
         self, request: CreateResponse, context: ResponseContext, cancellation_signal: asyncio.Event
     ) -> AsyncIterator[ResponseStreamEvent]:
-        events = ResponseEventStream(response_id=context.response_id, model=request.model)
+        events = ResponseEventStream(response_id=context.response_id, model=request.get("model"))
         yield events.emit_created()
         yield events.emit_in_progress()
         try:
             message = events.add_output_item_message()
             yield message.emit_added()
-            async for event in message.atext_content(
-                self._text_chunks(request, context, cancellation_signal)
-            ):
-                yield event
+            content = message.add_text_content()
+            yield content.emit_added()
+            async for chunk in self._text_chunks(request, context, cancellation_signal):
+                yield content.emit_delta(chunk)
+            yield content.emit_text_done()
+            yield content.emit_done()
             yield message.emit_done()
             yield events.emit_completed()
         except HandoffRequestError as error:
