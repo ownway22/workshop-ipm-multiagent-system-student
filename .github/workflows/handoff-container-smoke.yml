@@ -1,0 +1,199 @@
+name: Handoff container smoke
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+    paths:
+      - ".github/workflows/handoff-container-smoke.yml"
+      - ".dockerignore"
+      - "deploy/Dockerfile"
+      - "src/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: handoff-container-smoke-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    env:
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+      BEFORE_SHA: ${{ github.event.before }}
+      PR_ACTION: ${{ github.event.action }}
+      IMAGE_NAME: handoff-smoke:${{ github.run_id }}-${{ github.run_attempt }}
+      CONTAINER_NAME: handoff-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout exact PR head
+        timeout-minutes: 2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Record source and select relevant changes
+        id: changes
+        timeout-minutes: 1
+        run: |
+          LOG_DIR="$RUNNER_TEMP/handoff-container-smoke"
+          mkdir -p "$LOG_DIR"
+          printf 'source_sha=%s\nrunner_arch=%s\n' "$SOURCE_SHA" "$RUNNER_ARCH" \
+            | tee "$LOG_DIR/context.log"
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$RUNNER_ARCH" = X64
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+          # PR path filters 是累積 diff；文件回填不需重複 build。
+          if [[ "$PR_ACTION" == synchronize && "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            && git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null \
+            && git diff --quiet "$BEFORE_SHA" "$SOURCE_SHA" -- \
+              .github/workflows/handoff-container-smoke.yml .dockerignore deploy/Dockerfile src; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Only unrelated files changed; build/smoke skipped, not revalidated." \
+              | tee -a "$LOG_DIR/context.log"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "Relevant changes or no comparable previous head; run build/smoke." \
+              | tee -a "$LOG_DIR/context.log"
+          fi
+
+      - name: Build formal linux/amd64 image
+        if: steps.changes.outputs.build == 'true'
+        timeout-minutes: 12
+        run: |
+          LOG_DIR="$RUNNER_TEMP/handoff-container-smoke"
+          docker info --format '{{.ServerVersion}} {{.OSType}}/{{.Architecture}}' \
+            | tee "$LOG_DIR/docker-info.log"
+          git archive --format=tar "$SOURCE_SHA" \
+            | docker build --platform linux/amd64 --progress plain \
+              -f deploy/Dockerfile \
+              --label "org.opencontainers.image.revision=$SOURCE_SHA" \
+              -t "$IMAGE_NAME" - 2>&1 \
+            | tee "$LOG_DIR/build.log"
+          docker image inspect "$IMAGE_NAME" \
+            --format '{{json .}}' > "$LOG_DIR/image.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          image = json.loads((Path(os.environ["RUNNER_TEMP"]) /
+                              "handoff-container-smoke/image.json").read_text())
+          assert image["Os"] == "linux" and image["Architecture"] == "amd64", image["Id"]
+          assert image["Config"]["Labels"]["org.opencontainers.image.revision"] == os.environ["SOURCE_SHA"]
+          print("Built", image["Id"], "from", os.environ["SOURCE_SHA"])
+          PY
+
+      - name: Readiness and blank-input contract
+        if: steps.changes.outputs.build == 'true'
+        timeout-minutes: 4
+        run: |
+          LOG_DIR="$RUNNER_TEMP/handoff-container-smoke"
+          docker run --detach --platform linux/amd64 \
+            --name "$CONTAINER_NAME" \
+            --cidfile "$LOG_DIR/container-id" \
+            --publish 127.0.0.1::8088 \
+            --env PYTHONUNBUFFERED=1 \
+            --env FOUNDRY_PROJECT_ENDPOINT=https://offline.invalid/api/projects/offline \
+            --env MODEL_DEPLOYMENT_NAME=offline \
+            --env OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false \
+            "$IMAGE_NAME" | tee "$LOG_DIR/docker-run.log"
+          docker inspect "$CONTAINER_NAME" \
+            --format '{{json .}}' > "$LOG_DIR/container.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          container = json.loads((Path(os.environ["RUNNER_TEMP"]) /
+                                  "handoff-container-smoke/container.json").read_text())
+          assert container["Mounts"] == [], "Credentials or other mounts are not allowed."
+          ports = container["NetworkSettings"]["Ports"]["8088/tcp"]
+          assert len(ports) == 1 and ports[0]["HostIp"] == "127.0.0.1", ports
+          PY
+          ADDRESS="$(docker port "$CONTAINER_NAME" 8088/tcp)"
+          [[ "$ADDRESS" =~ ^127\.0\.0\.1:[0-9]+$ ]]
+          BASE_URL="http://$ADDRESS"
+          READY=false
+          for attempt in $(seq 1 30); do
+            if curl --silent --show-error --fail --connect-timeout 1 --max-time 2 \
+              --output "$LOG_DIR/readiness.body" --write-out '%{http_code}' \
+              "$BASE_URL/readiness" > "$LOG_DIR/readiness-http-status" \
+              2>> "$LOG_DIR/readiness-errors.log" \
+              && test "$(cat "$LOG_DIR/readiness-http-status")" = 200; then
+              READY=true
+              break
+            fi
+            sleep 2
+          done
+          test "$READY" = true
+          curl --silent --show-error --fail --connect-timeout 2 --max-time 30 \
+            --header 'Content-Type: application/json' \
+            --data '{"input":" ","stream":false}' \
+            --output "$LOG_DIR/response.json" --write-out '%{http_code}' \
+            "$BASE_URL/responses" > "$LOG_DIR/response-http-status"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          logs = Path(os.environ["RUNNER_TEMP"]) / "handoff-container-smoke"
+          assert (logs / "response-http-status").read_text() == "200"
+          response = json.loads((logs / "response.json").read_text())
+          assert response["status"] == "failed", response
+          assert response["error"]["code"] == "invalid_prompt", response
+          print("PASS: readiness and failed/invalid_prompt; no valid model prompt submitted.")
+          (logs / "smoke-result.log").write_text("PASS: readiness + failed/invalid_prompt\n")
+          PY
+
+      - name: Collect diagnostics and stop only this container
+        if: always()
+        timeout-minutes: 2
+        run: |
+          LOG_DIR="$RUNNER_TEMP/handoff-container-smoke"
+          mkdir -p "$LOG_DIR"
+          printf 'source_sha=%s\n' "$SOURCE_SHA" >> "$LOG_DIR/context.log"
+          if [[ -s "$LOG_DIR/container-id" ]]; then
+            CONTAINER_ID="$(cat "$LOG_DIR/container-id")"
+            [[ "$CONTAINER_ID" =~ ^[0-9a-f]{64}$ ]]
+            # 精確 ID 與名稱核對；不使用廣域清理。
+            MATCH="$(docker ps --all --quiet --no-trunc \
+              --filter "id=$CONTAINER_ID" --filter "name=^/$CONTAINER_NAME$")"
+            if [[ "$MATCH" == "$CONTAINER_ID" ]]; then
+              STATUS=0
+              docker logs "$CONTAINER_ID" > "$LOG_DIR/container.log" 2>&1 || STATUS=1
+              docker inspect "$CONTAINER_ID" > "$LOG_DIR/container-final.json" || STATUS=1
+              docker stop --time 20 "$CONTAINER_ID" \
+                > "$LOG_DIR/cleanup.log" 2>&1 || STATUS=1
+              docker rm "$CONTAINER_ID" >> "$LOG_DIR/cleanup.log" 2>&1 || STATUS=1
+              REMAINING="$(docker ps --all --quiet --no-trunc --filter "id=$CONTAINER_ID")"
+              test -z "$REMAINING" || STATUS=1
+              if [[ -f "$LOG_DIR/smoke-result.log" ]]; then
+                grep --fixed-strings "拒絕 Handoff 請求" "$LOG_DIR/container.log" \
+                  >> "$LOG_DIR/smoke-result.log" || STATUS=1
+              fi
+              exit "$STATUS"
+            fi
+            REMAINING="$(docker ps --all --quiet --no-trunc --filter "id=$CONTAINER_ID")"
+            test -z "$REMAINING"
+            echo "The exact smoke container is already absent." > "$LOG_DIR/cleanup.log"
+          else
+            echo "No smoke container was created." > "$LOG_DIR/cleanup.log"
+          fi
+
+      - name: Upload diagnostics on success or failure
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: handoff-container-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/handoff-container-smoke/
+          if-no-files-found: error
+          retention-days: 7
