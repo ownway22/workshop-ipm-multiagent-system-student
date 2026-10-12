@@ -209,11 +209,11 @@ A365 ImportError／exporter Bad Request 尚未解決，Tracing 不宣稱通過�
 
 ## DevUI 已知限制
 
-Native hosting 候選環境不代表本 Lab 已升級：[真正 Handoff 的純文字續接門檻未通過](native-hosting-migration.md)，
-正式與完成版仍使用原精確 lock。候選 DevUI 只查證 imports／API 相容性，
-沒有用模型重新驗收此介面；以下既有已知限制不變。
+正式 DevUI 已隨 [SDK 升級](native-hosting-migration.md) 更新至 `1.0.0b261008`，
+進入點、實體建構與 public API 的離線 regression 通過；沒有用真實模型重新驗收此介面。
+以下保留舊版已知限制，不宣稱新版已修復；native hosting 仍未接入。
 
-目前版本無法將 Handoff 狀態完整隔離在單一對話。2026-07-28 實測確認：
+舊版無法將 Handoff 狀態完整隔離在單一對話。2026-07-28 實測確認：
 
 1. **workflow 實體**：按「新對話」後，仍讀得到上一段對話的內容。
 2. **agent 實體**：第一輪交接結束後，繼續追問或開新對話都可能回 `Unexpected content type while awaiting request info responses.`

@@ -1,4 +1,87 @@
-# Handoff adapter 的 SDK 相容性準備
+# 正式 SDK 升級：保留 HandoffResponsesHost
+
+## 目前階段：正式 pins 已升級，native host 未接入
+
+2026-10-12，PR #5 已以一般 merge commit
+`f880de981017d9995845f0735e915851c1bb4e15` 合併。
+本階段從該最新 `main` 建立獨立 branch／worktree；沒有修改或刪除 #5 的 branch／worktree。
+正式 [manifest](../src/pyproject.toml) 與 [lock](../src/uv.lock) 採用 #5 已驗證的組合，
+預設仍是 [HandoffResponsesHost](../src/workflows/responses.py)，不接入 native host。
+以下是 source 的 dependency 升級，**不是 Azure 已部署、模型／Playground／Teams 已驗收**。
+
+| 套件 | 舊正式版 → 新正式版 | 必要原因 |
+| ---- | ------------------ | -------- |
+| agent-framework-core | 1.12.1 → 1.21.0 | Foundry 1.14.1 要求的最低核心 |
+| agent-framework-foundry | 1.10.3 → 1.14.1 | #5 已驗證的 Foundry client 組合 |
+| agent-framework-orchestrations | 1.0.1 → 1.3.1 | 同組合的真正 HandoffBuilder |
+| agent-framework-devui | 1.0.0b260721 → 1.0.0b261008 | 已驗證的 Lab 2 public API |
+| agent-framework-foundry-hosting | 1.0.0b260722 → 1.0.0b261008 | 同組合相依；不改 host 選擇 |
+| azure-ai-agentserver-core | 2.0.0b8 → 2.1.0 | Hosting／Responses 的最低相容需求 |
+| azure-ai-agentserver-responses | 1.0.0b9 → 2.2.0b1 | 現有 adapter 的公開 response handler API |
+| agent-framework-openai（間接） | 1.11.0 → 1.15.0 | Foundry 的最低需求 |
+| azure-ai-agentserver-invocations（間接） | 1.0.0b7 → 1.1.0 | Hosting 的最低需求，不開 Invocations |
+| msgspec（新增間接） | 無 → 0.22.0 | 新 core 必要相依 |
+| regex（新增間接） | 無 → 2026.9.29 | 新 core 必要相依 |
+
+逐項比較正式與 #5 候選 lock：除專案名稱外，**所有 resolved versions 完全一致**；
+其他原 lock 版本都保留，沒有重新選 latest／無差別 upgrade。
+Python minimum、uv、模型、prompts、拓撲、Bicep／RBAC 與 Teams 配置未改。
+部署 manifest 只更新註解中的套件版本，Responses protocol **2.0.0** 值不變。
+原 runtime 與 16 份 `src`／`solutions/lab2` Python 副本不需修改，仍完全一致。
+
+### 正式新版驗證
+
+```bash
+cd src
+uv lock --upgrade-package agent-framework-openai==1.15.0 \
+  --upgrade-package azure-ai-agentserver-invocations==1.1.0 \
+  --upgrade-package msgspec==0.22.0 --upgrade-package regex==2026.9.29
+uv sync --locked --no-dev --python 3.13
+uv sync --locked --group dev --python 3.13
+uv lock --check
+uv run --no-sync pytest -q --tb=short
+uv run --no-sync python main.py --help
+```
+
+Locked prod／dev sync、CLI 成功；Linux Python **3.13.11**／uv **0.9.25**。
+完整 regression：**45 passed、105 subtests passed**，保留原 43 tests／103 subtests，
+新增離線 main credential 選擇、DevUI 實體建構及 public `serve` signature tests。
+原測試的真正 Handoff 三輪、完整輸出、分岔、隔離、strict restore、
+降級／timeout、取消與 metadata-only diagnostics 斷言不變，沒有 skip／xfail。
+DevUI API 通過不等於真實模型下的 DevUI UX 已驗收；新版的實際對話行為仍須人工確認。
+
+新版正式 image 的 GitHub-hosted build／readiness／空白 `failed/invalid_prompt` smoke
+**待本 PR 的新 run 回填**；不引用下方 #5 舊 image 作為新版通過證據。
+現有最小權限 PR workflow 不需修改；native gate 留在隔離實驗、不混入正式 runner，
+也沒有重跑已完成的 upstream 調查。
+
+### Checkpoint 版本邊界、新 session 與 rollback
+
+離線合成 probe 使用真正 Handoff 與現有 host，先在隔離的 #5 舊正式 lock
+（core 1.12.1／orchestrations 1.0.1／Responses 1.0.0b9）建立第一輪 checkpoint，
+再以本次正式新版環境及 fresh workflow 還原、續接第二／第三輪。
+三輪皆 completed，完整專家文字／code fence 無遺失，原材料沒有重複 replay，
+原 checkpoint 檔案 bytes 不變。這是**實際限定案例的跨版本相容證據**，不是只測新 checkpoint。
+
+這不涵蓋真實 Foundry `service_session_id`、SDK 原始 provider payload、
+實驗版 ledger、所有舊 checkpoint 型別或平台 session binding。
+不保證任意舊 checkpoint 相容；不做自動轉換、清除 ID、退回較舊 checkpoint 或重開對話。
+損毀／錯誤 checkpoint 仍走既有明確失敗路徑，原 strict restore tests 保留。
+
+將來部署此 SDK 組合的第一次人工驗收**必須新 session／conversation**，
+舊對話資料保留不動，不假設既有 sandbox 會自動切到新 image。
+Rollback 應人工選擇 #5 合併版的程式／精確 lock／已驗證舊 image，
+使用新 session／conversation 再驗收；不把新版 state 自動匯回舊版，也不刪除舊資料。
+本次未部署／rollback、未變更 credentials，亦未認證 Azure／Playground／Teams／12 題，
+不能把本機 fake regression 或容器空白輸入 smoke 宣稱為模型與業務流程驗收。
+
+---
+
+## PR #5 歷史：相容性準備與 native 隔離實驗
+
+以下完整保留 #5 的查證／review／舊 image 證據，描述的是**升級前的歷史狀態**，
+不是本階段重新執行，也不是說目前正式 manifest 仍未升級。#5 已合併；
+本次新的 SDK upgrade PR 保持 Draft、不 merge。
 
 版本查證日期：2026-10-11；收斂 review：2026-10-12。
 正式 baseline：`origin/main` 的 `1e1cb78`（已合併 PR #4）。

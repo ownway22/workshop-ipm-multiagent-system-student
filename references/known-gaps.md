@@ -1,13 +1,12 @@
 # 已知限制
 
-PR #5 僅為 **Handoff adapter 的 SDK 相容性準備**，正式 pins／lock／預設 host 不變。
-以下 native 限制屬於隔離實驗，不是正式 adapter regression；
-本機兩套 adapter suites 皆通過。Docker daemon 已可用，但正式 image build 在
-`uv sync --locked --no-dev` 的 PyPI TLS handshake 失敗，image 未完成、smoke 未執行。
-這是本機結果；已授權的 [GitHub-hosted run](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38197154016)
-通過正式 `linux/amd64` build、readiness、空白輸入 `failed/invalid_prompt`、logs／清理。
-WSL／Docker 的連線差異不是根因判定或程式 regression，runner 成功也不代表本機 TLS 已修復。
-精確 head SHA／image ID 與驗收邊界見 [相容性報告](../docs/native-hosting-migration.md#github-hosted-runner-實際驗證已授權)。
+PR #5 已合併，本階段正式 pins／lock 升級為其已驗證組合，
+預設仍為 `HandoffResponsesHost`；**不是 native hosting 遷移**。
+正式新版 **45 tests、105 subtests 通過**，CLI／DevUI public API 及限定舊 SDK
+合成 checkpoint 還原通過。這不保證任意真實舊 state 相容；
+首次部署驗收必須新 session／conversation，不自動遷移或刪除舊資料。
+新版 image 仍須本階段新的 runner 證據，不能引用 #5 的舊 image；
+版本、checkpoint 與人工 Azure 未驗收邊界見 [升級報告](../docs/native-hosting-migration.md)。
 
 ## Native hosting：遷移尚未通過可行性門檻
 
@@ -31,7 +30,8 @@ WSL／Docker 的連線差異不是根因判定或程式 regression，runner 成�
 CreateResponse／input items／event 的 model → dict，以及候選移除 `atext_content()` 的
 相容性已修復；baseline 與隔離候選皆 **43 tests、103 subtests 通過**，
 包含真正 Handoff 三輪純文字、完整輸出、host 重建、分岔、原完整 regression 與 strict restore。
-正式 pins／lock／預設 host 不變，救援程式同步；**不是 native hosting 已完成**。
+本階段正式新版也保留全部原斷言並通過；預設 host 不變，救援程式同步，
+**不是 native hosting 已完成**。
 
 不同使用者重用既有 conversation ID，但沒有自己的 checkpoint 時，
 兩環境均明確拒絕：不回傳前位內容、不呼叫模型、不消耗 pending request、不改寫 checkpoint。

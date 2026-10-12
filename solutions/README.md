@@ -83,7 +83,8 @@ deploy/scripts/       azd 環境自動匯入工具
 Native hosting 的候選環境只在 [tests/native_hosting/](../tests/native_hosting/)；
 [native 可行性未通過](../docs/native-hosting-migration.md)，因此 `src/` 與 `solutions/lab2/`
 都保留 #4 的 host 行為，並同步必要的 public mapping／text builder 相容修改。
-兩套環境皆通過 regression，但正式 pins／lock／預設 host 不變。**不要**把候選 manifest／lock 或 function result 對照組
+PR #5 合併後，本階段正式 pins／lock 已採用其已驗證 SDK 組合，
+預設 host 不變，原 runtime 副本仍完全一致。**不要**把 function result 對照組
 複製成學員的 runtime；目前沒有已淘汰的正式 hosting 救援檔可移除。
 
 `solutions/lab1_prompt.md` 更嚴格：它的內容取自 `src/agents/coding.py`，

@@ -34,7 +34,8 @@ protocols:
   # ⚠️ **protocol 版本是由 `agent-framework-foundry-hosting` 套件版本決定的**，
   # 不是一個固定常數，也**不能**從別的 agent 抄。
   #
-  # 本專案釘定的 `agent-framework-foundry-hosting==1.0.0b260722` 需要 **2.0.0**。
+  # 本專案已升級至 `agent-framework-foundry-hosting==1.0.0b261008`；
+  # 現有 HandoffResponsesHost 仍使用 Responses **2.0.0**，protocol 值不變。
   # 值填錯時部署與映像拉取都會成功、`/readiness` 也回 200，直到真的送出請求才會在
   # 容器日誌看到：
   #
