@@ -4,8 +4,10 @@ PR #5 僅為 **Handoff adapter 的 SDK 相容性準備**，正式 pins／lock／
 以下 native 限制屬於隔離實驗，不是正式 adapter regression；
 本機兩套 adapter suites 皆通過。Docker daemon 已可用，但正式 image build 在
 `uv sync --locked --no-dev` 的 PyPI TLS handshake 失敗，image 未完成、smoke 未執行。
-WSL／Docker 的連線差異不是根因判定或程式 regression；實際 commands、source SHA、
-清理與待同意的 runner 方案見 [相容性報告](../docs/native-hosting-migration.md#docker-阻擋與使用者設定)。
+這是本機結果；已授權的 [GitHub-hosted run](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38197154016)
+通過正式 `linux/amd64` build、readiness、空白輸入 `failed/invalid_prompt`、logs／清理。
+WSL／Docker 的連線差異不是根因判定或程式 regression，runner 成功也不代表本機 TLS 已修復。
+精確 head SHA／image ID 與驗收邊界見 [相容性報告](../docs/native-hosting-migration.md#github-hosted-runner-實際驗證已授權)。
 
 ## Native hosting：遷移尚未通過可行性門檻
 

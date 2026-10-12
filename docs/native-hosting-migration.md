@@ -17,9 +17,10 @@ Manual permissions 不變；沒有 provision、deploy、變更 credentials、刪
 的 call count，以及所有模型完整 history 不含其他使用者材料；沒有刪除或放寬原斷言。
 正式與候選的 adapter regression 重驗皆為 **43 passed、103 subtests passed**。
 
-相容性準備的本機程式／測試條件已滿足，可供 maintainer review；
-**尚欠正式容器 build／啟動 smoke 與人工 review，保持 Draft，不宣稱完整合併驗證完成**。
-GitHub 目前沒有回報 PR checks；不把本機測試寫成 CI 綠燈。
+相容性準備的兩套 adapter regression 與 GitHub-hosted 正式容器 build／入口 smoke
+已通過；**尚待 maintainer 人工 review，保持 Draft、不 merge**。
+容器驗證的精確 source SHA／image ID／run URL 見下節；不把它寫成 Azure 授權／模型、
+Playground／Teams 或 native migration 驗收。
 下方隔離的 native gate 是未來 migration 的證據，**不是正式 adapter regression failures，
 也不是要求本 PR 強行解決的合併條件**。沒有重做既有版本調查或新增 hosting 機制。
 
@@ -81,30 +82,50 @@ docker ps -a --filter 'name=^/ipm-pr5-netcheck(-host)?-d9efd9f3$' \
 使用者已要求停止重試，正式 Dockerfile／pins／lock 不改。
 本次只更新文件，未重跑既有 SDK／native migration 調查或已完成的 regression。
 
-### GitHub-hosted runner 最小方案（尚待同意）
+### GitHub-hosted runner 實際驗證（已授權）
 
-目前只提出方案，**沒有新增 workflow、沒有觸發執行**：
+使用者已明確同意新增 workflow 與 commit／push 觸發。
+查無可重用的 repository 容器 workflow／smoke script；已有的 Copilot、Dependabot、
+Dependency Graph 是平台工作，不重複建置其中的任務。
+新增單一 [Handoff container smoke workflow](../.github/workflows/handoff-container-smoke.yml)：
 
-1. 一個 job，GitHub-hosted `ubuntu-24.04`（x64），`permissions: contents: read`，
-   有限 timeout；不使用 Azure secrets、OIDC、environment 或部署步驟。
-2. 明確 checkout 本次 PR 的 head SHA（不把 merge ref 當成 image source），
-   不保留 checkout credentials；使用相同 tracked archive、正式 Dockerfile／lock、
-   `--platform linux/amd64` 與 revision label 建 image，記錄 source SHA／image ID。
-3. 只啟動本次唯一命名的 `--rm` 容器，無 credentials mounts，
-   `127.0.0.1` published port；使用 `FOUNDRY_PROJECT_ENDPOINT=https://offline.invalid/api/projects/offline`、
-   `MODEL_DEPLOYMENT_NAME=offline` 與敏感內容 capture=false。
-4. 有限等待 `/readiness` HTTP 200；再送 `{"input":" ","stream":false}` 至 `/responses`，
-   assert HTTP 200、`status=failed`、`error.code=invalid_prompt`，不得是 `server_error`。
-   不送有效模型 prompt，不呼叫真實模型。
-5. 檢查／保存合成 startup/request logs；成功或失敗均只停止／移除本次容器，
-   不使用 `docker system prune`，不 push image／deploy。
+- `ubuntu-24.04` x64、只有 `contents: read`，`pull_request`＋相關 paths，
+  Draft 可執行，沒有 `pull_request_target`／merge／Azure／registry login／image push。
+- Checkout 明確 PR head SHA、`persist-credentials: false`；
+  官方 release tag 已查證並完整釘 SHA：
+  `actions/checkout` v7.0.1 → `3d3c42e5aac5ba805825da76410c181273ba90b1`，
+  `actions/upload-artifact` v7.0.2 → `cf430e030ddbb5b0abf93d22962f4752f3646cd9`。
+- Job timeout 25 分鐘，build／smoke／cleanup 有各自 timeout。
+  成功／失敗均收集診斷、上傳 artifact；容器先保留 logs，
+  再核對精確 ID／名稱，只 stop／rm 本次容器，沒有 prune。
+- PR path filters 是累積 diff，因此另比對 synchronize 的前一 head；
+  僅回填文件時明確 skip build／smoke，不重複建置、不宣稱該新 SHA 已重新驗證。
 
-建議同意後才加入受限的 `pull_request` workflow（僅此 PR 的相關 paths／明確批准的
-push 觸發），避免假設未在 default branch 的新 `workflow_dispatch` 可直接使用。
-**新增 workflow 與其 push 所造成的 run 都須先取得使用者同意**；不為了 CI merge 本 PR。
-Runner 成功後才補錄實際結果；不能預先保證其網路或 smoke 會通過。
-即使 smoke 通過，也不等於 Azure／Playground／Teams 授權、模型驗收，
-不表示正式 SDK 已升級或 native migration 已完成。
+2026-10-12 **[run 38197154016](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38197154016)
+成功**；build、smoke、diagnostics、cleanup、artifact steps 全部成功。
+
+| 實際證據 | 結果 |
+| -------- | ---- |
+| Checkout／image revision／被測 head SHA | `f63e33eaebe1feb8c1ddb1b307ba37e67833fb55` |
+| Image ID | `sha256:015d062134f7140265c1c1cee64cc6fd1a542003486ba0664a82b570739eeaa3` |
+| Image／原始 CMD | `linux/amd64`；`uv run --no-sync python main.py --responses --host 0.0.0.0` |
+| 正式 lock 安裝 | `uv sync --locked --no-dev`；解析 117、安裝 110 packages，Python 3.13.16／uv 0.9.25 |
+| 未升級的 SDK（build log 核對） | core 1.12.1、foundry 1.10.3、foundry-hosting b260722、agentserver core 2.0.0b8／responses 1.0.0b9 |
+| Container ports／mounts | `127.0.0.1:32768 → 8088/tcp`；mounts 為空 |
+| `GET /readiness` | HTTP 200，`{"status":"healthy"}` |
+| `POST /responses`，`{"input":" ","stream":false}` | HTTP 200；`status=failed`、`error.code=invalid_prompt`，訊息「請輸入非空白的訊息。」；不是 `server_error` |
+| Startup／request logs | 合成 offline 設定、正式 protocol、8088 listening；`拒絕 Handoff 請求` 明確出現，未送有效模型 prompt |
+| Cleanup | 僅本次 container ID 的 stop／rm 成功，精確 ID 再查為空 |
+| Diagnostics artifact | `handoff-container-smoke-38197154016-1`，ID `11723603803`；[下載頁](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38197154016/artifacts/11723603803) |
+
+Run 使用 tracked-only archive 與正式 Dockerfile／manifest／lock；合成非秘密 env、
+無 `.env`／credentials mounts。Readiness 和 response JSON 均有實際斷言，
+不是只看 HTTP 200；空白輸入在進入 workflow／model 前被 adapter 拒絕。
+Artifact 已下載核對 image metadata、JSON、啟動／請求及 cleanup logs。
+
+**本機 Docker 的 TLS build failure 仍是獨立歷史紀錄，根因未確認；GitHub runner 的成功
+不能解釋或修好該本機環境。** 本節只證明明確 head 的正式 container smoke；
+正式 SDK／runtime 不變，沒有 Azure／Playground／Teams 驗收或 native migration 完成宣稱。
 
 ## 本階段：現有 adapter 的 SDK 相容性
 
