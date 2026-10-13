@@ -46,8 +46,10 @@ uv run --no-sync python main.py --help
 ```
 
 Locked prod／dev sync、CLI 成功；Linux Python **3.13.11**／uv **0.9.25**。
-完整 regression：**46 passed、111 subtests passed**，保留升級基準的 45 tests／105 subtests，
-新增三位專家在 stream／nonstream 收到 control-only provider response 時的拒絕測試。
+完整 regression：**52 passed、117 subtests passed**，保留升級基準的 45 tests／105 subtests，
+新增三位專家 control-only 拒絕，以及 Primary 忠實呈現、來源順序、跨域串流、
+釐清後保留已完成結果與不重播舊 review 的測試。正式 runtime 模組使用專案 interpreter 的
+既有 mypy 檢查通過；沒有重新安裝工具／依賴。
 既有離線 main credential 選擇、DevUI 實體建構及 public `serve` signature tests 保留。
 原測試的真正 Handoff 三輪、完整輸出、分岔、隔離、strict restore、
 降級／timeout、取消與 metadata-only diagnostics 斷言不變，沒有 skip／xfail。
@@ -92,7 +94,20 @@ request／terminal response／parsed result；fake Primary 僅用於診斷，不
 合法 review 仍 parsed 為 `SpecialistReview` 並完整投射一次，沒有增加補正模型呼叫。
 診斷實測 1 次 Coding 邏輯呼叫／1 次 HTTP attempt、2,743 tokens；費用 unavailable。
 compute 的 idle＋本次有效 `stopped_at` 已核對，資料保留。正式新 image、
-T01 三輪、12 題與 Playground 尚待驗收；T12 歷史限制仍保留。
+使用者提供的 Playground 三輪已成功，但輸入是 1,646 字元的 raw CSV 轉義變體，
+不是 1,596 字元正式 T01。正式字元／hash 判準不改；T12 歷史限制仍保留。
+
+完整 version 3 題組觀測確認專家 schema／基本回交通過，但 Primary 曾重貼完整專家 JSON、
+改寫或漏掉嚴重度，T12 只處理 Spec 並把已要求的 Architect 子需求當作可選後續。
+checkpoint 證明重貼內容由 Primary 自己產生，不能歸咎於 host 重複投射。
+經使用者明確批准，新增公開 middleware 的忠實呈現保護，保留真實 Primary 的路由與釐清；
+只從本輪已驗證專家資料產生 Markdown，不新增模型補正、不捏造 review、不要求 Primary JSON。
+本輪已接回的結果以普通 JSON 保存在 Primary agent session state，跨域回交不遺失，
+最終呈現且沒有待釐清事項後清除；釐清暫停時保留已完成結果，新追問不重播前輪結果。
+Primary 內部模型 history 改為 `store=False`
+保持呈現與續接一致，外層 Responses 保存仍開啟；舊服務端 history 不自動轉換。
+角色定義、模型、star topology、schema／allowed checkpoint types、RBAC／credentials 不變；
+同步 `src`／`solutions/lab2`，必須使用新正式 image／新 session 再驗收，不能宣稱 version 3 已交付。
 
 ### Checkpoint 版本邊界、新 session 與 rollback
 

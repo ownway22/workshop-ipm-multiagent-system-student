@@ -225,12 +225,26 @@ middleware 補一個非文字控制 call，由 SDK 真正交回 Primary；
 此補強不增加專家的回交決策 model call；相較於提前停在專家的失敗路徑，
 會增加應有的 Primary 彙整呼叫與 Token 成本。Lab 1 的單獨 Coding 不受影響。
 
-僅 runtime specialists 的模型請求使用 `store=False`，避免程式補的控制 call
-與服務端原始 response 的工具 history 不一致。SDK 會將本機 call/result history
-保存到既有 checkpoint，下一輪還原後傳送完整上下文；Primary 的 storage 行為不變。
+四位 runtime participants 的模型請求均使用 `store=False`，避免程式補的控制 call
+或忠實呈現結果與服務端原始 response 的 history 不一致。SDK 會將本機 call/result history
+保存到既有 checkpoint，下一輪還原後傳送完整上下文；這不關閉外層 Responses 的對話保存。
 Hosted session 與 `$HOME` checkpoint 的持久化仍保留，輸入 Token 成本／快取效果可能不同。
 舊 service-managed conversation ID 不會被清除或假裝成功遷移；如不相容會明確失敗。
-部署這項政策後，請用新 session/conversation 驗證，不沿用 version 9 的既有對話。
+部署這項政策後，請用新 session/conversation 驗證，不沿用舊版本的既有對話。
+
+Primary 仍由真實模型決定路由、跨域子需求是否完成與釐清；不指定 JSON response format。
+專家回交後的最終彙整由公開 chat middleware 忠實呈現本輪有效 `SpecialistReview`：
+依實際接回順序標示來源，逐字保留摘要、發現、證據、建議、限制及原嚴重度，
+不再重貼整份專家 JSON、不採用模型另外補寫的分析。串流以公開 buffering／result hooks
+先確認正常 terminal，再同時更新可見文字與本機 history；不新增模型呼叫。
+跨域交接期間的本輪結果保存在該 agent session 的普通 JSON state，
+最終呈現且沒有待釐清事項後清除；中途詢問不丟掉已完成的專家結果。
+後續純文字追問不重新投射前輪結果。明確的「### 待釐清事項」段落保留，
+沒有合法 review 的釐清／能力界線回覆不套用彙整。原專家文字仍只投射一次。
+
+測試材料請使用 CSV 解碼後的儲存格內容或純文字 prompt，不能從 raw CSV 直接複製加倍的引號。
+T01 正式 prompt 為 1,596 字元；raw CSV 轉義版本為 1,646 字元，屬於不同輸入案例。
+Runtime 不自動解碼／改寫使用者貼上的程式碼。
 
 每輪重新建立工作流，並依使用者與 conversation 還原 checkpoint；不共用上一輪的 executor
 記憶體狀態，不同對話也不必互相排隊（同一個 conversation 的追問才會依序處理）。
