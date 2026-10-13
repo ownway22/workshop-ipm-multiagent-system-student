@@ -212,10 +212,13 @@ protocol 2.0.0、credential 選擇與部署配置不變，沒有執行新的 Azu
 本機 ASGI 的隔離與續接測試不代表 Foundry 平台授權或 Playground 已驗收。
 
 Handoff runtime 的三位專家有程式控制的 completion-return policy：
-正常回合沒有合法回交 call 時，middleware 補一個非文字控制 call，由 SDK 真正交回 Primary；
+模型請求使用 `tool_choice="none"`，保留框架注入的工具與原 strict schema，但先產出專家結果，
+避免模型只選回交工具而略過審查。正常回合沒有合法回交 call 時，
+middleware 補一個非文字控制 call，由 SDK 真正交回 Primary；
 已有 call 就不重複補，原審查文字只傳遞一次。Primary 不被強制交接，仍負責彙整與釐清。
 這與「業務審查完成」是不同的判定；需要補充材料不能被當成成功審查。
 
+只有回交 call、沒有審查結果或釐清文字的回覆會被拒絕；控制權交回不代表已有有效審查。
 外層 guard 在 stream 真正消費後仍核對回交結果。空結果、工具錯誤、特殊未完成動作、
 降級或技術失敗不會冒充 completed 的專家等待，而是走既有 host 的明確失敗路徑；
 取消不被吞掉。原 schema 不擴充，也不靠 autonomous mode 或模型重試完成回交。

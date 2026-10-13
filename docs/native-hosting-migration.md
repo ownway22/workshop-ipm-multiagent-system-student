@@ -6,7 +6,7 @@
 `f880de981017d9995845f0735e915851c1bb4e15` 合併。
 本階段從該最新 `main` 建立獨立 branch／worktree；沒有修改或刪除 #5 的 branch／worktree。
 新 [Draft PR #6](https://github.com/ownway22/workshop-ipm-multiagent-system-student/pull/6)
-尚未合併，也沒有部署。
+尚未合併；獨立測試 agent 已部署候選及診斷版本，原 agent 的版本與路由未修改。
 正式 [manifest](../src/pyproject.toml) 與 [lock](../src/uv.lock) 採用 #5 已驗證的組合，
 預設仍是 [HandoffResponsesHost](../src/workflows/responses.py)，不接入 native host。
 以下是 source 的 dependency 升級，**不是 Azure 已部署、模型／Playground／Teams 已驗收**。
@@ -27,9 +27,9 @@
 
 逐項比較正式與 #5 候選 lock：除專案名稱外，**所有 resolved versions 完全一致**；
 其他原 lock 版本都保留，沒有重新選 latest／無差別 upgrade。
-Python minimum、uv、模型、prompts、拓撲、Bicep／RBAC 與 Teams 配置未改。
+Python minimum、uv、模型、角色定義、拓撲、Bicep／RBAC 與 Teams 配置未改。
 部署 manifest 只更新註解中的套件版本，Responses protocol **2.0.0** 值不變。
-原 runtime 與 16 份 `src`／`solutions/lab2` Python 副本不需修改，仍完全一致。
+專家的 runtime completion-return policy 已依下述實測補強，`src`／`solutions/lab2` 同步修改。
 
 ### 正式新版驗證
 
@@ -46,8 +46,9 @@ uv run --no-sync python main.py --help
 ```
 
 Locked prod／dev sync、CLI 成功；Linux Python **3.13.11**／uv **0.9.25**。
-完整 regression：**45 passed、105 subtests passed**，保留原 43 tests／103 subtests，
-新增離線 main credential 選擇、DevUI 實體建構及 public `serve` signature tests。
+完整 regression：**46 passed、111 subtests passed**，保留升級基準的 45 tests／105 subtests，
+新增三位專家在 stream／nonstream 收到 control-only provider response 時的拒絕測試。
+既有離線 main credential 選擇、DevUI 實體建構及 public `serve` signature tests 保留。
 原測試的真正 Handoff 三輪、完整輸出、分岔、隔離、strict restore、
 降級／timeout、取消與 metadata-only diagnostics 斷言不變，沒有 skip／xfail。
 DevUI API 通過不等於真實模型下的 DevUI UX 已驗收；新版的實際對話行為仍須人工確認。
@@ -74,6 +75,24 @@ SDK log 的 experimental／「resilience disabled」警告是未驗收的 crash-
 最後的文件回填不更改正式 build inputs，若 workflow 明確 skip，不能當成新的 image 驗證。
 現有最小權限 PR workflow 未修改；native gate 留在隔離實驗、不混入正式 runner，
 也沒有重跑已完成的 upstream 調查。
+
+### 2026-10-13：專家結果先於回交
+
+復用已成功的 ce9 診斷 image，在獨立測試 agent 的 version 2 取得同一次 Coding
+request／terminal response／parsed result；fake Primary 僅用於診斷，不能算正式驗收。
+實際 wire 保留 strict `SpecialistReview` schema、原 instructions、完整 1,596 字元 T01
+與回交工具，但 `tool_choice=auto` 的 terminal 只有 function call、零文字、
+`finish_reason=tool_calls`、parsed value 為 `None`。這是結果未產生，不是已產生後被 host 丟失；
+此證據本身不證明 SDK regression。
+
+現在只於 specialists 的公開 chat middleware 設定 `tool_choice="none"`：
+不移除工具、不放寬 schema、不要求 Primary JSON；結果完成後仍由原 result hook 補 call，
+由 SDK 執行真正回交。runtime instructions 明示先輸出結果；control-only 回覆明確失敗。
+實際 payload 的離線 replay 確認修正前會誤回交、修正後不再觸發 Primary 彙整，
+合法 review 仍 parsed 為 `SpecialistReview` 並完整投射一次，沒有增加補正模型呼叫。
+診斷實測 1 次 Coding 邏輯呼叫／1 次 HTTP attempt、2,743 tokens；費用 unavailable。
+compute 的 idle＋本次有效 `stopped_at` 已核對，資料保留。正式新 image、
+T01 三輪、12 題與 Playground 尚待驗收；T12 歷史限制仍保留。
 
 ### Checkpoint 版本邊界、新 session 與 rollback
 

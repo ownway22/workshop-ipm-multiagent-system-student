@@ -10,6 +10,7 @@ src/.venv/
 
 # ── 機密 ──────────────────────────────────
 **/.handoff-checkpoints/
+.cache/
 # 環境設定一律由部署時注入（`deploy/agent.yaml` 的 `environment_variables`），MUST NOT 打包進映像。
 .env
 .env.*

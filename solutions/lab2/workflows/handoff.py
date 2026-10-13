@@ -291,8 +291,9 @@ def _runtime_instructions(primary_name: str) -> str:
         "\n\n## Handoff 執行期控制規則\n"
         "角色定義中的「沒有任何工具」指沒有外部查詢或執行工具；"
         "本工作流另有框架提供的內部交接控制工具。\n"
-        f"本回合控制權必須交回 {primary_name}，由協調者彙整或向使用者釐清。"
-        "程式會補上必要的回交控制 call，不是只靠 prompt 保證。\n"
+        "先依原資料契約輸出完整專家結果；回交 call 不是專家分析，不能代替結果。"
+        f"程式會在結果正常完成後呼叫內部工具，將控制權交回 {primary_name}，"
+        "由協調者彙整或向使用者釐清；不要自行呼叫交接工具。\n"
         "原審查結果只輸出一次；需要補充材料的說明不代表審查完成，"
         "不得捏造審查結果。業務與 schema 的原有限制不變。"
     )
@@ -339,7 +340,7 @@ def _check_response_complete(response: "ChatResponse | AgentResponse") -> None:
 
 
 def build_completion_return_middleware(primary_name: str):
-    """在原 chat stream 的 result hook 補控制 call，保留原 finalizer 與 hooks。"""
+    """模型先輸出結果，再於原 result hook 回交；保留工具、finalizer 與 hooks。"""
     from agent_framework import (
         ChatResponse, Content, FunctionTool, ResponseStream, chat_middleware,
     )
@@ -376,6 +377,8 @@ def build_completion_return_middleware(primary_name: str):
 
         def return_control(response: ChatResponse) -> ChatResponse:
             _check_response_complete(response)
+            if not response.text.strip():
+                raise HandoffRoutingError("專家沒有審查結果或釐清文字，不能只靠控制 call 回交。")
             calls = [
                 content for message in response.messages for content in message.contents
                 if content.type == "function_call"
@@ -388,8 +391,6 @@ def build_completion_return_middleware(primary_name: str):
                 ):
                     raise HandoffRoutingError("專家要求的工具或參數不是合法回交。")
                 return response
-            if not response.text.strip():
-                raise HandoffRoutingError("專家沒有正常文字或合法回交。")
             assistants = [message for message in response.messages if message.role == "assistant"]
             if not assistants:
                 raise HandoffRoutingError("專家正常回覆缺少 assistant 訊息。")
@@ -398,6 +399,8 @@ def build_completion_return_middleware(primary_name: str):
             ))
             return response
 
+        # 保留工具供 SDK 執行程式補的 call，但不讓模型以工具選擇略過 structured output。
+        context.options = dict(context.options or {}, tool_choice="none")
         await call_next()
         if context.stream and isinstance(context.result, ResponseStream):
             # 沿用原 stream 的 hooks；控制 call 留在同一份訊息中供本機 history 配對。

@@ -1296,6 +1296,91 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(captured.records[-1].args[0], primary_name)
                     self.assertEqual(source.clients[specialist_name].calls, 1)
                     self.assertEqual(source.clients[primary_name].calls, 2)
+                    self.assertEqual(source.clients[specialist_name].options_seen[0]["tool_choice"], "none")
+
+    async def test_http_specialist_control_only_does_not_complete_review(self):
+        for key in ("coding", "architect", "spec"):
+            for stream in (True, False):
+                with self.subTest(specialist=key, stream=stream):
+                    requests = []
+
+                    def provider(request):
+                        body = json.loads(request.content)
+                        requests.append(body)
+                        self.assertEqual(body["tool_choice"], "none")
+                        self.assertTrue(body["text"]["format"]["strict"])
+                        self.assertEqual(
+                            [tool["name"] for tool in body["tools"]],
+                            [f"handoff_to_{roles['primary'].agent_name}"],
+                        )
+                        payload = provider_responses_events((), target=roles["primary"].agent_name)
+                        events = [
+                            json.loads(line.removeprefix("data: "))
+                            for line in payload.splitlines() if line.startswith("data: ")
+                        ]
+                        events = [
+                            event for event in events
+                            if event["type"] in (
+                                "response.created", "response.in_progress", "response.completed",
+                            )
+                            or event["type"].startswith("response.function_call")
+                            or event["type"] in ("response.output_item.added", "response.output_item.done")
+                            and event["item"]["type"] == "function_call"
+                        ]
+                        for event in events:
+                            if "output_index" in event:
+                                event["output_index"] = 0
+                            if event["type"] == "response.completed":
+                                event["response"]["output"] = [
+                                    item for item in event["response"]["output"]
+                                    if item["type"] == "function_call"
+                                ]
+                        return Response(
+                            200, headers={"content-type": "text/event-stream"},
+                            text="\n\n".join(
+                                "event: " + event["type"] + "\ndata: " + json.dumps(event)
+                                for event in events
+                            ) + "\n\n",
+                        )
+
+                    async with AsyncClient(transport=MockTransport(provider)) as provider_http:
+                        async with AsyncOpenAI(
+                            api_key="offline-fixture-not-a-real-key",
+                            base_url="http://offline.invalid/v1",
+                            http_client=provider_http, max_retries=0,
+                        ) as openai_client:
+                            def client_factory(name, script):
+                                if name == roles[key].agent_name:
+                                    return OpenAIChatClient(
+                                        model="offline-responses", async_client=openai_client,
+                                    )
+                                return ScriptedHandoffClient(name, script)
+
+                            host, roles, sources = self.production_host({
+                                "primary": [(("PREFACE\n",), key)],
+                            }, suffix=f"control-only-{key}-{stream}", client_factory=client_factory)
+                            async with AsyncClient(
+                                transport=ASGITransport(app=host), base_url="http://localhost"
+                            ) as client:
+                                with self.assertLogs("workflows.responses", level="INFO") as captured:
+                                    response = await client.post(
+                                        "/responses", json={"input": "Synthetic material.", "stream": stream}
+                                    )
+                    payload = (
+                        json.loads([
+                            line.removeprefix("data: ")
+                            for line in response.text.splitlines() if line.startswith("data: {")
+                        ][-1])["response"]
+                        if stream else response.json()
+                    )
+                    self.assertEqual(payload["status"], "failed")
+                    self.assertEqual(payload["error"]["code"], "server_error")
+                    self.assertEqual(len(requests), 1)
+                    self.assertEqual(sources[0].clients[roles["primary"].agent_name].calls, 1)
+                    self.assertEqual([
+                        record.args for record in captured.records
+                        if record.msg == "Handoff transition: source=%s target=%s"
+                    ], [(roles["primary"].agent_name, roles[key].agent_name)])
 
     async def test_http_provider_responses_lifecycle(self):
         review = {
@@ -1328,6 +1413,11 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                         body = json.loads(request.content)
                         self.assertIs(body["stream"], True)
                         self.assertIs(body["store"], False)
+                        self.assertEqual(body["tool_choice"], "none")
+                        self.assertEqual(
+                            [tool["name"] for tool in body["tools"]],
+                            [f"handoff_to_{roles['primary'].agent_name}"],
+                        )
                         requests.append(body)
                         self.assertEqual(len(requests), 1)
                         return Response(
