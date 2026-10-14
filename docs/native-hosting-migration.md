@@ -46,7 +46,7 @@ uv run --no-sync python main.py --help
 ```
 
 Locked prod／dev sync、CLI 成功；Linux Python **3.13.11**／uv **0.9.25**。
-完整 regression：**52 passed、117 subtests passed**，保留升級基準的 45 tests／105 subtests，
+完整 regression：**54 passed、117 subtests passed**，保留升級基準的 45 tests／105 subtests，
 新增三位專家 control-only 拒絕，以及 Primary 忠實呈現、來源順序、跨域串流、
 釐清後保留已完成結果與不重播舊 review 的測試。正式 runtime 模組使用專案 interpreter 的
 既有 mypy 檢查通過；沒有重新安裝工具／依賴。
@@ -131,6 +131,15 @@ T12 仍只有 Spec → Primary、沒有 Architect，歷史限制明確保留，�
 因此 version 4 不是整套交付驗收完成。兩輪修正部署已用完，額外一輪需另取批准。
 已停止本次 run-owned 驗收及檢查 compute、確認 idle／有效 stopped_at，保留資料；
 費用／tokens／完整 logical calls／SDK retries unavailable，不冒充實測。
+
+使用者後續批准最多再一輪必要修正部署。新增的單次 Architect 邊界觀測採原 HTTP chunks
+透傳，原 schema／tools／middleware 不變：1 次 logical call／1 次 HTTP attempt，
+wire strict schema、stream=true、store=false，一個 terminal text part，
+terminal／chat／agent 文字均 2,362 字元、parsed 為 `SpecialistReview`，4,593 tokens。
+本次沒有重現 v4 的重複，不能宣稱已證明 SDK regression；diagnostic compute 已停止、資料保留。
+後續修正僅保守合併同次回應的完全相同合法 review，並把程式補的控制 call
+同步放入公開 stream update，不丟掉不同結果、不修改 schema。Primary 的本輪已完成來源
+提醒與能力界線明示加強；本次未啟用額外模型補正，不冒充已完成新版部署驗收。
 
 ### Checkpoint 版本邊界、新 session 與 rollback
 

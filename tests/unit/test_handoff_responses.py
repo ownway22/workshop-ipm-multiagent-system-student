@@ -47,6 +47,7 @@ from workflows.responses import HandoffRequestError, HandoffResponsesHost
 from workflows.handoff import (
     HandoffRoutingError,
     _current_reviews,
+    _collapse_identical_review,
     _render_primary_summary,
     build_checkpoint_safe_middleware,
     build_primary_summary_middleware,
@@ -1492,6 +1493,69 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Architecture finding.", summary)
         self.assertLess(summary.index(roles["spec"].agent_name), summary.index(roles["architect"].agent_name))
         self.assertEqual(sources[0].clients[roles["spec"].agent_name].calls, 0)
+
+    def test_identical_review_collapse_preserves_distinct_results_and_parsed_value(self):
+        review = SpecialistReview(
+            category="architecture", summary="Verified summary.", findings=["Exact finding."],
+            severity="HIGH", evidence=["Exact evidence."], recommendations=["Exact advice."],
+            limitations=["Exact limitation."],
+        )
+        text = review.model_dump_json()
+        for messages in (
+            [Message("assistant", [text + text])],
+            [Message("assistant", [text]), Message("assistant", [text])],
+        ):
+            response = ChatResponse(messages=messages, response_format=SpecialistReview, finish_reason="stop")
+            self.assertTrue(_collapse_identical_review(response))
+            self.assertEqual(response.text, text)
+            self.assertEqual(response.value, review)
+        distinct = review.model_copy(update={"findings": ["Different finding."]})
+        response = ChatResponse(
+            messages=[Message("assistant", [text + distinct.model_dump_json()])],
+            finish_reason="stop",
+        )
+        self.assertFalse(_collapse_identical_review(response))
+        self.assertEqual(response.text, text + distinct.model_dump_json())
+
+    async def test_completion_return_projects_synthetic_call_once_without_review_replay(self):
+        roles = build_agent_roles("wire-control-")
+        name = roles["coding"].agent_name
+        review = SpecialistReview(
+            category="code", summary="Verified summary.", findings=["Exact finding."],
+            severity="LOW", evidence=["Exact evidence."], recommendations=["Exact advice."],
+            limitations=["Exact limitation."],
+        )
+        class RawSpecialist(ChatMiddlewareLayer, BaseChatClient):
+            def _inner_get_response(self, *, messages, stream, options, **kwargs):
+                async def updates():
+                    yield ChatResponseUpdate(
+                        contents=[Content.from_text(review.model_dump_json())],
+                        role="assistant", author_name=name, message_id="review",
+                    )
+                    yield ChatResponseUpdate(role="assistant", finish_reason="stop")
+                return ResponseStream(updates(), finalizer=lambda updates: ChatResponse.from_updates(
+                    updates, output_format_type=SpecialistReview,
+                ))
+
+        client = RawSpecialist()
+        from workflows.handoff import build_completion_return_middleware, _return_description
+        primary = roles["primary"].agent_name
+        tool = FunctionTool(
+            name=f"handoff_to_{primary}", description=_return_description(primary),
+            input_model={"type": "object", "properties": {}},
+        )
+        raw = client.get_response(
+            [Message("user", ["Synthetic material."])], stream=True,
+            options={"store": False, "tools": [tool], "response_format": SpecialistReview},
+            client_kwargs={"middleware": [build_completion_return_middleware(primary)]},
+        )
+        updates = [update async for update in raw]
+        self.assertEqual("".join(update.text for update in updates), review.model_dump_json())
+        result = await raw.get_final_response()
+        self.assertEqual(result.value, review)
+        self.assertEqual(len([
+            content for update in updates for content in update.contents if content.type == "function_call"
+        ]), 1)
 
     async def test_http_specialist_control_only_does_not_complete_review(self):
         for key in ("coding", "architect", "spec"):

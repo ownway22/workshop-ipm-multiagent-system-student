@@ -310,12 +310,16 @@ def _primary_runtime_instructions() -> str:
         "使用者明確要求多類健檢且材料齊備時，必須逐次完成所有已要求的專家交接，"
         "才結束本輪；專家結果中的限制不會自動取消其他子需求。"
         "不要再問是否要做使用者已要求的另一類健檢。\n"
+        "比較規格與架構的一致性時，必須實際交給規格及架構兩位專家；"
+        "一位專家的結果不能代替另一位。若材料可做局部分析，先完成該子需求並保留限制。\n"
         "程式會依本輪合法專家結果與實際來源順序忠實呈現最終彙整；"
         "不要重貼整份 SpecialistReview JSON，也不要補寫新發現或修改嚴重度。"
         "你仍負責判斷交接、完成與釐清；需要補充材料時，"
         "請以「### 待釐清事項」段落提出一個簡短問題，該段落會保留。\n"
         "團隊職責之外只回覆能力界線與可提供的健檢材料，"
         "不要另承諾翻譯、代寄信件、撰寫新程式碼或其他代做服務。"
+        "翻成日文或撰寫轉寄草稿不是規格健檢；即使不需要工具，也必須拒絕，"
+        "不能在拒絕後又說可以翻譯或提供草稿。"
     )
 
 
@@ -422,7 +426,14 @@ def build_primary_summary_middleware(primary_name: str, specialist_names: Mappin
         instructions = (context.options or {}).get("instructions") or ""
         if not isinstance(instructions, str):
             raise HandoffRoutingError("Primary instructions 必須是文字。")
-        context.options = dict(context.options or {}, instructions=instructions + _primary_runtime_instructions())
+        completed = (
+            "\n本輪已完成的專家只有：" + "、".join(source for source, _ in reviews)
+            + "。未列出的專家尚未執行；逐一核對使用者已要求的子需求，不要把未完成需求改成可選服務。"
+            if reviews else ""
+        )
+        context.options = dict(
+            context.options or {}, instructions=instructions + _primary_runtime_instructions() + completed
+        )
         await call_next()
         if not reviews:
             return
@@ -536,6 +547,42 @@ def _empty_arguments(arguments: object) -> bool:
     return isinstance(arguments, Mapping) and not arguments
 
 
+def _collapse_identical_review(response: "ChatResponse") -> bool:
+    text = response.text
+    decoder = json.JSONDecoder()
+    offset = 0
+    values = []
+    slices = []
+    while offset < len(text):
+        while offset < len(text) and text[offset].isspace():
+            offset += 1
+        if offset == len(text):
+            break
+        try:
+            payload, end = decoder.raw_decode(text, offset)
+            value = SpecialistReview.model_validate(payload)
+        except (json.JSONDecodeError, ValidationError):
+            return False
+        values.append(value)
+        slices.append(text[offset:end])
+        offset = end
+    if len(values) < 2 or any(value != values[0] for value in values[1:]):
+        return False
+    assistants = [message for message in response.messages if message.role == "assistant"]
+    if not assistants:
+        raise HandoffRoutingError("重複專家結果缺少 assistant 訊息。")
+    response.messages = [copy.copy(message) for message in response.messages]
+    for message in response.messages:
+        if message.role == "assistant":
+            message.contents = [content for content in message.contents if content.type != "text"]
+    from agent_framework import Content
+    first = next(message for message in response.messages if message.role == "assistant")
+    first.contents.insert(0, Content.from_text(slices[0]))
+    response.additional_properties["handoff_identical_review_collapsed"] = True
+    logger.warning("已合併同一次回應的相同合法 review：copies=%s", len(values))
+    return True
+
+
 def _check_response_actions(response: "ChatResponse | AgentResponse | AgentResponseUpdate") -> None:
     from agent_framework import AgentResponseUpdate
 
@@ -603,6 +650,7 @@ def build_completion_return_middleware(primary_name: str):
 
         def return_control(response: ChatResponse) -> ChatResponse:
             _check_response_complete(response)
+            _collapse_identical_review(response)
             if not response.text.strip():
                 raise HandoffRoutingError("專家沒有審查結果或釐清文字，不能只靠控制 call 回交。")
             calls = [
@@ -629,7 +677,48 @@ def build_completion_return_middleware(primary_name: str):
         context.options = dict(context.options or {}, tool_choice="none")
         await call_next()
         if context.stream and isinstance(context.result, ResponseStream):
-            # 沿用原 stream 的 hooks；控制 call 留在同一份訊息中供本機 history 配對。
+            raw_updates: list[ChatResponseUpdate] = []
+
+            def capture(update: "ChatResponseUpdate") -> "ChatResponseUpdate":
+                raw_updates.append(update)
+                return update
+
+            def project(response: "ChatResponse") -> Sequence["ChatResponseUpdate"]:
+                collapsed = response.additional_properties.get("handoff_identical_review_collapsed")
+                updates = []
+                emitted = False
+                for original in raw_updates:
+                    update = copy.copy(original)
+                    if collapsed:
+                        update.contents = [content for content in original.contents if content.type != "text"]
+                        if not emitted and any(content.type == "text" for content in original.contents):
+                            update.contents.insert(0, Content.from_text(response.text))
+                            emitted = True
+                    updates.append(update)
+                existing = {
+                    content.call_id for update in updates for content in update.contents
+                    if content.type == "function_call"
+                }
+                missing = [
+                    content for message in response.messages for content in message.contents
+                    if content.type == "function_call" and content.call_id not in existing
+                ]
+                if missing:
+                    index = next(
+                        (index for index, update in enumerate(updates) if update.finish_reason is not None),
+                        len(updates),
+                    )
+                    last = next(message for message in reversed(response.messages) if message.role == "assistant")
+                    updates.insert(index, ChatResponseUpdate(
+                        contents=missing, role="assistant", author_name=last.author_name,
+                        message_id=last.message_id, response_id=response.response_id,
+                    ))
+                return updates
+
+            from agent_framework import ChatResponseUpdate
+            context.stream_buffer_updates = True
+            context.stream_transform_hooks.append(capture)
+            context.stream_result_to_updates = project
             context.stream_result_hooks.insert(0, return_control)
         elif isinstance(context.result, ChatResponse):
             context.result = return_control(context.result)

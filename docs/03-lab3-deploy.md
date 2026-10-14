@@ -218,6 +218,10 @@ middleware 補一個非文字控制 call，由 SDK 真正交回 Primary；
 已有 call 就不重複補，原審查文字只傳遞一次。Primary 不被強制交接，仍負責彙整與釐清。
 這與「業務審查完成」是不同的判定；需要補充材料不能被當成成功審查。
 
+模型正常回覆後補的控制 call 同時存在於 terminal 與公開 stream update，保持 SDK 看到的
+控制訊號一致。若同一次專家回應包含多份完全相同、逐一通過原 schema 的 review，
+只保留原第一份文字；不同結果不合併、不選一份丟掉。原 finalizer／hooks／parsed value 保留。
+
 只有回交 call、沒有審查結果或釐清文字的回覆會被拒絕；控制權交回不代表已有有效審查。
 外層 guard 在 stream 真正消費後仍核對回交結果。空結果、工具錯誤、特殊未完成動作、
 降級或技術失敗不會冒充 completed 的專家等待，而是走既有 host 的明確失敗路徑；
