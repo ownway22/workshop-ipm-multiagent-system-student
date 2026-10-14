@@ -10,25 +10,7 @@
 
 ---
 
-## 目前現況與本 Lab 的目標
-
-截至 **2026-10-14**，[PR #6](https://github.com/ownway22/workshop-ipm-multiagent-system-student/pull/6)
-已合併至 `main`，merge commit 為 `80d5107777890323ca0d60d5ad573524baa725ae`。
-這是正式 SDK 升級及既有 runtime 補強，**不是 native hosting migration**：
-
-- 仍使用 [HandoffResponsesHost](../src/workflows/responses.py) 與 Responses **2.0.0**。
-- 版本以 [pyproject.toml](../src/pyproject.toml)／[uv.lock](../src/uv.lock) 為準，不追最新版本。
-- [main.py](../src/main.py) 的 credential 選擇、Bicep／RBAC 與部署配置未因 #6 改變。
-- 新 image 已在獨立測試 agent **`qvn-ipm-review-sdk6-validation` 的 regular version 6** 部署；
-  **不是原 `qvn-ipm-review` 的 version 6**。原 agent 的 active／latest 路由沒有隨 merge 切換。
-
-合併門檻是使用者接受限制後的「指定 T01 流程」，不是完整 12 題或 Lab 2 → Lab 3 → Lab 4
-全鏈路通過。已驗證範圍與限制見[目前已驗證範圍](#目前已驗證範圍)，原始日期、
-FAIL／skip 與 image 證據保留於[SDK 升級紀錄](native-hosting-migration.md)及
-[#7](https://github.com/ownway22/workshop-ipm-multiagent-system-student/issues/7)。
-本頁的日期不是一次新的 Azure 狀態查詢；開發者仍須核對自己的實際部署目標。
-
-本 Lab 的完整課程目標仍是：
+本 Lab 的課程目標：
 
 1. 將本機四代理系統部署成可呼叫的 hosted agent。
 2. 在 Playground 與 CLI 觀察正確交接及純文字多輪續接。
@@ -44,19 +26,6 @@ FAIL／skip 與 image 證據保留於[SDK 升級紀錄](native-hosting-migration
 | Agent version | 某個 agent 的版本定義 | **專案＋agent 名稱＋version**，以及定義中的 image |
 | Endpoint routing | 新請求如何選版本 | 該 agent endpoint 的 version selector；不要把 `latest` 當授權 |
 | Session／conversation | compute／檔案與對話 lineage | Session ID、實際 `version_indicator`、Conversation ID 或 response chain |
-
-**Merge 不會替你 build／deploy 或切換路由。** 建立新版本也不代表既有 session 已執行它；
-既有 session 有自己的版本 binding，新版驗收需新 session／conversation。
-`version 6` 必須連同 agent 名稱閱讀，不能跨 agent 比較。
-
-```bash
-# 起始目錄：repository 根目錄；僅查看 source，不切換或清除工作區
-git status --short
-git rev-parse HEAD
-```
-
-先保存 source SHA 與未提交修改。若改版後有文件專用 commit，須確認 build inputs 是否相同，
-不能把另一個 SHA 的綠燈直接稱為本次新 image 已測過。
 
 ## 步驟一：看懂三個部署檔與目標
 
