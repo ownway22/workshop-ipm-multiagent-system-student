@@ -141,6 +141,35 @@ terminal／chat／agent 文字均 2,362 字元、parsed 為 `SpecialistReview`�
 同步放入公開 stream update，不丟掉不同結果、不修改 schema。Primary 的本輪已完成來源
 提醒與能力界線明示加強；本次未啟用額外模型補正，不冒充已完成新版部署驗收。
 
+### 2026-10-14：version 6 的使用者指定驗收範圍
+
+Source `752699bfde0fb1b5ca95bad5e86e8ff5683723b1` 已 push；
+[CI 38502942437](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38502942437)
+確實執行修改後 build／smoke 並成功。ACR ced 成功，image
+`sha256:21382f8fb6b738bc07647496686561c170151363483f307086487dca14f26677`，
+獨立測試 agent 的 regular version 6 active；版本 5 是單次診斷，不是交付驗收版本。
+完整 regression 54 tests／117 subtests 與 runtime mypy（含 untyped callback bodies）通過。
+
+使用者明確要求新 image 跳過 T03／T10／T12。三題標為「依使用者指示未重測」，
+保留 version 4 已觀測問題與 T12 歷史限制，不標 PASS，不另設同材料替代測試。
+version 6 實際執行其餘九題 T01／T02／T04／T05／T06／T07／T08／T09／T11，
+全部通過實際 routing／schema／review 一次投射／全欄位與嚴重度忠實呈現；
+T07／T08 單一材料釐清與 T09 能力界線另經語意核對。
+T11 按原題獨立驗證 code → architecture 的逐次交接，不算 T03 的替代驗收。
+同一 canonical T01 對話的兩次純文字追問亦完成，原 HIGH／來源保留、沒有重播整份 review。
+已確認停止這些 run-owned compute，保留資料；費用／tokens／SDK retries unavailable。
+
+使用者後續將最終驗收明確收斂為 T01，不再執行其他題目的新請求。
+version 6 真實 Playground 的指定流程已由 Session ID／畫面及 strict checkpoint 核對：
+首輪完整、有效 Coding review 一份，忠實呈現全欄位；兩次指定純文字追問保留 HIGH／來源，
+沒有重貼整份 review，等待來源均為 Primary。該 session 共有五個使用者輸入，
+指定流程在第 1／4／5 輪；第 2／3 輪是額外自由詢問，不能假裝只有三個輸入。
+其中一個額外詢問只保存了短回覆、未進一步診斷，不把所有任意追問都稱為成功。
+GUI 首輪仍是 1,646 字元 raw CSV 變體，canonical 1,596 字元的 API 三輪另通過，
+不混稱 canonical GUI；原始使用者材料沒有自動修改。GUI 檢查 compute 已 stop、
+核對 idle／有效 stopped_at、保留資料。本次依最新指定範圍完成 T01，不宣稱 12 題全 PASS。
+原 agent 路由切換仍需另行批准，#6 保持 Draft、不 merge，不接入 native host。
+
 ### Checkpoint 版本邊界、新 session 與 rollback
 
 離線合成 probe 使用真正 Handoff 與現有 host，先在隔離的 #5 舊正式 lock
