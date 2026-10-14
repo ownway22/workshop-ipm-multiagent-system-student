@@ -26,7 +26,8 @@ flowchart LR
 ```
 
 **定義檔是唯一事實來源。** `src/agents/` 的內容同時餵給持久化 agent 與執行期參與者，
-兩邊不會分歧。
+角色定義不另抄一份；Handoff runtime 另外加上交接／忠實呈現保護，
+不表示持久化角色與 runtime 的 middleware／模型 history 選擇完全相同。
 
 ---
 
@@ -86,7 +87,8 @@ solutions/           備援         各關完成版（救援用）
 | `FOUNDRY_PROJECT_ENDPOINT` | Foundry 專案端點 | portal → 你的專案 → 首頁 → 複製「專案端點」                        |
 | `MODEL_DEPLOYMENT_NAME`    | 模型部署名稱     | portal → 你的專案 → Deployments → 複製「部署名稱」（不是模型型號） |
 
-切換環境**只需要改 `.env`**，程式碼與講義都不用動。
+本機目標由 `.env` 載入；Azure 部署另使用 azd environment。
+修改 `.env` 不會自動更新已部署 agent、版本或路由，部署前須重新核對並匯入。
 
 ---
 
@@ -161,18 +163,29 @@ asyncio.run(main())
 
 ## 部署
 
+**截至 2026-10-14**，[PR #6](https://github.com/ownway22/workshop-ipm-multiagent-system-student/pull/6)
+已合併，是 SDK 升級與既有 runtime 補強；仍使用 HandoffResponsesHost／Responses 2.0.0。
+新 image 只在獨立 `qvn-ipm-review-sdk6-validation` 的 regular version 6 受測，
+不是原 `qvn-ipm-review` 的 version 6，原 agent active／latest 路由未隨 merge 切換。
+
+下列是**首次部署到已獲准目標**的入口，不是共用環境的無條件升級命令。
+新增 azd environment 不等於隔離 project／agent；共用目標及路由影響先取得授權。
+
 ```bash
+# 起始目錄：repository 根目錄
 cd deploy
 azd env new ipm-workshop
-uv run --project ../src python scripts/configure_azd_env.py
+uv run --project ../src --locked python scripts/configure_azd_env.py
 azd provision
 azd deploy
-azd ai agent show
+azd ai agent show --output json
 ```
 
 匯入工具會從已驗證的 `src/.env` 取得專案端點與模型部署名稱，再透過目前的 Azure CLI 登入自動查出訂閱、租戶、資源群組、區域、Foundry 帳戶、專案名稱及 ARM ID；不需回 portal 手動抄值。
 
-完整步驟與常見失敗見 [Lab 3](docs/03-lab3-deploy.md)。
+既有升級先選取正確 environment、確認 ACR／授權接線，不能盲目重跑 provision。
+Source／image／版本／路由／session 核對、新對話、T01 三輪與停止 compute 的操作，
+見 [Lab 3](docs/03-lab3-deploy.md)；active／readiness 200 不代表新版實際驗收成功。
 
 基礎設施刻意極小：只建立一個 Container Registry 與必要授權。
 **不會**佈建 Foundry 專案或模型部署——那是你的既有資產。
@@ -212,8 +225,9 @@ Container Registry 與 Bot Service 要另外處理，見 [收尾與清理](docs/
 | 找不到 `qvn-coding-agent`         | `.env` 指向的專案與 portal 上的不同；比對錯誤訊息裡的 agent 清單 |
 | DevUI 顯示 400 Bad Request        | 改用 `uv run python main.py --forward`                           |
 | 部署後 `azd ai agent show` 回 404 | `azure.yaml` 的服務名稱必須等於 `agent.yaml` 的 `name`           |
-| 休息後第一則訊息很慢              | 閒置 15 分鐘被回收，冷啟動中；不是壞掉                           |
-| 改版後行為還是舊的                | `azd ai agent sessions delete <id>`；只開新對話不夠              |
+| 休息後第一則訊息很慢              | 核對本次 session／閒置設定與 console，可能是冷啟動；不要直接重 deploy |
+| 改版後行為還是舊的                | 核對 image／版本與 session binding；新建 session／conversation，不以刪除舊資料作預設 |
+| 找不到 traces／exporter Bad Request | Telemetry 接線仍有已知問題；分開確認，不能直接當 Handoff 根因 |
 
 環境本身修不好時走 [觀摩路徑](docs/06-fallback.md)。
 
@@ -223,17 +237,25 @@ Container Registry 與 Bot Service 要另外處理，見 [收尾與清理](docs/
 
 ### 正式 SDK 升級，保留既有 Handoff host
 
-PR #5 已合併。本階段正式採用其已驗證組合：core **1.21.0**、foundry **1.14.1**、
+PR #5／#6 均已合併，精確版本以 [pyproject.toml](src/pyproject.toml)／[uv.lock](src/uv.lock) 為準：
+core **1.21.0**、foundry **1.14.1**、
 orchestrations **1.3.1**、DevUI／foundry-hosting **1.0.0b261008**、
 agentserver core **2.1.0**／Responses **2.2.0b1**，其他非必要相依不升級。
 預設仍為 `HandoffResponsesHost`，與救援程式一致；新版正式環境
-**45 tests、105 subtests 通過**，沒有部署 Azure 或完成 end-to-end 驗收。
+**54 tests、117 subtests 通過**。Source／image 已部署到獨立測試 agent，
+合併門檻是接受限制後的「指定 T01 流程」，**不是完整 12 題或 Lab 2 → Lab 3 → Lab 4 全鏈路通過**。
 
-[新版正式 image run](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38206422208)
-已通過 `linux/amd64` build、readiness、空白 `failed/invalid_prompt`、logs 與清理，
-受測 SHA 為 `5c0f935093813b336cebddfd9c53ffa62c70f10e`，不是沿用 #5 舊 smoke。
+[實際 source build／smoke run](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38502942437)
+通過，受測 runtime source 為 `752699b`，不是文件回填的 skipped build。
 首次部署驗收使用新 session／conversation；舊 checkpoint 僅有合成案例相容證據，
 不做自動遷移或刪除。
+
+Canonical T01 的 1,596 字元 API 三輪通過；GUI 指定流程使用 1,646 字元 raw CSV 變體，
+兩者不混稱同一輸入的 API／GUI 驗收。Canonical GUI 證據與額外自由詢問短回覆由
+[#7](https://github.com/ownway22/workshop-ipm-multiagent-system-student/issues/7) 追蹤。
+新 image T03／T10／T12 未重測，T12 漏 Architect 歷史限制與 telemetry 問題保留，
+不宣稱任意追問或所有題目通過。操作與驗收範圍以 [Lab 3](docs/03-lab3-deploy.md) 為入口，
+完整日期／FAIL／skip 證據見 [SDK 升級紀錄](docs/native-hosting-migration.md)。
 
 Native 純文字續接能力與官方線性 lineage／既有分岔契約是**獨立 migration blockers**，
 不是正式 adapter 的 regression failures，也不在本次 SDK 升級的解決範圍。
@@ -242,7 +264,8 @@ Native 純文字續接能力與官方線性 lineage／既有分岔契約是**獨
 
 所有相依都**釘死版本**。升級任一 `agent-framework` 套件時，
 **必須**重跑 Lab 2 → Lab 3 → Lab 4 全鏈路——
-`agent-framework-foundry-hosting` 的版本會決定 `deploy/agent.yaml` 的 protocol 版本號。
+套件、目前使用的 host 與 `deploy/agent.yaml` protocol 必須一起核對，
+不能假設升套件或 merge 就自動切換託管協定、路由或既有 session。
 
 ### 成熟度：這條鏈路不是每一層都是穩定版
 

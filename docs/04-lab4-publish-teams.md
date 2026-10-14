@@ -1,6 +1,7 @@
 # Lab 4：發布到 Teams
 
-**前置條件**：[Lab 3](03-lab3-deploy.md) 已完成，hosted agent 狀態為 `active`。
+**前置條件**：[Lab 3](03-lab3-deploy.md) 在你的發布目標完成實際版本／session 與對話驗收，
+不只 hosted agent 狀態 `active`。
 **完成條件**：在 Teams 的「Your agents」中找到 agent，並完成一輪交接對話。
 
 ---
@@ -38,7 +39,10 @@ cd deploy
 azd ai agent show
 ```
 
-`status` 必須是 `active`。若不是，回到 [Lab 3 步驟五](03-lab3-deploy.md#步驟五輪詢到-active)。
+`status` 必須是 `active`，還要核對實際 image／版本及 endpoint routing。
+若不是預期目標，回到 [Lab 3 步驟五](03-lab3-deploy.md#步驟五輪詢到-active)。
+PR #6 的獨立測試 agent regular version 6 沒有把原 `qvn-ipm-review` 路由切換，
+也沒有完成 Teams 驗收；不能直接把合併或其 T01 成功當作本 Lab 發布已通過。
 
 ---
 
@@ -123,8 +127,9 @@ result = eval(request.args.get("expr"))
 
 ## 1:1 對話與 session
 
-本次 [native hosting 可行性驗證未通過](native-hosting-migration.md)，沒有改動 Teams 發布配置，
-也沒有執行 Azure／Teams 驗收。正式 SDK 升級仍保留既有 host；
+歷史 [native hosting 可行性驗證未通過](native-hosting-migration.md)，沒有改動 Teams 發布配置。
+PR #6 已合併並在獨立 agent 完成有限 Azure／Playground 驗證，但沒有完成 Teams 或全鏈路驗收。
+正式 SDK 升級仍保留既有 HandoffResponsesHost；
 第一次部署驗收使用新 session／conversation，人工核對純文字多輪、
 session 閒置回收後續接、使用者隔離與完整專家輸出，不能只憑本機 HTTP 200 判定通過。
 
@@ -133,8 +138,8 @@ Teams 端的 session 邊界對應 **Teams 原生的對話識別碼**：
 - 你和 agent 的 1:1 對話串 → 一個 session
 - 你同事和同一個 agent 的對話 → 另一個 session，內容互不可見
 
-所以你昨天在同一個對話串貼的程式碼，今天問「剛剛那段有什麼問題」它記得；
-但你同事問一樣的話，它完全不知道你貼過什麼。
+這是預期的對話／隔離邊界，仍須在實際 Teams channel 驗證；#6 的 hosted API／GUI 證據
+不保證昨天的 Teams 對話一定能續接，也不取代跨使用者的平台授權隔離驗收。
 
 ---
 
@@ -145,9 +150,9 @@ Teams 端的 session 邊界對應 **Teams 原生的對話識別碼**：
 | 驗證錯誤，指向 Developer name                  | 超過 32 字元                                            | 縮短                                                            |
 | `403 AuthorizationFailed on botServices/write` | 缺 `Azure Bot Service Contributor Role`（資源群組範圍） | 請訂閱管理員在**資源群組**上指派；訂閱 Owner **不包含**這個角色 |
 | 發布成功但 Teams 裡找不到                      | Teams 帳號與 Azure 訂閱不同租戶                         | 用同租戶的帳號登入 Teams                                        |
-| 第一則訊息等很久                               | 閒置超過 15 分鐘被回收，冷啟動中                        | 等一下就好，不是壞掉                                            |
-| 完全沒有回應                                   | 先看 traces 判斷請求有沒有抵達                          | 見 [Lab 3 步驟八](03-lab3-deploy.md#步驟八看-traces)            |
-| 回應內容像是舊版本                             | 舊 session 綁在舊 agent 版本                            | `azd ai agent sessions delete <id>`；只開新對話不夠             |
+| 第一則訊息等很久                               | 可能依該版本閒置設定回收而冷啟動                        | 核對 session／console 狀態，不直接重 deploy                      |
+| 完全沒有回應                                   | 核對本次請求與 console，traces 可能尚未接線              | 見 [Lab 3 步驟八](03-lab3-deploy.md#步驟八console-logs-與-traces) |
+| 回應內容像是舊版本                             | 先核對 image／版本、路由及實際 session binding          | 新建已確認版本的 session／conversation，保留舊資料，勿以刪除作預設 |
 | 在頻道 `@` 它沒反應                            | **不支援**頻道提及                                      | 改用 1:1 私訊                                                   |
 
 ---

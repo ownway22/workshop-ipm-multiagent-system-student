@@ -102,7 +102,9 @@ uv run python main.py --forward
 uv run python -c "from fixtures.test_items import TEST_ITEMS, render_prompt; print(render_prompt(TEST_ITEMS[0]))"
 ```
 
-或直接開 `src/fixtures/materials/test_items.csv`——十二題的完整提示（含已內嵌的材料）都在「提示」欄，選取儲存格複製即可貼進 DevUI。
+或用試算表開 `src/fixtures/materials/test_items.csv`——十二題的完整提示都在「提示」欄，
+複製已解碼的儲存格。不要從 raw CSV 原文複製加倍引號；canonical T01 是 1,596 字元，
+轉義原文是不同的 1,646 字元輸入，詳見 [Lab 3 最小示範](03-lab3-deploy.md#步驟六playground-的-canonical-t01-最小示範)。
 
 依序送出，每題觀察三件事：**交給了誰**、**問了什麼**、**有沒有跳過 Primary**。
 
@@ -160,16 +162,17 @@ Handoff 的實作機制**就是**注入交接工具——框架以「呼叫一�
 相較於提前停在專家的失敗路徑，會多出原本就應有的 Primary 彙整呼叫與 Token 成本。
 Lab 1 單獨 Coding 的共用 instructions、schema 與行為不變，只有 Handoff runtime 有此補強。
 
-程式補的控制 call 不存在於模型服務端的原始 response，因此只有 runtime specialists
-設定 `store=False`：模型 history 由 SDK 本機 provider 保存、載入，並隨既有 checkpoint
-持久化，包含配對的工具 call/result。Primary 保留原有服務端 history 行為。
+PR #6 合併後，四位 runtime participants 均設定內部模型 `store=False`：
+模型 history 由 SDK 本機 provider 保存、載入，並隨既有 checkpoint 持久化，
+包含配對的控制 call/result 與 Primary 忠實呈現結果；外層 Responses 保存仍保留。
 這不表示 Hosted session 或 checkpoint 不再持久化；後續專家回合會傳送完整本機上下文，
 輸入 Token 成本／快取效果可能不同。已有 service-managed conversation ID 不能安全自動
 遷移，程式會明確失敗，不清除 ID 或丟棄 history；新版驗證應建立新 session/conversation。
 
-### 本 hotfix 的驗證邊界與已知限制
+### 歷史 hotfix 的驗證邊界與已知限制
 
-本次短期 hotfix 的程式與測試收斂至歷史遠端驗證的 version 11／commit `6dea353`：
+以下是 PR #4 的歷史狀態，不是 #6 合併後 runtime 仍停在舊版本。
+該次短期 hotfix 的程式與測試收斂至歷史遠端驗證的 version 11／commit `6dea353`：
 保留 credential、Responses 純文字續接、checkpoint／隔離及專家回交、stream finalization 修正。
 後續 outcome／需求 ledger、Primary planning／storage 改變、ledger restore validator 與大型
 診斷以新的 forward revert 撤回，不改寫原作者或實驗 commit 歷史。
@@ -183,7 +186,9 @@ Primary 仍負責彙整與下一段路由；本 hotfix 不保證所有跨領域�
 原 12 題與完整 workshop 驗收標準不變，這不是全部 Playground 驗收通過。
 A365 ImportError／exporter Bad Request 尚未解決，Tracing 不宣稱通過；
 沒有直接因果證據，不拿 telemetry 錯誤解釋 T12。
-後續另開 SDK／hosting 升級工作並保留 T12 regression；
+後續 SDK 升級已由 #6 合併，仍不是 native hosting 遷移，完整鏈路未全部驗收；
+本機 DevUI 多輪／新對話限制不因獨立 hosted agent 的 T01 成功自動解決。
+保留 T12 regression，現行部署與範圍見 [Lab 3](03-lab3-deploy.md#目前已驗證範圍)；
 目前沒有證據證明舊 SDK 無法克服此限制，也不承諾升級必然修好。
 
 ---

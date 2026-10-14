@@ -1,15 +1,20 @@
 # 正式 SDK 升級：保留 HandoffResponsesHost
 
-## 目前階段：正式 pins 已升級，native host 未接入
+## 目前階段：#6 已合併，正式 SDK 與既有 runtime 補強，native host 未接入
 
-2026-10-12，PR #5 已以一般 merge commit
-`f880de981017d9995845f0735e915851c1bb4e15` 合併。
-本階段從該最新 `main` 建立獨立 branch／worktree；沒有修改或刪除 #5 的 branch／worktree。
-新 [Draft PR #6](https://github.com/ownway22/workshop-ipm-multiagent-system-student/pull/6)
-尚未合併；獨立測試 agent 已部署候選及診斷版本，原 agent 的版本與路由未修改。
+2026-10-14，[PR #6](https://github.com/ownway22/workshop-ipm-multiagent-system-student/pull/6)
+以一般 merge commit `80d5107777890323ca0d60d5ad573524baa725ae` 合併。
+使用者接受指定 T01 流程與已記錄限制作為門檻；不代表完整 12 題或 Lab 2 → Lab 3 → Lab 4 通過。
+獨立測試 agent `qvn-ipm-review-sdk6-validation` 的 regular version 6 已部署／有限驗收，
+不是原 `qvn-ipm-review` 的 version 6；原 agent 的 active／latest 路由未因 merge 切換。
 正式 [manifest](../src/pyproject.toml) 與 [lock](../src/uv.lock) 採用 #5 已驗證的組合，
 預設仍是 [HandoffResponsesHost](../src/workflows/responses.py)，不接入 native host。
-以下是 source 的 dependency 升級，**不是 Azure 已部署、模型／Playground／Teams 已驗收**。
+目前操作入口以 [Lab 3](03-lab3-deploy.md) 為準。本頁保存歷史技術／驗收證據，不是重新部署命令集；
+下方「尚未部署／保持 Draft」等敘述限於各自日期的階段，不套用到目前合併狀態。
+Canonical 1,596 字元 T01 API 與 1,646 字元 GUI CSV 變體分別記錄；
+canonical GUI 證據與額外自由詢問短回覆由
+[#7](https://github.com/ownway22/workshop-ipm-multiagent-system-student/issues/7) 追蹤（2026-10-14 確認 open）。
+新 image T03／T10／T12 未重測，T12 歷史漏 Architect 保留；telemetry 問題未因 merge 解決。
 
 | 套件 | 舊正式版 → 新正式版 | 必要原因 |
 | ---- | ------------------ | -------- |
@@ -31,7 +36,9 @@ Python minimum、uv、模型、角色定義、拓撲、Bicep／RBAC 與 Teams �
 部署 manifest 只更新註解中的套件版本，Responses protocol **2.0.0** 值不變。
 專家的 runtime completion-return policy 已依下述實測補強，`src`／`solutions/lab2` 同步修改。
 
-### 正式新版驗證
+### 正式新版驗證紀錄
+
+以下是升級時已執行的歷史命令，不是目前 Lab 3 的安裝／部署步驟；不要為重跑講義再升依賴。
 
 ```bash
 cd src
@@ -55,7 +62,7 @@ Locked prod／dev sync、CLI 成功；Linux Python **3.13.11**／uv **0.9.25**�
 降級／timeout、取消與 metadata-only diagnostics 斷言不變，沒有 skip／xfail。
 DevUI API 通過不等於真實模型下的 DevUI UX 已驗收；新版的實際對話行為仍須人工確認。
 
-新版正式 image 的
+2026-10-12 初始新版 image 的歷史 smoke：
 **[GitHub-hosted run 38206422208](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38206422208)
 全部成功**，不是 #5 的舊 image／skipped run：
 
@@ -73,7 +80,8 @@ DevUI API 通過不等於真實模型下的 DevUI UX 已驗收；新版的實際
 
 SDK log 的 experimental／「resilience disabled」警告是未驗收的 crash-recovery 邊界，
 不把成功 smoke 宣稱為 process hard-kill 後的可恢復性保證。
-本次沒有送有效模型 prompt、registry login／image push、Azure secrets 或部署。
+這個初始 CI smoke 沒有送有效模型 prompt、registry login／image push、Azure secrets 或部署；
+之後 #6 的獨立 agent 部署／驗收另記於下面日期段落。
 最後的文件回填不更改正式 build inputs，若 workflow 明確 skip，不能當成新的 image 驗證。
 現有最小權限 PR workflow 未修改；native gate 留在隔離實驗、不混入正式 runner，
 也沒有重跑已完成的 upstream 調查。
@@ -187,8 +195,9 @@ GUI 首輪仍是 1,646 字元 raw CSV 變體，canonical 1,596 字元的 API 三
 舊對話資料保留不動，不假設既有 sandbox 會自動切到新 image。
 Rollback 應人工選擇 #5 合併版的程式／精確 lock／已驗證舊 image，
 使用新 session／conversation 再驗收；不把新版 state 自動匯回舊版，也不刪除舊資料。
-本次未部署／rollback、未變更 credentials，亦未認證 Azure／Playground／Teams／12 題，
-不能把本機 fake regression 或容器空白輸入 smoke 宣稱為模型與業務流程驗收。
+上述跨版本合成還原階段未部署／rollback、未變更 credentials，
+不能把它或容器空白輸入 smoke 宣稱為 Azure／Playground／Teams／12 題通過；
+後續有限實測與仍未驗收範圍分開閱讀。
 
 ---
 
