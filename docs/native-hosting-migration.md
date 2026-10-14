@@ -109,6 +109,29 @@ Primary 內部模型 history 改為 `store=False`
 角色定義、模型、star topology、schema／allowed checkpoint types、RBAC／credentials 不變；
 同步 `src`／`solutions/lab2`，必須使用新正式 image／新 session 再驗收，不能宣稱 version 3 已交付。
 
+### 2026-10-14：version 4 實際驗收與剩餘缺口
+
+Source `676ac0f5c9292c346807c7066638a41f49dbeb45` 的
+[CI 38484874321](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38484874321)
+確實 build／smoke 成功，不是 skip。ACR ceb 成功、image
+`sha256:c3148da619484bf8df94ff9d729e720d236ad49e536fd8857d2564c121504cd7`
+在獨立測試 agent 的 regular version 4 active；原 agent 版本／路由不動。
+Canonical 1,596 字元 T01 的 API 三輪完成，專家 review 一份、Primary 全欄位逐字保留，
+追問保留原嚴重度且不重播 review。第二輪 helper 曾多要求題目未要求的來源字樣，
+依已保存回應修正判準後只送第三輪，沒有重送已受理請求。
+
+使用者的 version 4 真實 Playground 三輪與三份 strict checkpoint 已核對：
+等待來源為 Primary、原 HIGH 保留、追問未重貼整份 review，第一次使用忠實 Markdown。
+但實際輸入仍是 1,646 字元 raw CSV 轉義變體，不能混稱 canonical T01 GUI 通過。
+
+完整 12 題為 10 題客觀檢查通過；T10 語意仍承諾翻譯，合計 9 題可接受／3 題未完成：
+T03 在 Architect 的 4,340 字元訊息中已有兩份相同 2,170 字元 JSON，
+Primary 最後的 Markdown 正確，不能再次歸因 Primary 重貼；尚缺該次 provider 邊界證據。
+T12 仍只有 Spec → Primary、沒有 Architect，歷史限制明確保留，不改 PASS 或跳過。
+因此 version 4 不是整套交付驗收完成。兩輪修正部署已用完，額外一輪需另取批准。
+已停止本次 run-owned 驗收及檢查 compute、確認 idle／有效 stopped_at，保留資料；
+費用／tokens／完整 logical calls／SDK retries unavailable，不冒充實測。
+
 ### Checkpoint 版本邊界、新 session 與 rollback
 
 離線合成 probe 使用真正 Handoff 與現有 host，先在隔離的 #5 舊正式 lock
