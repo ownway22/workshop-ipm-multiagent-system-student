@@ -47,8 +47,8 @@ preflight 六項皆通過時，使用完成版程式碼即可繼續；否則先�
 | ------------------------------ | -------------------------------------------------------------------- | --------------------------------------------------- |
 | `lab3-01-azd-deploy.png`       | [Lab 3 步驟四](03-lab3-deploy.md#步驟四部署映像)                     | `azd deploy` 開始建置時的輸出長什麼樣               |
 | `lab3-02-agent-active.png`     | [Lab 3 步驟五](03-lab3-deploy.md#步驟五輪詢到-active)                | `azd ai agent show` 顯示 `active` 的樣子            |
-| `lab3-03-playground.png`       | [Lab 3 步驟六](03-lab3-deploy.md#步驟六在-playground-送-12-題)       | Playground 是與**整個系統**對話，不是選擇單一 agent |
-| `lab3-04-traces.png`           | [Lab 3 步驟八](03-lab3-deploy.md#步驟八看-traces)                    | traces 長什麼樣，以及搜不到對話原文                 |
+| `lab3-03-playground.png`       | [Lab 3 步驟六](03-lab3-deploy.md#步驟六playground-的-canonical-t01-最小示範) | Playground 是與**整個系統**對話，不是選擇單一 agent |
+| `lab3-04-traces.png`           | [Lab 3 步驟八](03-lab3-deploy.md#步驟八console-logs-與-traces)       | traces 長什麼樣，以及搜不到對話原文                 |
 | `lab4-01-publish-metadata.png` | [Lab 4 步驟三](04-lab4-publish-teams.md#步驟三填必填中繼資料)        | 必填欄位有哪些、Developer name 的長度限制           |
 | `lab4-02-direct-publish.png`   | [Lab 4 步驟四、五](04-lab4-publish-teams.md#步驟四選-direct-publish) | Direct publish 與「Just you」在畫面上的位置         |
 | `lab4-03-teams-chat.png`       | [Lab 4 步驟七](04-lab4-publish-teams.md#步驟七完成一輪交接對話)      | Teams 裡完成一輪交接對話的實際樣子                  |
@@ -144,7 +144,7 @@ uv run python -m registry.cleanup
 | traces 裡**沒有**對應時間的請求 | 請求沒抵達         | 發布設定、Teams 通道、網路、session 是否已被回收 |
 | traces 裡**有**請求但回應不對   | agent 回應不如預期 | instructions、路由拓撲、模型能力                 |
 
-查法見 [Lab 3 步驟八](03-lab3-deploy.md#步驟八看-traces)。
+查法見 [Lab 3 步驟八](03-lab3-deploy.md#步驟八console-logs-與-traces)。
 
 ---
 
