@@ -221,17 +221,22 @@ Container Registry 與 Bot Service 要另外處理，見 [收尾與清理](docs/
 
 ## 版本
 
-### Handoff adapter 的 SDK 相容性準備
+### 正式 SDK 升級，保留既有 Handoff host
 
-正式 SDK **尚未升級**，pins、lock 與預設 host 不變。現有 adapter 的最小 public API
-相容修正已同步救援程式，baseline 與隔離候選皆通過 **43 tests、103 subtests**。
-Docker daemon 已可用，但正式 image build 在 PyPI wheel 的 TLS handshake 失敗，
-本機 smoke 未完成。已授權的 [GitHub-hosted container smoke](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38197154016)
-則通過正式 amd64 build、readiness、空白輸入 `failed/invalid_prompt` 與 logs／清理；
-沒有 Azure 部署或 end-to-end 驗收，兩個環境結果不混同。
+PR #5 已合併。本階段正式採用其已驗證組合：core **1.21.0**、foundry **1.14.1**、
+orchestrations **1.3.1**、DevUI／foundry-hosting **1.0.0b261008**、
+agentserver core **2.1.0**／Responses **2.2.0b1**，其他非必要相依不升級。
+預設仍為 `HandoffResponsesHost`，與救援程式一致；新版正式環境
+**45 tests、105 subtests 通過**，沒有部署 Azure 或完成 end-to-end 驗收。
+
+[新版正式 image run](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38206422208)
+已通過 `linux/amd64` build、readiness、空白 `failed/invalid_prompt`、logs 與清理，
+受測 SHA 為 `5c0f935093813b336cebddfd9c53ffa62c70f10e`，不是沿用 #5 舊 smoke。
+首次部署驗收使用新 session／conversation；舊 checkpoint 僅有合成案例相容證據，
+不做自動遷移或刪除。
 
 Native 純文字續接能力與官方線性 lineage／既有分岔契約是**獨立 migration blockers**，
-不是正式 adapter 的 regression failures，也不在本次相容性準備的解決範圍。
+不是正式 adapter 的 regression failures，也不在本次 SDK 升級的解決範圍。
 實驗版本與證據保留於 [相容性報告、Docker 設定與後續門檻](docs/native-hosting-migration.md)、
 [known gaps](references/known-gaps.md)；不宣稱 native migration 完成。
 
@@ -246,7 +251,8 @@ Native 純文字續接能力與官方線性 lineage／既有分岔契約是**獨
 
 不穩定的是把它接到託管與本機工具的那幾層黏著劑：`agent-framework-devui` 與
 `agent-framework-foundry-hosting` 是 **prerelease**，其傳遞相依 `azure-ai-agentserver-*`
-**全部 beta**，`azd ai agent` 擴充是 **preview**，建立持久化 agent 用的 `to_prompt_agent()`
+仍包含 prerelease（Responses 是 beta；core／invocations 已有穩定版），
+`azd ai agent` 擴充是 **preview**，建立持久化 agent 用的 `to_prompt_agent()`
 標記為 **Experimental**（執行時會印出 `ExperimentalWarning`，那不是錯誤）。
 
 意涵：這條路徑**能用**，但 API 可能在沒有向後相容承諾的情況下變動。

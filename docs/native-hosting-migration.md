@@ -1,4 +1,202 @@
-# Handoff adapter 的 SDK 相容性準備
+# 正式 SDK 升級：保留 HandoffResponsesHost
+
+## 目前階段：正式 pins 已升級，native host 未接入
+
+2026-10-12，PR #5 已以一般 merge commit
+`f880de981017d9995845f0735e915851c1bb4e15` 合併。
+本階段從該最新 `main` 建立獨立 branch／worktree；沒有修改或刪除 #5 的 branch／worktree。
+新 [Draft PR #6](https://github.com/ownway22/workshop-ipm-multiagent-system-student/pull/6)
+尚未合併；獨立測試 agent 已部署候選及診斷版本，原 agent 的版本與路由未修改。
+正式 [manifest](../src/pyproject.toml) 與 [lock](../src/uv.lock) 採用 #5 已驗證的組合，
+預設仍是 [HandoffResponsesHost](../src/workflows/responses.py)，不接入 native host。
+以下是 source 的 dependency 升級，**不是 Azure 已部署、模型／Playground／Teams 已驗收**。
+
+| 套件 | 舊正式版 → 新正式版 | 必要原因 |
+| ---- | ------------------ | -------- |
+| agent-framework-core | 1.12.1 → 1.21.0 | Foundry 1.14.1 要求的最低核心 |
+| agent-framework-foundry | 1.10.3 → 1.14.1 | #5 已驗證的 Foundry client 組合 |
+| agent-framework-orchestrations | 1.0.1 → 1.3.1 | 同組合的真正 HandoffBuilder |
+| agent-framework-devui | 1.0.0b260721 → 1.0.0b261008 | 已驗證的 Lab 2 public API |
+| agent-framework-foundry-hosting | 1.0.0b260722 → 1.0.0b261008 | 同組合相依；不改 host 選擇 |
+| azure-ai-agentserver-core | 2.0.0b8 → 2.1.0 | Hosting／Responses 的最低相容需求 |
+| azure-ai-agentserver-responses | 1.0.0b9 → 2.2.0b1 | 現有 adapter 的公開 response handler API |
+| agent-framework-openai（間接） | 1.11.0 → 1.15.0 | Foundry 的最低需求 |
+| azure-ai-agentserver-invocations（間接） | 1.0.0b7 → 1.1.0 | Hosting 的最低需求，不開 Invocations |
+| msgspec（新增間接） | 無 → 0.22.0 | 新 core 必要相依 |
+| regex（新增間接） | 無 → 2026.9.29 | 新 core 必要相依 |
+
+逐項比較正式與 #5 候選 lock：除專案名稱外，**所有 resolved versions 完全一致**；
+其他原 lock 版本都保留，沒有重新選 latest／無差別 upgrade。
+Python minimum、uv、模型、角色定義、拓撲、Bicep／RBAC 與 Teams 配置未改。
+部署 manifest 只更新註解中的套件版本，Responses protocol **2.0.0** 值不變。
+專家的 runtime completion-return policy 已依下述實測補強，`src`／`solutions/lab2` 同步修改。
+
+### 正式新版驗證
+
+```bash
+cd src
+uv lock --upgrade-package agent-framework-openai==1.15.0 \
+  --upgrade-package azure-ai-agentserver-invocations==1.1.0 \
+  --upgrade-package msgspec==0.22.0 --upgrade-package regex==2026.9.29
+uv sync --locked --no-dev --python 3.13
+uv sync --locked --group dev --python 3.13
+uv lock --check
+uv run --no-sync pytest -q --tb=short
+uv run --no-sync python main.py --help
+```
+
+Locked prod／dev sync、CLI 成功；Linux Python **3.13.11**／uv **0.9.25**。
+完整 regression：**54 passed、117 subtests passed**，保留升級基準的 45 tests／105 subtests，
+新增三位專家 control-only 拒絕，以及 Primary 忠實呈現、來源順序、跨域串流、
+釐清後保留已完成結果與不重播舊 review 的測試。正式 runtime 模組使用專案 interpreter 的
+既有 mypy 檢查通過；沒有重新安裝工具／依賴。
+既有離線 main credential 選擇、DevUI 實體建構及 public `serve` signature tests 保留。
+原測試的真正 Handoff 三輪、完整輸出、分岔、隔離、strict restore、
+降級／timeout、取消與 metadata-only diagnostics 斷言不變，沒有 skip／xfail。
+DevUI API 通過不等於真實模型下的 DevUI UX 已驗收；新版的實際對話行為仍須人工確認。
+
+新版正式 image 的
+**[GitHub-hosted run 38206422208](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38206422208)
+全部成功**，不是 #5 的舊 image／skipped run：
+
+| 新版 container 證據 | 結果 |
+| ------------------ | ---- |
+| 實際受測 head SHA／image revision | `5c0f935093813b336cebddfd9c53ffa62c70f10e` |
+| Image ID／platform | `sha256:8748803dc7a98f94e61040e10190277ada90fc24c24972de9b60927072fad157`；`linux/amd64` |
+| 正式 build | 原 `deploy/Dockerfile`／新版正式 lock，`uv sync --locked --no-dev`；解析 119／安裝 112 packages |
+| Runtime | base tag 的 Python 3.13.16、uv 0.9.25；build log 核對全部新版 SDK pins |
+| Container entry | 原 `main.py --responses --host 0.0.0.0`；合成 env、mounts=[]、僅 `127.0.0.1:32768` |
+| readiness | HTTP 200，`{"status":"healthy"}` |
+| 空白 input／stream=false | HTTP 200，`status=failed`、`error.code=invalid_prompt`，不是 `server_error` |
+| Logs／cleanup | input rejection log 已核對；僅本次 container ID stop／rm 並確認不存在 |
+| Artifact | [handoff-container-smoke-38206422208-1](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38206422208/artifacts/11727332609) |
+
+SDK log 的 experimental／「resilience disabled」警告是未驗收的 crash-recovery 邊界，
+不把成功 smoke 宣稱為 process hard-kill 後的可恢復性保證。
+本次沒有送有效模型 prompt、registry login／image push、Azure secrets 或部署。
+最後的文件回填不更改正式 build inputs，若 workflow 明確 skip，不能當成新的 image 驗證。
+現有最小權限 PR workflow 未修改；native gate 留在隔離實驗、不混入正式 runner，
+也沒有重跑已完成的 upstream 調查。
+
+### 2026-10-13：專家結果先於回交
+
+復用已成功的 ce9 診斷 image，在獨立測試 agent 的 version 2 取得同一次 Coding
+request／terminal response／parsed result；fake Primary 僅用於診斷，不能算正式驗收。
+實際 wire 保留 strict `SpecialistReview` schema、原 instructions、完整 1,596 字元 T01
+與回交工具，但 `tool_choice=auto` 的 terminal 只有 function call、零文字、
+`finish_reason=tool_calls`、parsed value 為 `None`。這是結果未產生，不是已產生後被 host 丟失；
+此證據本身不證明 SDK regression。
+
+現在只於 specialists 的公開 chat middleware 設定 `tool_choice="none"`：
+不移除工具、不放寬 schema、不要求 Primary JSON；結果完成後仍由原 result hook 補 call，
+由 SDK 執行真正回交。runtime instructions 明示先輸出結果；control-only 回覆明確失敗。
+實際 payload 的離線 replay 確認修正前會誤回交、修正後不再觸發 Primary 彙整，
+合法 review 仍 parsed 為 `SpecialistReview` 並完整投射一次，沒有增加補正模型呼叫。
+診斷實測 1 次 Coding 邏輯呼叫／1 次 HTTP attempt、2,743 tokens；費用 unavailable。
+compute 的 idle＋本次有效 `stopped_at` 已核對，資料保留。正式新 image、
+使用者提供的 Playground 三輪已成功，但輸入是 1,646 字元的 raw CSV 轉義變體，
+不是 1,596 字元正式 T01。正式字元／hash 判準不改；T12 歷史限制仍保留。
+
+完整 version 3 題組觀測確認專家 schema／基本回交通過，但 Primary 曾重貼完整專家 JSON、
+改寫或漏掉嚴重度，T12 只處理 Spec 並把已要求的 Architect 子需求當作可選後續。
+checkpoint 證明重貼內容由 Primary 自己產生，不能歸咎於 host 重複投射。
+經使用者明確批准，新增公開 middleware 的忠實呈現保護，保留真實 Primary 的路由與釐清；
+只從本輪已驗證專家資料產生 Markdown，不新增模型補正、不捏造 review、不要求 Primary JSON。
+本輪已接回的結果以普通 JSON 保存在 Primary agent session state，跨域回交不遺失，
+最終呈現且沒有待釐清事項後清除；釐清暫停時保留已完成結果，新追問不重播前輪結果。
+Primary 內部模型 history 改為 `store=False`
+保持呈現與續接一致，外層 Responses 保存仍開啟；舊服務端 history 不自動轉換。
+角色定義、模型、star topology、schema／allowed checkpoint types、RBAC／credentials 不變；
+同步 `src`／`solutions/lab2`，必須使用新正式 image／新 session 再驗收，不能宣稱 version 3 已交付。
+
+### 2026-10-14：version 4 實際驗收與剩餘缺口
+
+Source `676ac0f5c9292c346807c7066638a41f49dbeb45` 的
+[CI 38484874321](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38484874321)
+確實 build／smoke 成功，不是 skip。ACR ceb 成功、image
+`sha256:c3148da619484bf8df94ff9d729e720d236ad49e536fd8857d2564c121504cd7`
+在獨立測試 agent 的 regular version 4 active；原 agent 版本／路由不動。
+Canonical 1,596 字元 T01 的 API 三輪完成，專家 review 一份、Primary 全欄位逐字保留，
+追問保留原嚴重度且不重播 review。第二輪 helper 曾多要求題目未要求的來源字樣，
+依已保存回應修正判準後只送第三輪，沒有重送已受理請求。
+
+使用者的 version 4 真實 Playground 三輪與三份 strict checkpoint 已核對：
+等待來源為 Primary、原 HIGH 保留、追問未重貼整份 review，第一次使用忠實 Markdown。
+但實際輸入仍是 1,646 字元 raw CSV 轉義變體，不能混稱 canonical T01 GUI 通過。
+
+完整 12 題為 10 題客觀檢查通過；T10 語意仍承諾翻譯，合計 9 題可接受／3 題未完成：
+T03 在 Architect 的 4,340 字元訊息中已有兩份相同 2,170 字元 JSON，
+Primary 最後的 Markdown 正確，不能再次歸因 Primary 重貼；尚缺該次 provider 邊界證據。
+T12 仍只有 Spec → Primary、沒有 Architect，歷史限制明確保留，不改 PASS 或跳過。
+因此 version 4 不是整套交付驗收完成。兩輪修正部署已用完，額外一輪需另取批准。
+已停止本次 run-owned 驗收及檢查 compute、確認 idle／有效 stopped_at，保留資料；
+費用／tokens／完整 logical calls／SDK retries unavailable，不冒充實測。
+
+使用者後續批准最多再一輪必要修正部署。新增的單次 Architect 邊界觀測採原 HTTP chunks
+透傳，原 schema／tools／middleware 不變：1 次 logical call／1 次 HTTP attempt，
+wire strict schema、stream=true、store=false，一個 terminal text part，
+terminal／chat／agent 文字均 2,362 字元、parsed 為 `SpecialistReview`，4,593 tokens。
+本次沒有重現 v4 的重複，不能宣稱已證明 SDK regression；diagnostic compute 已停止、資料保留。
+後續修正僅保守合併同次回應的完全相同合法 review，並把程式補的控制 call
+同步放入公開 stream update，不丟掉不同結果、不修改 schema。Primary 的本輪已完成來源
+提醒與能力界線明示加強；本次未啟用額外模型補正，不冒充已完成新版部署驗收。
+
+### 2026-10-14：version 6 的使用者指定驗收範圍
+
+Source `752699bfde0fb1b5ca95bad5e86e8ff5683723b1` 已 push；
+[CI 38502942437](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/38502942437)
+確實執行修改後 build／smoke 並成功。ACR ced 成功，image
+`sha256:21382f8fb6b738bc07647496686561c170151363483f307086487dca14f26677`，
+獨立測試 agent 的 regular version 6 active；版本 5 是單次診斷，不是交付驗收版本。
+完整 regression 54 tests／117 subtests 與 runtime mypy（含 untyped callback bodies）通過。
+
+使用者明確要求新 image 跳過 T03／T10／T12。三題標為「依使用者指示未重測」，
+保留 version 4 已觀測問題與 T12 歷史限制，不標 PASS，不另設同材料替代測試。
+version 6 實際執行其餘九題 T01／T02／T04／T05／T06／T07／T08／T09／T11，
+全部通過實際 routing／schema／review 一次投射／全欄位與嚴重度忠實呈現；
+T07／T08 單一材料釐清與 T09 能力界線另經語意核對。
+T11 按原題獨立驗證 code → architecture 的逐次交接，不算 T03 的替代驗收。
+同一 canonical T01 對話的兩次純文字追問亦完成，原 HIGH／來源保留、沒有重播整份 review。
+已確認停止這些 run-owned compute，保留資料；費用／tokens／SDK retries unavailable。
+
+使用者後續將最終驗收明確收斂為 T01，不再執行其他題目的新請求。
+version 6 真實 Playground 的指定流程已由 Session ID／畫面及 strict checkpoint 核對：
+首輪完整、有效 Coding review 一份，忠實呈現全欄位；兩次指定純文字追問保留 HIGH／來源，
+沒有重貼整份 review，等待來源均為 Primary。該 session 共有五個使用者輸入，
+指定流程在第 1／4／5 輪；第 2／3 輪是額外自由詢問，不能假裝只有三個輸入。
+其中一個額外詢問只保存了短回覆、未進一步診斷，不把所有任意追問都稱為成功。
+GUI 首輪仍是 1,646 字元 raw CSV 變體，canonical 1,596 字元的 API 三輪另通過，
+不混稱 canonical GUI；原始使用者材料沒有自動修改。GUI 檢查 compute 已 stop、
+核對 idle／有效 stopped_at、保留資料。本次依最新指定範圍完成 T01，不宣稱 12 題全 PASS。
+原 agent 路由切換仍需另行批准，#6 保持 Draft、不 merge，不接入 native host。
+
+### Checkpoint 版本邊界、新 session 與 rollback
+
+離線合成 probe 使用真正 Handoff 與現有 host，先在隔離的 #5 舊正式 lock
+（core 1.12.1／orchestrations 1.0.1／Responses 1.0.0b9）建立第一輪 checkpoint，
+再以本次正式新版環境及 fresh workflow 還原、續接第二／第三輪。
+三輪皆 completed，完整專家文字／code fence 無遺失，原材料沒有重複 replay，
+原 checkpoint 檔案 bytes 不變。這是**實際限定案例的跨版本相容證據**，不是只測新 checkpoint。
+
+這不涵蓋真實 Foundry `service_session_id`、SDK 原始 provider payload、
+實驗版 ledger、所有舊 checkpoint 型別或平台 session binding。
+不保證任意舊 checkpoint 相容；不做自動轉換、清除 ID、退回較舊 checkpoint 或重開對話。
+損毀／錯誤 checkpoint 仍走既有明確失敗路徑，原 strict restore tests 保留。
+
+將來部署此 SDK 組合的第一次人工驗收**必須新 session／conversation**，
+舊對話資料保留不動，不假設既有 sandbox 會自動切到新 image。
+Rollback 應人工選擇 #5 合併版的程式／精確 lock／已驗證舊 image，
+使用新 session／conversation 再驗收；不把新版 state 自動匯回舊版，也不刪除舊資料。
+本次未部署／rollback、未變更 credentials，亦未認證 Azure／Playground／Teams／12 題，
+不能把本機 fake regression 或容器空白輸入 smoke 宣稱為模型與業務流程驗收。
+
+---
+
+## PR #5 歷史：相容性準備與 native 隔離實驗
+
+以下完整保留 #5 的查證／review／舊 image 證據，描述的是**升級前的歷史狀態**，
+不是本階段重新執行，也不是說目前正式 manifest 仍未升級。#5 已合併；
+本次新的 SDK upgrade PR 保持 Draft、不 merge。
 
 版本查證日期：2026-10-11；收斂 review：2026-10-12。
 正式 baseline：`origin/main` 的 `1e1cb78`（已合併 PR #4）。

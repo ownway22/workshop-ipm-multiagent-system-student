@@ -204,28 +204,51 @@ Responses 端點，使用公開的 `response_handler` 與 `Workflow.run(response
 
 2026-10-11 查證的 native `ResponsesHostServer(workflow=..., parse_response=...)`
 仍無法保留這項純文字續接，也改為不允許分岔的線性 lineage。
-[遷移門檻未通過](native-hosting-migration.md)。現有 adapter 僅做必要的 public API
-相容修改，baseline／候選 regression 均通過；正式 pins、lock、預設 host、protocol、
-credential 選擇與部署配置均未改變，沒有執行新的 Azure 部署／驗收。
+[native 遷移門檻未通過](native-hosting-migration.md)。
+正式 pins／lock 已採用 #5 的已驗證 SDK 組合，但仍保留 `HandoffResponsesHost`；
+protocol 2.0.0、credential 選擇與部署配置不變，沒有執行新的 Azure 部署／驗收。
+首次驗收須新 session／conversation，不自動遷移或刪除舊 checkpoint；
+限定的離線跨版本還原證據與 rollback 見 [SDK 升級紀錄](native-hosting-migration.md#checkpoint-版本邊界新-session-與-rollback)。
 本機 ASGI 的隔離與續接測試不代表 Foundry 平台授權或 Playground 已驗收。
 
 Handoff runtime 的三位專家有程式控制的 completion-return policy：
-正常回合沒有合法回交 call 時，middleware 補一個非文字控制 call，由 SDK 真正交回 Primary；
+模型請求使用 `tool_choice="none"`，保留框架注入的工具與原 strict schema，但先產出專家結果，
+避免模型只選回交工具而略過審查。正常回合沒有合法回交 call 時，
+middleware 補一個非文字控制 call，由 SDK 真正交回 Primary；
 已有 call 就不重複補，原審查文字只傳遞一次。Primary 不被強制交接，仍負責彙整與釐清。
 這與「業務審查完成」是不同的判定；需要補充材料不能被當成成功審查。
 
+模型正常回覆後補的控制 call 同時存在於 terminal 與公開 stream update，保持 SDK 看到的
+控制訊號一致。若同一次專家回應包含多份完全相同、逐一通過原 schema 的 review，
+只保留原第一份文字；不同結果不合併、不選一份丟掉。原 finalizer／hooks／parsed value 保留。
+
+只有回交 call、沒有審查結果或釐清文字的回覆會被拒絕；控制權交回不代表已有有效審查。
 外層 guard 在 stream 真正消費後仍核對回交結果。空結果、工具錯誤、特殊未完成動作、
 降級或技術失敗不會冒充 completed 的專家等待，而是走既有 host 的明確失敗路徑；
 取消不被吞掉。原 schema 不擴充，也不靠 autonomous mode 或模型重試完成回交。
 此補強不增加專家的回交決策 model call；相較於提前停在專家的失敗路徑，
 會增加應有的 Primary 彙整呼叫與 Token 成本。Lab 1 的單獨 Coding 不受影響。
 
-僅 runtime specialists 的模型請求使用 `store=False`，避免程式補的控制 call
-與服務端原始 response 的工具 history 不一致。SDK 會將本機 call/result history
-保存到既有 checkpoint，下一輪還原後傳送完整上下文；Primary 的 storage 行為不變。
+四位 runtime participants 的模型請求均使用 `store=False`，避免程式補的控制 call
+或忠實呈現結果與服務端原始 response 的 history 不一致。SDK 會將本機 call/result history
+保存到既有 checkpoint，下一輪還原後傳送完整上下文；這不關閉外層 Responses 的對話保存。
 Hosted session 與 `$HOME` checkpoint 的持久化仍保留，輸入 Token 成本／快取效果可能不同。
 舊 service-managed conversation ID 不會被清除或假裝成功遷移；如不相容會明確失敗。
-部署這項政策後，請用新 session/conversation 驗證，不沿用 version 9 的既有對話。
+部署這項政策後，請用新 session/conversation 驗證，不沿用舊版本的既有對話。
+
+Primary 仍由真實模型決定路由、跨域子需求是否完成與釐清；不指定 JSON response format。
+專家回交後的最終彙整由公開 chat middleware 忠實呈現本輪有效 `SpecialistReview`：
+依實際接回順序標示來源，逐字保留摘要、發現、證據、建議、限制及原嚴重度，
+不再重貼整份專家 JSON、不採用模型另外補寫的分析。串流以公開 buffering／result hooks
+先確認正常 terminal，再同時更新可見文字與本機 history；不新增模型呼叫。
+跨域交接期間的本輪結果保存在該 agent session 的普通 JSON state，
+最終呈現且沒有待釐清事項後清除；中途詢問不丟掉已完成的專家結果。
+後續純文字追問不重新投射前輪結果。明確的「### 待釐清事項」段落保留，
+沒有合法 review 的釐清／能力界線回覆不套用彙整。原專家文字仍只投射一次。
+
+測試材料請使用 CSV 解碼後的儲存格內容或純文字 prompt，不能從 raw CSV 直接複製加倍的引號。
+T01 正式 prompt 為 1,596 字元；raw CSV 轉義版本為 1,646 字元，屬於不同輸入案例。
+Runtime 不自動解碼／改寫使用者貼上的程式碼。
 
 每輪重新建立工作流，並依使用者與 conversation 還原 checkpoint；不共用上一輪的 executor
 記憶體狀態，不同對話也不必互相排隊（同一個 conversation 的追問才會依序處理）。

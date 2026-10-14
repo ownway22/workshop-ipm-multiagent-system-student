@@ -46,7 +46,11 @@ from models.specialist_review import SpecialistReview
 from workflows.responses import HandoffRequestError, HandoffResponsesHost
 from workflows.handoff import (
     HandoffRoutingError,
+    _current_reviews,
+    _collapse_identical_review,
+    _render_primary_summary,
     build_checkpoint_safe_middleware,
+    build_primary_summary_middleware,
     build_participants,
     build_workflow,
 )
@@ -1011,22 +1015,23 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         primary_name = roles["primary"].agent_name
         coding_name = roles["coding"].agent_name
         preface = "<<<PRIMARY_PREFACE>>>\n"
-        summary = "<<<PRIMARY_SUMMARY>>>\nSummary: offline fixture reviewed.\n"
+        review = SpecialistReview(
+            category="code", summary="Offline fixture reviewed.", findings=["Synthetic finding."],
+            severity="LOW", evidence=["Synthetic evidence."], recommendations=["Synthetic advice."],
+            limitations=["Offline fixture only."],
+        )
+        summary = _render_primary_summary([(coding_name, review)], "")
         coding_text = (
             "<<<CODING_BEGIN_OUTPUT_CONTRACT>>>\n"
             "Synthetic specialist review.\n"
-            '{"category":"code","summary":"offline fixture"}\n'
+            + review.model_dump_json() + "\n"
             "```python\n"
             'value = {"fixture": True}\n'
             "```\n"
             "<<<CODING_END_OUTPUT_CONTRACT>>>\n"
         )
-        coding_chunks = (
-            "<<<CODING_BEGIN_OUTPUT_CONTRACT>>>\nSynthetic specialist review.\n",
-            '{"category":"code",',
-            '"summary":"offline fixture"}\n```py',
-            'thon\nvalue = {"fixture": True}\n',
-            "```\n<<<CODING_END_OUTPUT_CONTRACT>>>\n",
+        coding_chunks = tuple(
+            coding_text[offset:offset + 17] for offset in range(0, len(coding_text), 17)
         )
         expected_text = preface + coding_text + summary
         clients: list[tuple[ScriptedHandoffClient, ScriptedHandoffClient]] = []
@@ -1119,15 +1124,19 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         primary, coding = roles["primary"].agent_name, roles["coding"].agent_name
         material = "固定材料：fixture_value = 42"
         prefaces = [f"<<<PRIMARY_{index}>>>\n" for index in range(3)]
-        summaries = [f"<<<SUMMARY_{index}>>>\n等待使用者。\n" for index in range(3)]
-        reviews = [
-            f"<<<CODING_BEGIN_{index}>>>\n"
-            + SpecialistReview(
+        review_values = [
+            SpecialistReview(
                 category="code", summary=f"第 {index} 輪固定材料健檢",
                 findings=["材料使用固定值。"], severity="LOW",
                 evidence=["fixture_value = 42（來源：使用者訊息）"],
                 recommendations=["以測試確認用途。"], limitations=["未執行程式碼。"],
-            ).model_dump_json()
+            )
+            for index in range(3)
+        ]
+        summaries = [_render_primary_summary([(coding, review)], "") for review in review_values]
+        reviews = [
+            f"<<<CODING_BEGIN_{index}>>>\n"
+            + review_values[index].model_dump_json()
             + f"\n```python\nfixture_value = 42\n```\n<<<CODING_END_{index}>>>\n"
             for index in range(3)
         ]
@@ -1296,6 +1305,341 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(captured.records[-1].args[0], primary_name)
                     self.assertEqual(source.clients[specialist_name].calls, 1)
                     self.assertEqual(source.clients[primary_name].calls, 2)
+                    self.assertEqual(source.clients[specialist_name].options_seen[0]["tool_choice"], "none")
+
+    async def test_primary_summary_preserves_reviews_without_echo_or_extra_model_call(self):
+        review = SpecialistReview(
+            category="code", summary="Verified summary.",
+            findings=["Exact finding."], severity="LOW", evidence=["Exact evidence."],
+            recommendations=["Exact advice."], limitations=["Exact limitation."],
+        )
+        text = review.model_dump_json()
+        for streaming in (False, True):
+            for primary_reply in (text, "Invented HIGH finding.", "### 待釐清事項\n請提供缺少的架構材料？"):
+                with self.subTest(stream=streaming, reply=primary_reply):
+                    host, roles, sources = self.production_host({
+                        "primary": [(("PREFACE\n",), "coding"), ((primary_reply,), None)],
+                        "coding": [((text,), None)],
+                    }, suffix=f"faithful-{streaming}-{len(primary_reply)}")
+                    async with AsyncClient(transport=ASGITransport(app=host), base_url="http://localhost") as client:
+                        response = await client.post("/responses", json={"input": "Synthetic material.", "stream": streaming})
+                    if streaming:
+                        events = [
+                            json.loads(line[6:]) for line in response.text.splitlines()
+                            if line.startswith("data: {")
+                        ]
+                        payload = events[-1]["response"]
+                        self.assertEqual(events[-1]["type"], "response.completed")
+                    else:
+                        payload = response.json()
+                    actual = "".join(
+                        part["text"] for item in payload["output"] for part in item["content"]
+                        if part["type"] == "output_text"
+                    )
+                    self.assertEqual(actual.count(text), 1)
+                    summary = actual[len("PREFACE\n" + text):]
+                    self.assertIn(f"1. `{roles['coding'].agent_name}`", summary)
+                    self.assertIn("**嚴重度：LOW**", summary)
+                    for value in ("Exact finding.", "Exact evidence.", "Exact advice.", "Exact limitation."):
+                        self.assertIn(value, summary)
+                    self.assertNotIn("Invented", summary)
+                    self.assertNotIn("HIGH", summary)
+                    if primary_reply.startswith("###"):
+                        self.assertIn(primary_reply, summary)
+                    source = sources[0]
+                    self.assertEqual(source.clients[roles["primary"].agent_name].calls, 2)
+                    self.assertEqual(source.clients[roles["coding"].agent_name].calls, 1)
+                    self.assertNotIn("response_format", source.clients[roles["primary"].agent_name].options_seen[1])
+                    checkpoint = await host._latest_checkpoint(host._response_dir(None, payload["id"]))
+                    waiting = next(iter(checkpoint.pending_request_info_events.values())).data.agent_response
+                    self.assertEqual(waiting.text, summary)
+                    if streaming:
+                        self.assertEqual("".join(
+                            event["delta"] for event in events if event["type"] == "response.output_text.delta"
+                        ), actual)
+
+    async def test_primary_summary_does_not_repeat_prior_review_on_plain_text_followup(self):
+        review = SpecialistReview(
+            category="code", summary="Verified summary.", findings=["Exact finding."],
+            severity="LOW", evidence=["Exact evidence."], recommendations=["Exact advice."],
+            limitations=["Exact limitation."],
+        )
+        host, roles, _ = self.production_host({
+            "primary": [(("START\n",), "coding"), (("Untrusted summary",), None)],
+            "coding": [((review.model_dump_json(),), None)],
+        }, suffix="faithful-followup")
+        await self.turn("Synthetic first turn.", host=host)
+        restarted, _, sources = self.production_host({
+            "primary": [(("LOW: Exact advice.",), None)],
+        }, suffix="faithful-followup")
+        self.assertEqual(await self.turn("Only repeat the original advice.", host=restarted), "LOW: Exact advice.")
+        self.assertEqual(sources[0].clients[roles["primary"].agent_name].calls, 1)
+        self.assertEqual(sources[0].clients[roles["coding"].agent_name].calls, 0)
+
+    async def test_primary_summary_preserves_composite_routing_and_source_order(self):
+        reviews = [
+            SpecialistReview(category=category, summary="Verified summary.", findings=[finding],
+                severity=severity, evidence=["Exact evidence."], recommendations=["Exact advice."],
+                limitations=["Exact limitation."])
+            for category, finding, severity in (
+                ("specification", "Spec finding.", "LOW"), ("architecture", "Architect finding.", "HIGH")
+            )
+        ]
+        host, roles, sources = self.production_host({
+            "primary": [
+                (("START\n",), "spec"),
+                ((reviews[0].model_dump_json() + "\nNEXT\n",), "architect"),
+                (("Wrong summary",), None),
+            ],
+            "spec": [((reviews[0].model_dump_json(),), None)],
+            "architect": [((reviews[1].model_dump_json(),), None)],
+        })
+        with self.assertLogs("workflows.responses", level="INFO") as captured:
+            actual = await self.turn("Synthetic complete composite materials.", host=host)
+        summary = actual[actual.index("## handled_by"):]
+        self.assertEqual(actual.count(reviews[0].model_dump_json()), 1)
+        self.assertEqual(actual.count(reviews[1].model_dump_json()), 1)
+        self.assertLess(summary.index(roles["spec"].agent_name), summary.index(roles["architect"].agent_name))
+        self.assertIn("Spec finding.", summary)
+        self.assertIn("Architect finding.", summary)
+        self.assertIn("**嚴重度：LOW**", summary)
+        self.assertIn("**嚴重度：HIGH**", summary)
+        self.assertEqual([
+            record.args for record in captured.records if record.msg == "Handoff transition: source=%s target=%s"
+        ], [(roles["primary"].agent_name, roles["spec"].agent_name),
+            (roles["spec"].agent_name, roles["primary"].agent_name),
+            (roles["primary"].agent_name, roles["architect"].agent_name),
+            (roles["architect"].agent_name, roles["primary"].agent_name)])
+        self.assertEqual(sources[0].clients[roles["primary"].agent_name].calls, 3)
+
+    def test_primary_review_scope_excludes_old_user_and_primary_payloads(self):
+        review = SpecialistReview(
+            category="code", summary="Verified summary.", findings=["Exact finding."],
+            severity="LOW", evidence=["Exact evidence."], recommendations=["Exact advice."],
+            limitations=["Exact limitation."],
+        )
+        text = review.model_dump_json()
+        names = {"qvn-coding-agent": "code"}
+        messages = [
+            Message("assistant", [text], author_name="qvn-coding-agent"),
+            Message("user", [text], author_name="qvn-coding-agent"),
+            Message("assistant", [text], author_name="qvn-primary-agent"),
+        ]
+        self.assertEqual(_current_reviews(messages, names), [])
+        messages.append(Message("assistant", [text], author_name="qvn-coding-agent"))
+        self.assertEqual(_current_reviews(messages, names), [("qvn-coding-agent", review)])
+        with self.assertRaises(HandoffRoutingError):
+            _current_reviews(messages, {"qvn-coding-agent": "architecture"})
+
+    async def test_primary_buffered_stream_keeps_normal_second_handoff_updates(self):
+        review = SpecialistReview(
+            category="specification", summary="Verified summary.", findings=["Exact finding."],
+            severity="LOW", evidence=["Exact evidence."], recommendations=["Exact advice."],
+            limitations=["Exact limitation."],
+        )
+
+        class RawPrimary(ChatMiddlewareLayer, BaseChatClient):
+            def _inner_get_response(self, *, messages, stream, options, **kwargs):
+                async def updates():
+                    yield ChatResponseUpdate(
+                        contents=[Content.from_text("NEXT"), Content.from_function_call(
+                            call_id="normal-next", name="handoff_to_qvn-architect-agent", arguments={},
+                        )], role="assistant", author_name="qvn-primary-agent", message_id="next-message",
+                    )
+                    yield ChatResponseUpdate(role="assistant", finish_reason="tool_calls")
+                return ResponseStream(updates(), finalizer=ChatResponse.from_updates)
+
+        client = RawPrimary(middleware=[build_primary_summary_middleware(
+            "qvn-primary-agent", {"qvn-spec-agent": "specification", "qvn-architect-agent": "architecture"},
+        )])
+        stream = client.get_response([
+            Message("user", ["Both materials."]),
+            Message("assistant", [review.model_dump_json()], author_name="qvn-spec-agent"),
+        ], stream=True, options={"store": False})
+        updates = [update async for update in stream]
+        self.assertTrue(updates)
+        self.assertEqual("".join(update.text for update in updates), "NEXT")
+        self.assertEqual([
+            content.name for update in updates for content in update.contents if content.type == "function_call"
+        ], ["handoff_to_qvn-architect-agent"])
+        self.assertEqual((await stream.get_final_response()).finish_reason, "tool_calls")
+
+    async def test_primary_partial_review_survives_clarification_round_trip(self):
+        spec = SpecialistReview(
+            category="specification", summary="Spec summary.", findings=["Spec finding."],
+            severity="LOW", evidence=["Spec evidence."], recommendations=["Spec advice."],
+            limitations=["Spec limitation."],
+        )
+        architecture = SpecialistReview(
+            category="architecture", summary="Architecture summary.", findings=["Architecture finding."],
+            severity="HIGH", evidence=["Architecture evidence."], recommendations=["Architecture advice."],
+            limitations=["Architecture limitation."],
+        )
+        question = "### 待釐清事項\n請提供缺少的架構材料？"
+        host, roles, _ = self.production_host({
+            "primary": [(("START\n",), "spec"), ((question,), None)],
+            "spec": [((spec.model_dump_json(),), None)],
+        }, suffix="partial-clarification")
+        first = await self.turn("Spec material; architecture requested but missing.", host=host)
+        self.assertIn("Spec finding.", first)
+        self.assertIn(question, first)
+        restarted, _, sources = self.production_host({
+            "primary": [(("NEXT\n",), "architect"), (("Finished.",), None)],
+            "architect": [((architecture.model_dump_json(),), None)],
+        }, suffix="partial-clarification")
+        final = await self.turn("Architecture material.", host=restarted)
+        summary = final[final.index("## handled_by"):]
+        self.assertIn("Spec finding.", summary)
+        self.assertIn("Architecture finding.", summary)
+        self.assertLess(summary.index(roles["spec"].agent_name), summary.index(roles["architect"].agent_name))
+        self.assertEqual(sources[0].clients[roles["spec"].agent_name].calls, 0)
+
+    def test_identical_review_collapse_preserves_distinct_results_and_parsed_value(self):
+        review = SpecialistReview(
+            category="architecture", summary="Verified summary.", findings=["Exact finding."],
+            severity="HIGH", evidence=["Exact evidence."], recommendations=["Exact advice."],
+            limitations=["Exact limitation."],
+        )
+        text = review.model_dump_json()
+        for messages in (
+            [Message("assistant", [text + text])],
+            [Message("assistant", [text]), Message("assistant", [text])],
+        ):
+            response = ChatResponse(messages=messages, response_format=SpecialistReview, finish_reason="stop")
+            self.assertTrue(_collapse_identical_review(response))
+            self.assertEqual(response.text, text)
+            self.assertEqual(response.value, review)
+        distinct = review.model_copy(update={"findings": ["Different finding."]})
+        response = ChatResponse(
+            messages=[Message("assistant", [text + distinct.model_dump_json()])],
+            finish_reason="stop",
+        )
+        self.assertFalse(_collapse_identical_review(response))
+        self.assertEqual(response.text, text + distinct.model_dump_json())
+
+    async def test_completion_return_projects_synthetic_call_once_without_review_replay(self):
+        roles = build_agent_roles("wire-control-")
+        name = roles["coding"].agent_name
+        review = SpecialistReview(
+            category="code", summary="Verified summary.", findings=["Exact finding."],
+            severity="LOW", evidence=["Exact evidence."], recommendations=["Exact advice."],
+            limitations=["Exact limitation."],
+        )
+        class RawSpecialist(ChatMiddlewareLayer, BaseChatClient):
+            def _inner_get_response(self, *, messages, stream, options, **kwargs):
+                async def updates():
+                    yield ChatResponseUpdate(
+                        contents=[Content.from_text(review.model_dump_json())],
+                        role="assistant", author_name=name, message_id="review",
+                    )
+                    yield ChatResponseUpdate(role="assistant", finish_reason="stop")
+                return ResponseStream(updates(), finalizer=lambda updates: ChatResponse.from_updates(
+                    updates, output_format_type=SpecialistReview,
+                ))
+
+        client = RawSpecialist()
+        from workflows.handoff import build_completion_return_middleware, _return_description
+        primary = roles["primary"].agent_name
+        tool = FunctionTool(
+            name=f"handoff_to_{primary}", description=_return_description(primary),
+            input_model={"type": "object", "properties": {}},
+        )
+        raw = client.get_response(
+            [Message("user", ["Synthetic material."])], stream=True,
+            options={"store": False, "tools": [tool], "response_format": SpecialistReview},
+            client_kwargs={"middleware": [build_completion_return_middleware(primary)]},
+        )
+        updates = [update async for update in raw]
+        self.assertEqual("".join(update.text for update in updates), review.model_dump_json())
+        result = await raw.get_final_response()
+        self.assertEqual(result.value, review)
+        self.assertEqual(len([
+            content for update in updates for content in update.contents if content.type == "function_call"
+        ]), 1)
+
+    async def test_http_specialist_control_only_does_not_complete_review(self):
+        for key in ("coding", "architect", "spec"):
+            for stream in (True, False):
+                with self.subTest(specialist=key, stream=stream):
+                    requests = []
+
+                    def provider(request):
+                        body = json.loads(request.content)
+                        requests.append(body)
+                        self.assertEqual(body["tool_choice"], "none")
+                        self.assertTrue(body["text"]["format"]["strict"])
+                        self.assertEqual(
+                            [tool["name"] for tool in body["tools"]],
+                            [f"handoff_to_{roles['primary'].agent_name}"],
+                        )
+                        payload = provider_responses_events((), target=roles["primary"].agent_name)
+                        events = [
+                            json.loads(line.removeprefix("data: "))
+                            for line in payload.splitlines() if line.startswith("data: ")
+                        ]
+                        events = [
+                            event for event in events
+                            if event["type"] in (
+                                "response.created", "response.in_progress", "response.completed",
+                            )
+                            or event["type"].startswith("response.function_call")
+                            or event["type"] in ("response.output_item.added", "response.output_item.done")
+                            and event["item"]["type"] == "function_call"
+                        ]
+                        for event in events:
+                            if "output_index" in event:
+                                event["output_index"] = 0
+                            if event["type"] == "response.completed":
+                                event["response"]["output"] = [
+                                    item for item in event["response"]["output"]
+                                    if item["type"] == "function_call"
+                                ]
+                        return Response(
+                            200, headers={"content-type": "text/event-stream"},
+                            text="\n\n".join(
+                                "event: " + event["type"] + "\ndata: " + json.dumps(event)
+                                for event in events
+                            ) + "\n\n",
+                        )
+
+                    async with AsyncClient(transport=MockTransport(provider)) as provider_http:
+                        async with AsyncOpenAI(
+                            api_key="offline-fixture-not-a-real-key",
+                            base_url="http://offline.invalid/v1",
+                            http_client=provider_http, max_retries=0,
+                        ) as openai_client:
+                            def client_factory(name, script):
+                                if name == roles[key].agent_name:
+                                    return OpenAIChatClient(
+                                        model="offline-responses", async_client=openai_client,
+                                    )
+                                return ScriptedHandoffClient(name, script)
+
+                            host, roles, sources = self.production_host({
+                                "primary": [(("PREFACE\n",), key)],
+                            }, suffix=f"control-only-{key}-{stream}", client_factory=client_factory)
+                            async with AsyncClient(
+                                transport=ASGITransport(app=host), base_url="http://localhost"
+                            ) as client:
+                                with self.assertLogs("workflows.responses", level="INFO") as captured:
+                                    response = await client.post(
+                                        "/responses", json={"input": "Synthetic material.", "stream": stream}
+                                    )
+                    payload = (
+                        json.loads([
+                            line.removeprefix("data: ")
+                            for line in response.text.splitlines() if line.startswith("data: {")
+                        ][-1])["response"]
+                        if stream else response.json()
+                    )
+                    self.assertEqual(payload["status"], "failed")
+                    self.assertEqual(payload["error"]["code"], "server_error")
+                    self.assertEqual(len(requests), 1)
+                    self.assertEqual(sources[0].clients[roles["primary"].agent_name].calls, 1)
+                    self.assertEqual([
+                        record.args for record in captured.records
+                        if record.msg == "Handoff transition: source=%s target=%s"
+                    ], [(roles["primary"].agent_name, roles[key].agent_name)])
 
     async def test_http_provider_responses_lifecycle(self):
         review = {
@@ -1328,6 +1672,11 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                         body = json.loads(request.content)
                         self.assertIs(body["stream"], True)
                         self.assertIs(body["store"], False)
+                        self.assertEqual(body["tool_choice"], "none")
+                        self.assertEqual(
+                            [tool["name"] for tool in body["tools"]],
+                            [f"handoff_to_{roles['primary'].agent_name}"],
+                        )
                         requests.append(body)
                         self.assertEqual(len(requests), 1)
                         return Response(
@@ -1414,7 +1763,10 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNotNone(updates[0].continuation_token)
                     self.assertIsNotNone(updates[1].continuation_token)
                     self.assertIsNone(payload.get("error"))
-                    expected = "PREFACE\n" + text + "SUMMARY\n"
+                    expected = (
+                        "PREFACE\n" + text
+                        + _render_primary_summary([(coding, SpecialistReview.model_validate(review))], "")
+                    )
                     actual = "".join(
                         part["text"]
                         for item in payload["output"] if item["type"] == "message"
@@ -1712,7 +2064,8 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                 ], [(primary, coding), (coding, primary)])
                 self.assertEqual(
                     "".join(event.data.text for event in events if event.type == "output"),
-                    "PREFACE\n" + coding_text + "SUMMARY\n",
+                    "PREFACE\n" + coding_text
+                    + _render_primary_summary([(coding, SpecialistReview.model_validate(review))], ""),
                 )
                 self.assertEqual(len(inner_results), 1)
                 self.assertEqual(len(outer_results), 1)
@@ -1884,7 +2237,7 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                 effective.get(key)
                 for key in ("previous_response_id", "conversation", "conversation_id")
             ))
-            self.assertNotIn("store", source.clients[primary].options_seen[0])
+            self.assertIs(source.clients[primary].options_seen[0]["store"], False)
         messages = next_sources[0].clients[coding].requests[0]
         calls = {
             part["call_id"] for message in messages for part in message["contents"]

@@ -31,6 +31,7 @@ Handoff runtime 另附內部控制規則與 specialists-only 回交政策；Lab 
 """
 
 import asyncio
+import copy
 import json
 import logging
 import uuid
@@ -39,15 +40,19 @@ from typing import TYPE_CHECKING
 
 from agents import build_agent_roles
 from models.agent_role import AgentRole
+from models.specialist_review import SpecialistReview
+from pydantic import ValidationError
 
 if TYPE_CHECKING:  # 只為型別標註；執行期不匯入，維持本模組「用到才 import」的一致風格
     from agent_framework import (
-        Agent, AgentResponse, AgentResponseUpdate, ChatResponse, CheckpointStorage, ResponseStream,
+        Agent, AgentResponse, AgentResponseUpdate, ChatContext, ChatResponse, ChatResponseUpdate,
+        CheckpointStorage, Message, ResponseStream,
     )
 
 logger = logging.getLogger(__name__)
 
 _DEGRADED_RESULT = "handoff_degraded"
+_PRIMARY_PENDING_REVIEWS = "workshop_primary_pending_reviews"
 
 
 class HandoffRoutingError(RuntimeError):
@@ -291,11 +296,244 @@ def _runtime_instructions(primary_name: str) -> str:
         "\n\n## Handoff 執行期控制規則\n"
         "角色定義中的「沒有任何工具」指沒有外部查詢或執行工具；"
         "本工作流另有框架提供的內部交接控制工具。\n"
-        f"本回合控制權必須交回 {primary_name}，由協調者彙整或向使用者釐清。"
-        "程式會補上必要的回交控制 call，不是只靠 prompt 保證。\n"
+        "先依原資料契約輸出完整專家結果；回交 call 不是專家分析，不能代替結果。"
+        f"程式會在結果正常完成後呼叫內部工具，將控制權交回 {primary_name}，"
+        "由協調者彙整或向使用者釐清；不要自行呼叫交接工具。\n"
         "原審查結果只輸出一次；需要補充材料的說明不代表審查完成，"
         "不得捏造審查結果。業務與 schema 的原有限制不變。"
     )
+
+
+def _primary_runtime_instructions() -> str:
+    return (
+        "\n\n## Handoff 執行期協調規則\n"
+        "使用者明確要求多類健檢且材料齊備時，必須逐次完成所有已要求的專家交接，"
+        "才結束本輪；專家結果中的限制不會自動取消其他子需求。"
+        "不要再問是否要做使用者已要求的另一類健檢。\n"
+        "比較規格與架構的一致性時，必須實際交給規格及架構兩位專家；"
+        "一位專家的結果不能代替另一位。若材料可做局部分析，先完成該子需求並保留限制。\n"
+        "程式會依本輪合法專家結果與實際來源順序忠實呈現最終彙整；"
+        "不要重貼整份 SpecialistReview JSON，也不要補寫新發現或修改嚴重度。"
+        "你仍負責判斷交接、完成與釐清；需要補充材料時，"
+        "請以「### 待釐清事項」段落提出一個簡短問題，該段落會保留。\n"
+        "團隊職責之外只回覆能力界線與可提供的健檢材料，"
+        "不要另承諾翻譯、代寄信件、撰寫新程式碼或其他代做服務。"
+        "翻成日文或撰寫轉寄草稿不是規格健檢；即使不需要工具，也必須拒絕，"
+        "不能在拒絕後又說可以翻譯或提供草稿。"
+    )
+
+
+def _current_reviews(
+    messages: "Sequence[Message]", specialist_names: Mapping[str, str]
+) -> list[tuple[str, SpecialistReview]]:
+    start = max(
+        (index for index, message in enumerate(messages) if message.role == "user"),
+        default=-1,
+    )
+    reviews = []
+    decoder = json.JSONDecoder()
+    for message in messages[start + 1:]:
+        source = message.author_name
+        if message.role != "assistant" or source is None or source not in specialist_names:
+            continue
+        for index, character in enumerate(message.text):
+            if character != "{":
+                continue
+            try:
+                payload, _ = decoder.raw_decode(message.text[index:])
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict) or "category" not in payload:
+                continue
+            try:
+                review = SpecialistReview.model_validate(payload)
+            except ValidationError:
+                logger.warning("Primary 收到不合法專家結果：source=%s", source)
+                raise HandoffRoutingError("專家結果不符合既有 SpecialistReview 契約。") from None
+            if review.category.value != specialist_names[source]:
+                logger.warning("專家結果類別不符：source=%s category=%s", source, review.category.value)
+                raise HandoffRoutingError("專家結果的類別與來源不符。")
+            reviews.append((source, review))
+            break
+    return reviews
+
+
+def _render_primary_summary(
+    reviews: Sequence[tuple[str, SpecialistReview]], primary_text: str
+) -> str:
+    lines = ["## handled_by", *(
+        f"{index}. `{source}`" for index, (source, _) in enumerate(reviews, 1)
+    )]
+    for source, review in reviews:
+        lines.extend(["", f"## {source}", "", f"**嚴重度：{review.severity.value}**", "", review.summary])
+        for heading, values in (
+            ("發現", review.findings), ("證據", review.evidence),
+            ("建議", review.recommendations), ("限制", review.limitations),
+        ):
+            lines.extend(["", f"### {heading}", *(
+                f"- [{source}] [{review.severity.value}] {value}" for value in values
+            )])
+    question_heading = "### 待釐清事項"
+    primary_lines = primary_text.splitlines()
+    question_start = next(
+        (index for index, line in enumerate(primary_lines) if line.strip() == question_heading),
+        None,
+    )
+    if question_start is not None:
+        questions = primary_lines[question_start:]
+        next_heading = next(
+            (index for index, line in enumerate(questions[1:], 1) if line.startswith("### ")),
+            len(questions),
+        )
+        lines.extend(["", "\n".join(questions[:next_heading])])
+    return "\n".join(lines)
+
+
+def build_primary_summary_middleware(primary_name: str, specialist_names: Mapping[str, str]):
+    """保留真實路由，僅在本輪專家回交後忠實呈現最終結果。"""
+    from agent_framework import ChatResponse, ChatResponseUpdate, Content, ResponseStream, chat_middleware
+
+    @chat_middleware
+    async def primary_summary(context: "ChatContext", call_next):
+        if context.session is not None and context.session.service_session_id:
+            raise HandoffRoutingError("Primary 的舊服務端 history 無法轉換，請建立新的 session／conversation。")
+        if (context.options or {}).get("store") is not False:
+            raise HandoffRoutingError("Primary 忠實呈現需要 store=False 的本機模型 history。")
+        if any((context.options or {}).get(key) for key in ("previous_response_id", "conversation")):
+            raise HandoffRoutingError("Primary 忠實呈現不能引用既有服務端模型 history。")
+        reviews = []
+        if context.session is not None:
+            pending = context.session.state.get(_PRIMARY_PENDING_REVIEWS, [])
+            if not isinstance(pending, list):
+                raise HandoffRoutingError("Primary 本輪結果保存格式不符。")
+            for entry in pending:
+                if not isinstance(entry, dict) or entry.get("source") not in specialist_names:
+                    raise HandoffRoutingError("Primary 本輪結果來源不符。")
+                try:
+                    review = SpecialistReview.model_validate(entry.get("review"))
+                except ValidationError:
+                    raise HandoffRoutingError("Primary 已保存的專家結果不合法。") from None
+                if review.category.value != specialist_names[entry["source"]]:
+                    raise HandoffRoutingError("Primary 已保存的專家類別與來源不符。")
+                reviews.append((entry["source"], review))
+        for entry in _current_reviews(context.messages, specialist_names):
+            if entry not in reviews:
+                reviews.append(entry)
+        if context.session is not None and reviews:
+            context.session.state[_PRIMARY_PENDING_REVIEWS] = [
+                {"source": source, "review": review.model_dump(mode="json")} for source, review in reviews
+            ]
+        instructions = (context.options or {}).get("instructions") or ""
+        if not isinstance(instructions, str):
+            raise HandoffRoutingError("Primary instructions 必須是文字。")
+        completed = (
+            "\n本輪已完成的專家只有：" + "、".join(source for source, _ in reviews)
+            + "。未列出的專家尚未執行；逐一核對使用者已要求的子需求，不要把未完成需求改成可選服務。"
+            if reviews else ""
+        )
+        context.options = dict(
+            context.options or {}, instructions=instructions + _primary_runtime_instructions() + completed
+        )
+        await call_next()
+        if not reviews:
+            return
+
+        def present(response: "ChatResponse") -> "ChatResponse":
+            _check_response_complete(response)
+            calls = [
+                content for message in response.messages for content in message.contents
+                if content.type == "function_call"
+            ]
+            if calls:
+                decoder = json.JSONDecoder()
+                echo = False
+                for index, character in enumerate(response.text):
+                    if character != "{":
+                        continue
+                    try:
+                        payload, _ = decoder.raw_decode(response.text[index:])
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(payload, dict) and set(SpecialistReview.model_fields).issubset(payload):
+                        echo = True
+                        break
+                if not echo:
+                    return response
+                targets = [
+                    name for name in specialist_names
+                    if any(call.name == f"handoff_to_{name}" for call in calls)
+                ]
+                if len(calls) != 1 or len(targets) != 1:
+                    raise HandoffRoutingError("Primary 的交接目標無法唯一辨識。")
+                projected_text = f"我接著將其餘材料交給「{targets[0]}」。"
+            else:
+                projected_text = _render_primary_summary(reviews, response.text)
+            assistants = [message for message in response.messages if message.role == "assistant"]
+            if not assistants:
+                raise HandoffRoutingError("Primary 正常回覆缺少 assistant 訊息。")
+            has_question = any(
+                line.strip() == "### 待釐清事項" for line in response.text.splitlines()
+            )
+            # 保留 SDK terminal/history 的同一份 response；只複製將被改寫的訊息。
+            rendered = response
+            rendered.messages = [copy.copy(message) for message in response.messages]
+            for message in rendered.messages:
+                if message.role == "assistant":
+                    message.author_name = primary_name
+                    message.contents = [content for content in message.contents if content.type != "text"]
+            first = next(message for message in rendered.messages if message.role == "assistant")
+            first.contents.insert(0, Content.from_text(projected_text))
+            rendered.additional_properties = dict(
+                response.additional_properties or {}, handoff_primary_projection=True,
+                handoff_primary_summary=not calls and not has_question,
+            )
+            logger.info("Primary 忠實呈現：source_count=%s", len(reviews))
+            if context.session is not None and rendered.additional_properties["handoff_primary_summary"]:
+                context.session.state.pop(_PRIMARY_PENDING_REVIEWS, None)
+            return rendered
+
+        if context.stream and isinstance(context.result, ResponseStream):
+            raw_updates: list[ChatResponseUpdate] = []
+
+            def capture(update: "ChatResponseUpdate") -> "ChatResponseUpdate":
+                raw_updates.append(update)
+                return update
+
+            def project(response: "ChatResponse") -> Sequence["ChatResponseUpdate"]:
+                if not response.additional_properties.get("handoff_primary_projection"):
+                    return raw_updates
+                updates = []
+                emitted = False
+                for original in raw_updates:
+                    update = copy.copy(original)
+                    if update.role == "assistant":
+                        update.author_name = primary_name
+                    update.contents = [content for content in original.contents if content.type != "text"]
+                    if not emitted and any(content.type == "text" for content in original.contents):
+                        update.contents.insert(0, Content.from_text(response.text))
+                        emitted = True
+                    updates.append(update)
+                if not emitted:
+                    updates.insert(0, ChatResponseUpdate(
+                        contents=[Content.from_text(response.text)], role="assistant",
+                        author_name=primary_name, response_id=response.response_id,
+                        message_id=next(
+                            (message.message_id for message in response.messages if message.role == "assistant"),
+                            None,
+                        ),
+                    ))
+                return updates
+
+            context.stream_buffer_updates = True
+            context.stream_transform_hooks.append(capture)
+            context.stream_result_to_updates = project
+            context.stream_result_hooks.insert(0, present)
+        elif isinstance(context.result, ChatResponse):
+            context.result = present(context.result)
+        else:
+            raise HandoffRoutingError("Primary chat 結果型別不符合呈現契約。")
+
+    return primary_summary
 
 
 def _empty_arguments(arguments: object) -> bool:
@@ -307,6 +545,42 @@ def _empty_arguments(arguments: object) -> bool:
         except json.JSONDecodeError:
             return False
     return isinstance(arguments, Mapping) and not arguments
+
+
+def _collapse_identical_review(response: "ChatResponse") -> bool:
+    text = response.text
+    decoder = json.JSONDecoder()
+    offset = 0
+    values = []
+    slices = []
+    while offset < len(text):
+        while offset < len(text) and text[offset].isspace():
+            offset += 1
+        if offset == len(text):
+            break
+        try:
+            payload, end = decoder.raw_decode(text, offset)
+            value = SpecialistReview.model_validate(payload)
+        except (json.JSONDecodeError, ValidationError):
+            return False
+        values.append(value)
+        slices.append(text[offset:end])
+        offset = end
+    if len(values) < 2 or any(value != values[0] for value in values[1:]):
+        return False
+    assistants = [message for message in response.messages if message.role == "assistant"]
+    if not assistants:
+        raise HandoffRoutingError("重複專家結果缺少 assistant 訊息。")
+    response.messages = [copy.copy(message) for message in response.messages]
+    for message in response.messages:
+        if message.role == "assistant":
+            message.contents = [content for content in message.contents if content.type != "text"]
+    from agent_framework import Content
+    first = next(message for message in response.messages if message.role == "assistant")
+    first.contents.insert(0, Content.from_text(slices[0]))
+    response.additional_properties["handoff_identical_review_collapsed"] = True
+    logger.warning("已合併同一次回應的相同合法 review：copies=%s", len(values))
+    return True
 
 
 def _check_response_actions(response: "ChatResponse | AgentResponse | AgentResponseUpdate") -> None:
@@ -339,7 +613,7 @@ def _check_response_complete(response: "ChatResponse | AgentResponse") -> None:
 
 
 def build_completion_return_middleware(primary_name: str):
-    """在原 chat stream 的 result hook 補控制 call，保留原 finalizer 與 hooks。"""
+    """模型先輸出結果，再於原 result hook 回交；保留工具、finalizer 與 hooks。"""
     from agent_framework import (
         ChatResponse, Content, FunctionTool, ResponseStream, chat_middleware,
     )
@@ -376,6 +650,9 @@ def build_completion_return_middleware(primary_name: str):
 
         def return_control(response: ChatResponse) -> ChatResponse:
             _check_response_complete(response)
+            _collapse_identical_review(response)
+            if not response.text.strip():
+                raise HandoffRoutingError("專家沒有審查結果或釐清文字，不能只靠控制 call 回交。")
             calls = [
                 content for message in response.messages for content in message.contents
                 if content.type == "function_call"
@@ -388,8 +665,6 @@ def build_completion_return_middleware(primary_name: str):
                 ):
                     raise HandoffRoutingError("專家要求的工具或參數不是合法回交。")
                 return response
-            if not response.text.strip():
-                raise HandoffRoutingError("專家沒有正常文字或合法回交。")
             assistants = [message for message in response.messages if message.role == "assistant"]
             if not assistants:
                 raise HandoffRoutingError("專家正常回覆缺少 assistant 訊息。")
@@ -398,9 +673,52 @@ def build_completion_return_middleware(primary_name: str):
             ))
             return response
 
+        # 保留工具供 SDK 執行程式補的 call，但不讓模型以工具選擇略過 structured output。
+        context.options = dict(context.options or {}, tool_choice="none")
         await call_next()
         if context.stream and isinstance(context.result, ResponseStream):
-            # 沿用原 stream 的 hooks；控制 call 留在同一份訊息中供本機 history 配對。
+            raw_updates: list[ChatResponseUpdate] = []
+
+            def capture(update: "ChatResponseUpdate") -> "ChatResponseUpdate":
+                raw_updates.append(update)
+                return update
+
+            def project(response: "ChatResponse") -> Sequence["ChatResponseUpdate"]:
+                collapsed = response.additional_properties.get("handoff_identical_review_collapsed")
+                updates = []
+                emitted = False
+                for original in raw_updates:
+                    update = copy.copy(original)
+                    if collapsed:
+                        update.contents = [content for content in original.contents if content.type != "text"]
+                        if not emitted and any(content.type == "text" for content in original.contents):
+                            update.contents.insert(0, Content.from_text(response.text))
+                            emitted = True
+                    updates.append(update)
+                existing = {
+                    content.call_id for update in updates for content in update.contents
+                    if content.type == "function_call"
+                }
+                missing = [
+                    content for message in response.messages for content in message.contents
+                    if content.type == "function_call" and content.call_id not in existing
+                ]
+                if missing:
+                    index = next(
+                        (index for index, update in enumerate(updates) if update.finish_reason is not None),
+                        len(updates),
+                    )
+                    last = next(message for message in reversed(response.messages) if message.role == "assistant")
+                    updates.insert(index, ChatResponseUpdate(
+                        contents=missing, role="assistant", author_name=last.author_name,
+                        message_id=last.message_id, response_id=response.response_id,
+                    ))
+                return updates
+
+            from agent_framework import ChatResponseUpdate
+            context.stream_buffer_updates = True
+            context.stream_transform_hooks.append(capture)
+            context.stream_result_to_updates = project
             context.stream_result_hooks.insert(0, return_control)
         elif isinstance(context.result, ChatResponse):
             context.result = return_control(context.result)
@@ -470,8 +788,9 @@ def build_participants(
 
     `response_format` 一律取自定義檔（Primary 為 `None`，三位專家為 `SpecialistReview`）。
     這裡不可另外指定，否則就多出一份會與定義檔分歧的設定。
-    只有 specialists 新建的 options 加上 `store=False`，由 SDK 本機 history 保存
-    程式補的控制 call；不修改共用 client、角色定義或 Primary 的 storage 選擇。
+    四位參與者新建的 options 一律使用 `store=False`，由 SDK 本機 history 保存
+    程式補的控制 call 與忠實呈現結果；不修改共用 client 或角色定義。
+    外層 Responses 的保存／純文字續接契約不變。
 
     來源 M04（microsoft/agent-framework 官方 handoff sample 與原始碼）：
     https://github.com/microsoft/agent-framework
@@ -479,12 +798,15 @@ def build_participants(
     """
     participants: dict[str, Agent] = {}
     primary_name = roles["primary"].agent_name
+    specialist_names = {
+        roles[key].agent_name: category
+        for key, category in zip(SPECIALIST_KEYS, ("code", "architecture", "specification"))
+    }
     for key, role in roles.items():
         default_options: dict[str, object] = {}
         if role.response_format is not None:
             default_options["response_format"] = role.response_format
-        if key in SPECIALIST_KEYS:
-            default_options["store"] = False
+        default_options["store"] = False
         participants[key] = client.as_agent(
             name=role.agent_name,
             description=role.description,
@@ -498,6 +820,7 @@ def build_participants(
                 *([build_return_guard_middleware(primary_name)] if key in SPECIALIST_KEYS else []),
                 *([build_checkpoint_safe_middleware()] if checkpoint_safe else []),
                 build_degraded_reply_middleware(role.agent_name),
+                *([build_primary_summary_middleware(primary_name, specialist_names)] if key == "primary" else []),
                 *([build_completion_return_middleware(primary_name)] if key in SPECIALIST_KEYS else []),
             ],
         )

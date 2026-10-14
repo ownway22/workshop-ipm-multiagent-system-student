@@ -124,7 +124,8 @@ result = eval(request.args.get("expr"))
 ## 1:1 對話與 session
 
 本次 [native hosting 可行性驗證未通過](native-hosting-migration.md)，沒有改動 Teams 發布配置，
-也沒有執行 Azure／Teams 驗收。請維持正式 baseline；未來遷移仍需人工核對純文字多輪、
+也沒有執行 Azure／Teams 驗收。正式 SDK 升級仍保留既有 host；
+第一次部署驗收使用新 session／conversation，人工核對純文字多輪、
 session 閒置回收後續接、使用者隔離與完整專家輸出，不能只憑本機 HTTP 200 判定通過。
 
 Teams 端的 session 邊界對應 **Teams 原生的對話識別碼**：
