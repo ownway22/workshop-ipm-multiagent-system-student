@@ -30,6 +30,11 @@
 
 本課程使用 **Direct publish +「Just you」**。組織範圍發布需要 Teams 系統管理員核准，不在本課程內。
 
+Lab 3 的管理員 bootstrap 只處理 ACR／建置授權／project connection，**不保證 Teams 發布權限**。
+Bot 資源是 ARM 管理操作，Foundry agent／模型則有 data plane 權限；兩者分開核對。
+`Owner`／`Contributor` 一般涵蓋 `Microsoft.BotService/botServices/write`，但 ABAC／deny、
+作用範圍與實際被拒絕的 action 仍須查證，不能只憑 preflight 找到或沒找到 Bot 角色 GUID 判定。
+
 ---
 
 ## 步驟一：確認 agent 狀態
@@ -148,7 +153,7 @@ Teams 端的 session 邊界對應 **Teams 原生的對話識別碼**：
 | 現象                                           | 原因                                                    | 處理                                                            |
 | ---------------------------------------------- | ------------------------------------------------------- | --------------------------------------------------------------- |
 | 驗證錯誤，指向 Developer name                  | 超過 32 字元                                            | 縮短                                                            |
-| `403 AuthorizationFailed on botServices/write` | 缺 `Azure Bot Service Contributor Role`（資源群組範圍） | 請訂閱管理員在**資源群組**上指派；訂閱 Owner **不包含**這個角色 |
+| `403 AuthorizationFailed on botServices/write` | 目標 RG 的 Bot ARM action 未獲准，或受 condition／deny 限制 | 請管理員核對實際 action／scope；Owner／Contributor 一般涵蓋該 action，不一律重複加角色或重登 |
 | 發布成功但 Teams 裡找不到                      | Teams 帳號與 Azure 訂閱不同租戶                         | 用同租戶的帳號登入 Teams                                        |
 | 第一則訊息等很久                               | 可能依該版本閒置設定回收而冷啟動                        | 核對 session／console 狀態，不直接重 deploy                      |
 | 完全沒有回應                                   | 核對本次請求與 console，traces 可能尚未接線              | 見 [Lab 3 步驟八](03-lab3-deploy.md#步驟八console-logs-與-traces) |

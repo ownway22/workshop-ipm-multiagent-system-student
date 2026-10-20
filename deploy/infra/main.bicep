@@ -24,7 +24,7 @@
 // 完整的最小組合是下列三項，缺一不可：
 //
 //   1. **AcrPull** 給 **Foundry 專案的 managed identity** —— 執行期拉取映像。
-//   2. **Container Registry Tasks Contributor** 給**部署者** —— `remoteBuild` 走 ACR Tasks 建置。
+//   2. **Container Registry Tasks Contributor** 給**學員部署者** —— `remoteBuild` 走 ACR Tasks 建置。
 //   3. Foundry 專案上的 **ContainerRegistry 連線** —— 讓專案知道要用哪個登錄、以何種身分。
 
 targetScope = 'resourceGroup'
@@ -37,10 +37,10 @@ param location string = resourceGroup().location
 @description('azd 環境名稱。用於產生具唯一性的資源名稱。')
 param environmentName string
 
-@description('執行部署的使用者或服務主體 objectId。由 azd 自動帶入。')
+@description('受授權的建置／部署主體 objectId。自助由 azd 帶入；管理員 bootstrap 明確傳入學員。')
 param principalId string
 
-@description('部署者的主體型別。互動式部署為 User，CI 為 ServicePrincipal。')
+@description('受授權者的主體型別。學員與管理員 bootstrap 為 User，CI 為 ServicePrincipal。')
 @allowed(['User', 'ServicePrincipal'])
 param principalType string = 'User'
 

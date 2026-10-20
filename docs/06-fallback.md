@@ -69,7 +69,7 @@ preflight 六項皆通過時，使用完成版程式碼即可繼續；否則先�
 
 | 項目                                                | 怎麼確認                                  |
 | --------------------------------------------------- | ----------------------------------------- |
-| 專案範圍的 `Foundry Project Manager`                | 訂閱 Owner **不包含**這個角色，要另外指派 |
+| 專案範圍的 `Foundry Project Manager`                | 核對 Foundry data plane 權限；Owner 不自動授予 |
 | 資源群組範圍的 `Azure Bot Service Contributor Role` | Lab 4 發布到 Teams 需要                   |
 | Teams 帳號與訂閱同一個 Entra 租戶                   | 不同租戶時「Just you」發布不會出現        |
 | 區域在 hosted agents 支援清單內                     | East Asia **不在**清單內                  |
@@ -83,6 +83,8 @@ uv run python -m preflight
 ```
 
 六項全部通過後再繼續。
+preflight 僅比對指定角色，不證明 Lab 3 ACR／IAM 或所有 ABAC 條件通過；
+自助 provision 權限不足時使用 [管理員 bootstrap](03-lab3-deploy.md#路徑-b管理員-bootstrap)。
 
 ### 步驟二：Lab 1
 
@@ -109,12 +111,12 @@ cp -r solutions/lab3/deploy/* deploy/
 cd deploy
 azd env new ipm-workshop
 uv run --project ../src python scripts/configure_azd_env.py
-azd provision
-azd deploy
-azd ai agent show
 ```
 
-等 `status` 變成 `active`，其餘依 [Lab 3 講義](03-lab3-deploy.md)。
+已有 azd environment 時改用 `azd env select <原名稱>`，不要重建或改名。
+接著依 [Lab 3 步驟三](03-lab3-deploy.md#步驟三建立基礎設施)選擇自助 provision 或管理員
+bootstrap；後者匯入結果後直接 `azd deploy`，不要再 provision／up。
+`active` 之後仍需依 Lab 3 核對版本／session 與對話，並非狀態成功就完成。
 
 ### 步驟五：Lab 4
 
