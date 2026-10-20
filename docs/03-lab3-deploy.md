@@ -135,6 +135,19 @@ request 僅含 `schemaVersion`、`subscriptionId`、`resourceGroup`、`environme
 匯出／匯入都會做唯讀 Azure 查詢，並非離線工具；這份修補的離線測試才使用 mocked CLI。
 既有 request 不會覆寫，重做時先自行核對／保留舊檔，再選新檔名。
 
+匯出／匯入與管理員 helper 使用相同的欄位 allowlist；helper 在**任何 Azure CLI 呼叫之前**
+驗證 request，避免 Windows `az.cmd` 將欄位中的 shell metacharacters 當成命令：
+
+| 欄位 | 此 bootstrap helper 接受的名稱 |
+| --- | --- |
+| `resourceGroup` | 1–90 個 ASCII 英數、`_`、`-`、`.`，不可以 `.` 結尾 |
+| `accountName` | 2–64 個 ASCII 英數或 `-`，首尾必須為英數 |
+| `projectName` | 2–64 個 ASCII 英數、`_`、`-`、`.`，首字必須為英數 |
+
+這是交接工具的安全命名契約，不是 Azure 所有合法名稱的完整集合；
+例如 Azure 允許的部分 RG Unicode／括號名稱在此不支援。工具會明確拒絕，不清洗、截短或改名，
+也不要為了通過驗證更動原資源或 environment；這類目標需另安排經審查的管理員操作。
+
 只透過組織核准的管道將此 request 交給管理員。這些識別不是憑證，但仍是內部資產資訊，
 不要提交到 Git。`deploy/.azure/` 已被忽略。
 

@@ -40,6 +40,11 @@ BOOTSTRAP_OUTPUTS = (
     "AZURE_CONTAINER_REGISTRY_RESOURCE_ID",
     "AZURE_ACR_CONNECTION_NAME",
 )
+BOOTSTRAP_RESOURCE_NAME_PATTERNS = {
+    "resourceGroup": r"[A-Za-z0-9_.-]{1,90}(?<!\.)",
+    "accountName": r"[A-Za-z0-9][A-Za-z0-9-]{0,62}[A-Za-z0-9]",
+    "projectName": r"[A-Za-z0-9][A-Za-z0-9_.-]{1,63}",
+}
 
 
 class ConfigurationError(RuntimeError):
@@ -256,6 +261,12 @@ def validate_bootstrap_request(raw: object) -> dict[str, str | int]:
             or re.search(r"[/\\\x00-\x1f]", value)
         ):
             raise ConfigurationError(f"bootstrap request 的 {name} 無效。")
+    for name, pattern in BOOTSTRAP_RESOURCE_NAME_PATTERNS.items():
+        if not re.fullmatch(pattern, raw[name]):
+            raise ConfigurationError(
+                f"bootstrap request 的 {name} 不符合安全命名限制；"
+                "請參閱 docs/03-lab3-deploy.md，不會自動改名。"
+            )
     for name in ("subscriptionId", "studentObjectId"):
         try:
             valid = str(UUID(raw[name])).casefold() == raw[name].casefold()

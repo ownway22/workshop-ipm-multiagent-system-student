@@ -81,6 +81,12 @@ if ($null -eq $request -or $request -isnot [pscustomobject] -or
     $request.schemaVersion -ne 1) {
     throw 'Request must contain schemaVersion 1 and exactly seven required fields.'
 }
+# az.cmd is parsed by cmd.exe; array splatting does not escape request data.
+$resourceNamePatterns = @{
+    resourceGroup = '\A[A-Za-z0-9_.-]{1,90}(?<!\.)\z'
+    accountName = '\A[A-Za-z0-9][A-Za-z0-9-]{0,62}[A-Za-z0-9]\z'
+    projectName = '\A[A-Za-z0-9][A-Za-z0-9_.-]{1,63}\z'
+}
 foreach ($field in $fields) {
     if (@($request.PSObject.Properties.Name) -cnotcontains $field) {
         throw "Missing request field (names are case-sensitive): $field"
@@ -88,6 +94,10 @@ foreach ($field in $fields) {
     $value = Get-RequiredString $request $field
     if ($value -match '[/\\\x00-\x1f]' -or $value -match '^<.*>$') {
         throw "Invalid request field: $field"
+    }
+    if ($resourceNamePatterns.ContainsKey($field) -and
+        $value -cnotmatch $resourceNamePatterns[$field]) {
+        throw "Invalid request field: $field. See the bootstrap naming restrictions in docs\03-lab3-deploy.md."
     }
 }
 Assert-Guid $request.subscriptionId 'subscriptionId'

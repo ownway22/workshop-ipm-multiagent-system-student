@@ -56,6 +56,43 @@ ENVIRONMENT = {
     "AZURE_AI_MODEL_DEPLOYMENT_NAME": "offline-model",
     "MODEL_DEPLOYMENT_NAME": "offline-model",
 }
+CLI_RESOURCE_FIELDS = ("resourceGroup", "accountName", "projectName")
+SHELL_PAYLOADS = [
+    pytest.param("offline&echo.BOOTSTRAP_INJECTION_PROBE&rem", id="ampersand"),
+    pytest.param("offline|echo.BOOTSTRAP_INJECTION_PROBE", id="pipe"),
+    pytest.param("offline^&echo.BOOTSTRAP_INJECTION_PROBE&rem", id="caret"),
+    pytest.param('offline"&echo.BOOTSTRAP_INJECTION_PROBE&rem"', id="quote"),
+    pytest.param("offline%FAKE_AZ_INJECTION_MARKER%", id="expansion"),
+    pytest.param("offline(name)", id="parentheses"),
+    pytest.param(
+        'offline&echo.injected>"%FAKE_AZ_INJECTION_MARKER%"&rem', id="file-marker"
+    ),
+]
+VALID_RESOURCE_NAMES = [
+    ("resourceGroup", "r"),
+    ("resourceGroup", "RG_offline.01"),
+    ("resourceGroup", "r" * 90),
+    ("accountName", "aB"),
+    ("accountName", "Offline-01"),
+    ("accountName", "a" * 64),
+    ("projectName", "p0"),
+    ("projectName", "Project_Name.01-"),
+    ("projectName", "p" * 64),
+]
+INVALID_RESOURCE_NAMES = [
+    ("resourceGroup", "r" * 91),
+    ("resourceGroup", "rg."),
+    ("resourceGroup", "rg-\u8cc7\u6e90"),
+    ("accountName", "a"),
+    ("accountName", "a" * 65),
+    ("accountName", "-account"),
+    ("accountName", "account-"),
+    ("accountName", "account_name"),
+    ("projectName", "p"),
+    ("projectName", "p" * 65),
+    ("projectName", ".project"),
+    ("projectName", "_project"),
+]
 
 
 def outputs_for(request=REQUEST):
@@ -181,6 +218,28 @@ def test_import_rejects_different_environment_scope_or_student(cli, tmp_path, fi
     path.write_text(json.dumps(result_for(request)))
     assert configure.main(["--import-bootstrap-result", str(path)]) == 1
     assert cli.writes == []
+
+
+@pytest.mark.parametrize("field", CLI_RESOURCE_FIELDS)
+@pytest.mark.parametrize("value", SHELL_PAYLOADS)
+def test_import_rejects_cli_bound_shell_syntax_before_any_cli(cli, tmp_path, capsys, field, value):
+    path = tmp_path / "malicious result.json"
+    path.write_text(json.dumps(result_for({**REQUEST, field: value})))
+    assert configure.main(["--import-bootstrap-result", str(path)]) == 1
+    assert field in capsys.readouterr().err
+    assert cli.calls == []
+
+
+@pytest.mark.parametrize("field,value", VALID_RESOURCE_NAMES)
+def test_python_accepts_safe_resource_identifier_boundaries(field, value):
+    request = {**REQUEST, field: value}
+    assert configure.validate_bootstrap_request(request) == request
+
+
+@pytest.mark.parametrize("field,value", INVALID_RESOURCE_NAMES)
+def test_python_rejects_invalid_resource_identifiers(field, value):
+    with pytest.raises(configure.ConfigurationError, match=field):
+        configure.validate_bootstrap_request({**REQUEST, field: value})
 
 
 @pytest.mark.parametrize("variable", [key for key in ENVIRONMENT if key != "AZURE_ENV_NAME"])
@@ -360,6 +419,7 @@ def powershell_bootstrap(request, tmp_path):
     result_path = tmp_path / "bootstrap result.json"
     responses_path = tmp_path / "fake responses.json"
     log_path = tmp_path / "fake calls.jsonl"
+    marker_path = tmp_path / "unexpected shell execution.txt"
     environment = {
         **os.environ,
         "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
@@ -372,6 +432,7 @@ def powershell_bootstrap(request, tmp_path):
         "FAKE_AZ_RESPONSES": str(responses_path),
         "FAKE_AZ_LOG": str(log_path),
         "FAKE_AZ_PATH": str(fake_bin / "az.cmd"),
+        "FAKE_AZ_INJECTION_MARKER": str(marker_path),
     }
     responses = {
         "account": {"value": {
@@ -391,8 +452,27 @@ def powershell_bootstrap(request, tmp_path):
         }},
     }
 
-    def run(case="success"):
+    def run(case="success", *, request_values=None):
         payload = copy.deepcopy(REQUEST)
+        if request_values is not None:
+            payload.update(request_values)
+            scope = (
+                f"/subscriptions/{payload['subscriptionId']}"
+                f"/resourceGroups/{payload['resourceGroup']}"
+            )
+            project_id = (
+                f"{scope}/providers/Microsoft.CognitiveServices"
+                f"/accounts/{payload['accountName']}/projects/{payload['projectName']}"
+            )
+            responses["group"]["value"]["id"] = scope
+            responses["project"]["value"]["id"] = project_id
+            responses["deployment"]["value"]["id"] = (
+                f"{scope}/providers/Microsoft.Resources/deployments/lab3-bootstrap"
+            )
+            responses["deployment"]["value"]["properties"]["outputs"] = {
+                key: {"type": "String", "value": value}
+                for key, value in outputs_for(payload).items()
+            }
         if case == "missing-field":
             del payload["environmentName"]
         elif case == "request-template":
@@ -469,10 +549,39 @@ function Read-Host { param([string] $Prompt) return $env:BOOTSTRAP_CONFIRM }
             cwd=cwd, env=environment, capture_output=True, text=True,
             encoding="utf-8", errors="replace", check=False, timeout=40,
         )
+        assert not marker_path.exists(), "Request executed a shell command through az.cmd"
         calls = [json.loads(line) for line in log_path.read_text().splitlines()] if log_path.exists() else []
         return completed, result_path, calls, reviewed
 
     return run
+
+
+@pytest.mark.parametrize("field", CLI_RESOURCE_FIELDS)
+@pytest.mark.parametrize("value", SHELL_PAYLOADS)
+def test_powershell_rejects_cli_bound_shell_syntax_before_any_cli(powershell_bootstrap, field, value):
+    completed, path, calls, _ = powershell_bootstrap(request_values={field: value})
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+    assert field in completed.stderr
+    assert calls == []
+    assert not path.exists()
+    assert "BOOTSTRAP_INJECTION_PROBE" not in completed.stdout
+
+
+@pytest.mark.parametrize("field,value", VALID_RESOURCE_NAMES)
+def test_powershell_accepts_safe_resource_identifier_boundaries(powershell_bootstrap, field, value):
+    completed, path, calls, _ = powershell_bootstrap(request_values={field: value})
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert json.loads(path.read_text(encoding="utf-8-sig")) == result_for({**REQUEST, field: value})
+    assert [call["operation"] for call in calls] == ["account", "group", "project", "deployment"]
+
+
+@pytest.mark.parametrize("field,value", INVALID_RESOURCE_NAMES)
+def test_powershell_rejects_invalid_resource_identifiers_before_any_cli(powershell_bootstrap, field, value):
+    completed, path, calls, _ = powershell_bootstrap(request_values={field: value})
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+    assert field in completed.stderr
+    assert calls == []
+    assert not path.exists()
 
 
 @pytest.mark.parametrize("case", ["success", "warning"])
