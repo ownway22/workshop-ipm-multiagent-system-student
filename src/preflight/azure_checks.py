@@ -228,14 +228,16 @@ def check_providers() -> CheckResult:
 
 
 def check_role_assignments(location: ProjectLocation | AzCliError) -> CheckResult:
-    """檢查 4：角色指派。
+    """檢查 4：workshop 相容角色的存在性，不是 effective-permission 檢查。
 
     查詢方式依 2026-07-27 的官方來源查證結果：
 
     - 以**角色定義 ID（GUID）**而非顯示名稱比對，因為 Foundry 的 RBAC 角色近期更名，
       更名推行期間顯示名稱可能不一致，但 ID 不變。
-    - 必須帶 `--include-inherited` 與 `--include-groups`：學員常見的情況是在訂閱層取得
-      `Owner`，或透過安全性群組取得權限；缺少這兩個旗標會把已具權限的學員誤判為失敗。
+    - 必須帶 `--include-inherited` 與 `--include-groups`：指定 workshop 角色可能在上層
+      scope 或透過安全性群組授予；缺少這兩個旗標會漏查這些指派。
+    - 不展開其他角色的 Actions／DataActions，也不評估 ABAC condition 或 deny assignment。
+      找到這兩個 GUID 不代表 Lab 3 的 ACR roleAssignments/write 已獲准。
     """
     missing: list[str] = []
 
@@ -297,24 +299,34 @@ def check_role_assignments(location: ProjectLocation | AzCliError) -> CheckResul
             index=4,
             title="角色指派",
             passed=True,
-            detail=f"{ROLE_FOUNDRY_PROJECT_MANAGER[0]}、{ROLE_BOT_SERVICE_CONTRIBUTOR[0]}",
+            detail=(
+                f"已找到 {ROLE_FOUNDRY_PROJECT_MANAGER[0]}、{ROLE_BOT_SERVICE_CONTRIBUTOR[0]}；"
+                "僅確認角色存在，不代表 effective permissions、ABAC／deny 或 Lab 3 ACR bootstrap 通過"
+            ),
         )
 
     return CheckResult(
         index=4,
         title="角色指派",
         passed=False,
-        detail=f"缺少：{'；'.join(missing)}",
-        impact="權限不足會導致 Lab 2 無法建立 agent，或 Lab 4 出現 403 AuthorizationFailed。",
+        detail=f"未找到指定 workshop 角色或查詢失敗：{'；'.join(missing)}",
+        impact=(
+            "本項只比對兩個角色 GUID，不判斷其他角色是否提供等效權限。"
+            "Foundry data plane、Bot ARM 操作與 Lab 3 ACR／IAM 權限必須分開核對。"
+        ),
         remediation=[
-            "若你是訂閱擁有者，可自行指派（把 <objectId> 換成你的 objectId）：",
+            "先由管理員核對 effective permissions、deny 與 role assignment condition；"
+            "Owner／Contributor 一般涵蓋 Bot ARM 操作，但不因此取得 Foundry data plane 權限。",
+            "若採 workshop 相容角色路徑，請由具目標 scope roleAssignments/write "
+            "且 condition 允許下列 job roles 的管理員指派；受授權者是學員：",
             f'az role assignment create --role "{ROLE_FOUNDRY_PROJECT_MANAGER[1]}" '
             f'--assignee-object-id "{principal_id}" --assignee-principal-type User '
             f'--scope "{location.project_scope}"',
             f'az role assignment create --role "{ROLE_BOT_SERVICE_CONTRIBUTOR[1]}" '
             f'--assignee-object-id "{principal_id}" --assignee-principal-type User '
             f'--scope "{location.resource_group_scope}"',
-            "若你不是訂閱擁有者，需請訂閱管理員指派——這通常無法在現場完成。",
+            "Lab 3 自助 provision 另需 ACR scope 的 roleAssignments/write；"
+            "沒有時使用 docs/03-lab3-deploy.md 的管理員 bootstrap，不授予學員 RBAC Administrator。",
         ],
         onsite_fixable=False,
     )

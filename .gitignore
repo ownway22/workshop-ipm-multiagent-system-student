@@ -6,6 +6,9 @@
 !.env.template
 *.local
 
+# Local azd state and bootstrap handoff files
+.azure/
+
 # spike 產出的憑證、輸出檔與暫存物（FR-060 的驗證程式不納入交付包）
 spike/**/*.json
 spike/**/*.log

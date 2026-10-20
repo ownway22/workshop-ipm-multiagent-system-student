@@ -99,10 +99,11 @@ def run_az_json(args: list[str], *, timeout: int = 60) -> object:
     Raises:
         AzCliError: `az` 不可用、逾時、非零結束碼，或輸出不是合法 JSON。
     """
-    if not az_available():
+    executable = shutil.which("az")
+    if executable is None:
         raise AzCliError("找不到 az 指令。請確認你在 devcontainer 內執行。")
 
-    command = ["az", *args, "--output", "json"]
+    command = [executable, *args, "--output", "json"]
     try:
         completed = subprocess.run(  # noqa: S603 - 參數為程式內組出的固定清單，非使用者輸入
             command,

@@ -9,6 +9,7 @@ on:
       - ".dockerignore"
       - "deploy/Dockerfile"
       - "src/**"
+      - "!src/preflight/**"
 
 permissions:
   contents: read
@@ -57,7 +58,8 @@ jobs:
           if [[ "$PR_ACTION" == synchronize && "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ ]] \
             && git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null \
             && git diff --quiet "$BEFORE_SHA" "$SOURCE_SHA" -- \
-              .github/workflows/handoff-container-smoke.yml .dockerignore deploy/Dockerfile src; then
+              .github/workflows/handoff-container-smoke.yml .dockerignore deploy/Dockerfile src \
+              ':(exclude)src/preflight/**'; then
             echo "build=false" >> "$GITHUB_OUTPUT"
             echo "Only unrelated files changed; build/smoke skipped, not revalidated." \
               | tee -a "$LOG_DIR/context.log"

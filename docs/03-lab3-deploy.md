@@ -1,7 +1,7 @@
 # Lab 3：部署到 Azure
 
 **前置條件**：[Lab 0](00-lab0-env-check.md) 的工具、登入與 `src/.env` 已驗證，並完成
-[Lab 2](02-lab2-multi-agent.md) 的本機交接。以下命令使用 Bash／WSL，**每個區塊都標示起始目錄**；
+[Lab 2](02-lab2-multi-agent.md) 的本機交接。除明示 PowerShell 的管理員區塊外，命令使用 Bash／WSL，**每個區塊都標示起始目錄**；
 不要在 `deploy/` 再執行 `cd src`，也不要在 `src/` 執行專案範圍的 `azd` 命令。
 
 **操作成功條件**：確認實際受測的 source、image、agent version 與 session，
@@ -55,7 +55,7 @@
 cd deploy
 azd env new ipm-workshop
 uv run --project ../src --locked python scripts/configure_azd_env.py
-azd env get-values
+azd env get-value AZURE_ENV_NAME
 ```
 
 [configure_azd_env.py](../deploy/scripts/configure_azd_env.py) 從 `src/.env` 讀取
@@ -63,9 +63,9 @@ azd env get-values
 查證登入訂閱、租戶、資源群組、Foundry 帳戶、專案 ARM ID 與模型部署。
 全部驗證成功才寫入選取的 azd environment；不是離線匯入。
 
-核對 `AZURE_ENV_NAME`、`AZURE_SUBSCRIPTION_ID`、`AZURE_RESOURCE_GROUP`、
+以 `azd env get-value <名稱>` 核對 `AZURE_ENV_NAME`、`AZURE_SUBSCRIPTION_ID`、`AZURE_RESOURCE_GROUP`、
 `AZURE_AI_ACCOUNT_NAME`、`AZURE_AI_PROJECT_NAME`、`AZURE_AI_PROJECT_ENDPOINT`、
-`MODEL_DEPLOYMENT_NAME` 與你獲准的目標一致。不要把完整 env 輸出貼進公開 issue。
+`MODEL_DEPLOYMENT_NAME` 與你獲准的目標一致。不要把完整 `.env`、token 或 secret 交給管理員或貼進 issue。
 
 ### 既有環境升級
 
@@ -73,7 +73,7 @@ azd env get-values
 # 起始目錄：repository 根目錄
 cd deploy
 azd env select ipm-workshop
-azd env get-values
+azd env get-value AZURE_ENV_NAME
 ```
 
 先沿用正確的 environment，不為升級另建一個指向相同 project／agent 的 environment。
@@ -87,7 +87,14 @@ azd env get-values
 
 ## 步驟三：建立基礎設施
 
-首次部署，或已確認缺少所需接線且獲准變更時：
+先選**其中一條路徑**。預設自助入口與 Bicep 授權模型維持不變；
+沒有 ACR scope 的 `Microsoft.Authorization/roleAssignments/write` 時，改用管理員 bootstrap。
+Lab 0 只找到 Foundry Project Manager／Bot Contributor GUID **不代表**有這項權限。
+
+### 路徑 A：自助 provision
+
+首次部署，或已確認缺少所需接線且獲准變更，**且執行者有資源部署、project connection
+寫入與 ACR role assignment 權限，其 condition 也允許必要角色**時：
 
 ```bash
 # 起始目錄：deploy/
@@ -96,13 +103,85 @@ azd provision
 
 [main.bicep](../deploy/infra/main.bicep) 在既有 resource group 建立 ACR，
 將 AcrPull 授予既有 Foundry project managed identity、將 Container Registry Tasks Contributor
-授予部署者，並建立 project 的 ContainerRegistry 連線。
+授予 `principalId` 指定的建置／部署主體，並建立 project 的 ContainerRegistry 連線。
 它**不建立 Foundry project／模型部署**，也不在此建立 hosted agent。
 
 既有升級環境若 ACR、授權與連線已完整，不因 SDK 改版盲目重跑 provision。
 新 environment 名稱會參與 ACR／連線命名；新增 environment 可能建立另一份資產，而非隔離原 agent。
-權限錯誤先請環境管理者確認資源群組部署／角色指派及 Foundry 專案權限；
-訂閱 Owner 不等於具備 Foundry Project Manager。不要把自行擴增 RBAC 當一般排錯步驟。
+權限錯誤先請環境管理者分開確認 ARM／IAM 與 Foundry data plane；
+訂閱 Owner 不等於已取得 Foundry data plane 權限。不要把自行擴增 RBAC 當一般排錯步驟。
+
+### 路徑 B：管理員 bootstrap
+
+此路徑保留學員自助部署映像，只把上述**同一份 Bicep**交給具權限的管理員執行。
+不建立 Foundry account／project／model，不授予學員 Owner、User Access Administrator
+或 Role Based Access Control Administrator，不移除／繞過管理員的 role assignment condition。
+只禁止這三種 privileged roles 的 condition 不必然禁止 AcrPull／Container Registry Tasks
+Contributor；是否允許仍以目標 scope、condition、deny 與實際 ARM 回應為準。
+
+**1. 學員匯出 request。** 必須在學員自己的登入 context、已完成步驟二的**原 azd environment**
+執行，不另建 environment、不手抄七個變數，也不從管理員 shell 推導學員 objectId：
+
+```bash
+# 起始目錄：deploy/；先選取你原本的 environment，不再執行 env new
+uv run --project ../src --locked python scripts/configure_azd_env.py \
+  --export-bootstrap-request .azure/lab3-bootstrap-request.json
+```
+
+工具重用現有 `.env` 解析與 Azure context 查詢，並與原 azd environment 交叉核對。
+request 僅含 `schemaVersion`、`subscriptionId`、`resourceGroup`、`environmentName`、
+`location`、`accountName`、`projectName`、`studentObjectId`；無 token、secret、完整 `.env`
+或可執行 template path。`environmentName` 參與 ACR／connection 命名，不能由管理員猜一個。
+匯出／匯入都會做唯讀 Azure 查詢，並非離線工具；這份修補的離線測試才使用 mocked CLI。
+既有 request 不會覆寫，重做時先自行核對／保留舊檔，再選新檔名。
+
+只透過組織核准的管道將此 request 交給管理員。這些識別不是憑證，但仍是內部資產資訊，
+不要提交到 Git。`deploy/.azure/` 已被忽略。
+
+**2. 管理員執行完整 helper，不逐段貼程式。** 使用**同一個經審查版本的 repo checkout**，
+先以組織核准的方式登入並選定 request 的訂閱；helper 不自動登入或切換訂閱。
+下面是 Windows PowerShell 5.1／pwsh 範例，路徑為示意，可含空白：
+
+```powershell
+# 起始目錄：任意資料夾；$repo 必須是管理員已取得、已審查的 checkout
+$repo = 'C:\workshop repo'
+$request = Join-Path $HOME 'lab3-handoff\lab3-bootstrap-request.json'
+$result = Join-Path $HOME 'lab3-handoff\lab3-bootstrap-result.json'
+& (Join-Path $repo 'deploy\scripts\Invoke-Lab3Bootstrap.ps1') `
+    -RequestPath $request -ResultPath $result
+```
+
+helper 以 `$PSScriptRoot` 固定定位 repo 的 `deploy/infra/main.bicep`，不依 cwd，也不接受
+request 指定 template。它核對 active subscription、既有 RG 的 scope／location、既有 project
+與 managed identity，展示**執行者、scope、原 environment、受授權學員 objectId、project identity**
+後，要求輸入 `BOOTSTRAP` 才執行 `az deployment group create`。
+人員仍須透過可信管道核對 request 屬於獲准的學員／scope；JSON 不是授權簽章。
+
+傳入 Bicep 的 `principalId` **始終是 request 的 studentObjectId**，`principalType=User`；
+管理員只負責執行。AcrPull 仍給 project managed identity，並沿用原 module 的 deterministic
+role assignment naming，不另外建立隨機 GUID assignments。這個學員交接模式不支援用 service
+principal 冒充學員。
+
+路徑／欄位／context 不符、CLI 非零結束碼、空／無效 JSON、非 Succeeded 或缺少／錯誤 outputs
+均會停止，不重試 ABAC 403。只有成功才以 UTF-8 結果 envelope 發布三個 ACR outputs；
+結果檔若已存在會拒絕覆寫，避免誤拿上次成功結果。原始 CLI stderr 保留供診斷。
+**ARM 失敗不代表零變更**，可能已建立部分資源；先查原始錯誤再決定是否重跑同一份 request。
+
+**3. 學員核對並匯入結果，再 deploy。** 管理員只回傳 result JSON，學員存回原 environment
+的 `.azure/`，不要直接執行別人給的 `azd env set`：
+
+```bash
+# 起始目錄：deploy/；仍選取原 environment，Azure context 與 src/.env 也須一致
+uv run --project ../src --locked python scripts/configure_azd_env.py \
+  --import-bootstrap-result .azure/lab3-bootstrap-result.json
+azd deploy
+```
+
+匯入工具核對七個 request 欄位、原 environment／project／RG／學員身分及 ACR output scope，
+**只寫入** `AZURE_CONTAINER_REGISTRY_ENDPOINT`、`AZURE_CONTAINER_REGISTRY_RESOURCE_ID`、
+`AZURE_ACR_CONNECTION_NAME`。錯誤時不匯入；不覆寫原 Foundry／模型設定。
+之後**不要再跑 `azd provision` 或 `azd up`**，否則學員仍會碰到 ACR role assignments。
+成功匯入不等於 Azure／IAM／Teams 端到端驗收，仍須完成下方實際部署與對話驗證。
 
 ### 執行時身分不等於部署者
 
@@ -122,6 +201,10 @@ azd deploy
 
 現有 `remoteBuild: true` 在 Azure 建置 `linux/amd64` image；Dockerfile 使用
 `uv sync --locked --no-dev`，再由 extension 建立 agent version。
+`azd deploy` 不是「保證不寫 IAM」：現有 extension 的 postdeploy 可能指派 Foundry User。
+workshop 已有的 project-scope Foundry Project Manager 是相容路徑，不等於 ACR scope 的
+roleAssignments/write。若 postdeploy 仍有 IAM／ABAC 403，保留實際 action／scope／角色資訊
+交由管理員核對，不移除 condition，也不反覆重跑 provision。
 保存 source SHA、建置 run／digest、agent 名稱與新 version，不只保存「部署成功」訊息。
 不要為了強制新版本修改描述文字；先核對實際 code／lock／image 是否變更。
 不要重建完全相同的 image 來替代版本或路由查證。

@@ -121,11 +121,21 @@ az provider show --namespace Microsoft.BotService --query registrationState -o t
 
 ### 7. 角色指派
 
-需要**兩個**角色，範圍不同，**最容易卡關**。訂閱層的 `Owner`／`Contributor` **不包含**它們。
+本 workshop 的相容路徑使用下列**兩個指定角色**，範圍不同。
+Foundry 的 **data plane** 與 Azure Resource Manager（ARM）管理操作不能混為一談：
+`Owner`／`Contributor` 一般涵蓋 `Microsoft.BotService/botServices/write` 等 Bot **ARM**
+操作，但不因此取得 Foundry data plane 的 agent／模型權限。角色名稱不同，也可能有等效權限；
+preflight 只查下列兩個 GUID，並不展開所有 Actions／DataActions、ABAC condition 或 deny assignment。
+
+以下指令應由在目標 scope 有 `Microsoft.Authorization/roleAssignments/write`、
+且 role assignment condition 允許這些 job roles 的管理員核對後執行。
+受授權 objectId 必須是**學員**，不是代跑管理員。不要為了課程授予學員
+Owner、User Access Administrator 或 Role Based Access Control Administrator，也不要移除 condition。
 
 ```bash
-# 先取得你自己的 objectId
-OBJ=$(az ad signed-in-user show --query id -o tsv)
+# 學員在自己的 shell 取得 objectId，交給管理員；不要在管理員 shell 重查自己的 id
+az ad signed-in-user show --query id -o tsv
+OBJ="<學員提供的 objectId>"
 
 # 角色 1：Foundry Project Manager（範圍 = Foundry 專案）
 az role assignment create \
@@ -149,7 +159,15 @@ az role assignment create \
 > | Foundry Project Manager            | `eadc314b-1a2d-4efa-be10-5d325db5065e` | Foundry 專案 |
 > | Azure Bot Service Contributor Role | `9fc6112f-f48e-4e27-8b09-72a5c94e4ae9` | 資源群組     |
 
-**非訂閱擁有者**：將上述兩段指令連同 objectId 寄給訂閱管理員。核准需時間，請儘早提出申請。
+**Lab 3 是另一層授權**：自助 `azd provision` 會建立 ACR、在 ACR scope 指派
+AcrPull 給 project managed identity、Container Registry Tasks Contributor 給學員，並寫入
+project ContainerRegistry connection。前述兩個角色不證明學員能寫入 ACR role assignments。
+沒有該權限時，走 [Lab 3 管理員 bootstrap](03-lab3-deploy.md#路徑-b管理員-bootstrap)，
+沿用學員原 environment 與既有 project／model；不必授予學員 RBAC Administrator。
+
+管理員的 condition 若只禁止 Owner／User Access Administrator／Role Based Access Control
+Administrator，並不代表必然禁止上述 job roles；仍須以目標 scope、deny 與實際 ARM 回應判斷。
+若 403 明示 ABAC condition，不要當作 token 或網路問題反覆重試。核准需時間，請儘早提出申請。
 
 ### 8. Microsoft Teams
 
@@ -209,14 +227,15 @@ IPM Workshop 環境前置檢查
 [1/6] 登入的訂閱          通過 <你的訂閱名稱> — 請確認這是你預期使用的訂閱
 [2/6] 資源區域            通過 <區域>（資源群組 <RG>）
 [3/6] provider 註冊       通過 Microsoft.CognitiveServices、Microsoft.BotService
-[4/6] 角色指派            通過 Foundry Project Manager、Azure Bot Service Contributor Role
+[4/6] 角色指派            通過 已找到指定角色；僅確認角色存在，不代表 effective permissions、ABAC／deny 或 Lab 3 ACR bootstrap 通過
 [5/6] 專案端點            通過 可連線
 [6/6] 模型能力            通過 tool calling、structured outputs
 
 結果：6/6 通過。可以進入 Lab 1。
 ```
 
-> **提示：** 檢查工具只讀取設定；失敗時會一次列出所有問題與修復指令。
+> **提示：** preflight 不變更 Azure 資源；模型能力檢查會呼叫模型，可能計費。
+> `6/6` 不是完整授權驗收，尤其不證明 Lab 3 bootstrap 或 Lab 4 發布能成功。
 
 ---
 
@@ -228,7 +247,8 @@ IPM Workshop 環境前置檢查
 | 1 登入的訂閱    | 顯示的訂閱不是你要的                 | 多訂閱環境的預設值                           | `az account set --subscription <訂閱 ID>`                                  |
 | 2 資源區域      | `不在 hosted agents 支援清單內`      | 專案建在不支援的區域（例如 East Asia）       | **現場無法修復**——需重建專案並重新部署模型，改走觀摩路徑                   |
 | 3 provider 註冊 | 顯示 `NotRegistered`                 | 未註冊                                       | `az provider register --namespace <ns>`；需數分鐘，可先進 Lab 1            |
-| 4 角色指派      | `缺少：Foundry Project Manager…`     | 訂閱層 Owner 不含這兩個角色                  | 依訊息印出的指令指派；**非訂閱擁有者通常無法現場修復**                     |
+| 4 角色指派      | `未找到指定 workshop 角色或查詢失敗` | 未查到指定 GUID、讀取受限，或使用其他等效角色 | 請管理員分別核對 Foundry data plane 與 Bot ARM 權限；不要只看角色名稱 |
+| Lab 3 provision | `roleAssignments/write`／ABAC 403 | ACR scope 的 IAM 權限或 condition 不允許本次指派 | 使用 [管理員 bootstrap](03-lab3-deploy.md#路徑-b管理員-bootstrap)，不移除 condition |
 | 5 專案端點      | `AADSTS530036`                       | 租戶的 Conditional Access 政策               | `az logout` 後 `az login --scope "https://ai.azure.com/.default"`          |
 | 5 專案端點      | 其他連線失敗                         | 端點填錯，或登入的租戶與專案不同             | 逐字比對 Foundry portal 的「專案端點」；`az account show --query tenantId` |
 | 6 模型能力      | `部署 <名稱> 不支援：tool calling…`  | 該部署的模型不支援必要能力                   | 依訊息的編號步驟改用其他部署（建議 `gpt-5.4-mini`）                        |
@@ -251,7 +271,9 @@ IPM Workshop 環境前置檢查
 | provider 註冊                                   | 可，但需等待 | 註冊需數分鐘，Lab 3 前完成即可             |
 | 模型部署                                        | 可，但需等待 | 部署需數分鐘                               |
 
-**權限那兩項最容易被低估**：訂閱層的 `Owner` 或 `Contributor` **不包含**它們。
+**權限要分層看**：Foundry data plane、Bot ARM 操作、ACR 建置與 ACR role assignment
+是不同需求。`Owner`／`Contributor` 一般涵蓋 Bot ARM 操作；preflight 沒找到 Bot 角色 GUID
+不等於沒有該操作權限，也不能因為找到兩個 GUID 就宣稱所有 ABAC 條件通過。
 
 前兩項 preflight **無法自動檢查**：網路攔截只會讓指令卡住而不報錯，租戶不一致要到 Lab 4 發布時才顯現。因此必須自行核對，不能只依賴 6/6 通過。
 

@@ -67,13 +67,15 @@ deploy/Dockerfile     容器映像定義
 deploy/azure.yaml     azd 服務宣告
 deploy/agent.yaml     agent manifest
 deploy/infra/         最小基礎設施（ACR 與授權）
-deploy/scripts/       azd 環境自動匯入工具
+deploy/scripts/       azd 環境設定、bootstrap request／result 與管理員 helper
 ```
 
 覆蓋後接著跑 [Lab 3 步驟二](../docs/03-lab3-deploy.md#步驟二初始化-azd-環境)。
 
 `deploy/.azure/`（azd 環境設定）**不會**被覆蓋。
 保留 `.azure/` 不代表 project／agent 隔離；先確認選取的 environment、既有資產與路由授權。
+若缺 ACR role assignment 權限，依 [管理員 bootstrap](../docs/03-lab3-deploy.md#路徑-b管理員-bootstrap)
+交接原 environment；不要用覆蓋完成版或重建 environment 迴避 IAM／ABAC。
 首次部署與既有升級的分支、版本／session 核對及非刪除式收尾以 [Lab 3](../docs/03-lab3-deploy.md) 為準。
 
 ---
