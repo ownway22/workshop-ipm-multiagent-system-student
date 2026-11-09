@@ -669,7 +669,7 @@ def build_completion_return_middleware(primary_name: str):
             if not assistants:
                 raise HandoffRoutingError("專家正常回覆缺少 assistant 訊息。")
             assistants[-1].contents.append(Content.from_function_call(
-                call_id=f"handoff_{uuid.uuid4().hex}", name=tool.name, arguments={},
+                call_id=f"handoff_{uuid.uuid4().hex}", name=tool.name, arguments="{}",
             ))
             return response
 

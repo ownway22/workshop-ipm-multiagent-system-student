@@ -240,6 +240,134 @@ uv run --no-sync python -c "from fixtures.test_items import TEST_ITEMS, render_p
 驗證文字完整性使用原始回應／checkpoint 或實際 UI，不以 CLI pretty formatter 的中文字形判斷。
 Checkpoint 含完整對話，若下載核對只存於私有位置，維持原 allowed types，不關閉反序列化限制。
 
+### 升級後另驗證同一專家重入
+
+上述兩個追問要求不要再交接，只覆蓋 Primary 續接，不能驗證專家在下一輪重用 history。
+以下每組另開一個新 conversation，組內兩輪使用同一 agent version、session 與 conversation，
+每輪都貼上完整 canonical prompt，等待完成後再送下一輪：
+
+| 題目順序 | 驗證重點 |
+|---|---|
+| T01 → T11 | Coding 首輪完成後，第二輪可再次執行 |
+| T11 → T01 | 更換題目順序，Coding history 仍可 replay |
+| T01 → T01 | 不依賴複合題，單一專家也可連續兩輪執行 |
+
+兩輪都須有實際 Coding 模型請求與 `Primary → Coding → Primary` transition，
+不能只看 Primary 說已完成。第二輪不得出現 `400 invalid_payload`，
+最終須為 `response.completed`／`status=completed`，外層 HTTP 200 本身不算成功。
+T11 是否完成 Architect 審查仍需另外核對；沒有 400 不代表已完成全部子需求。
+離線 regression 只驗證 SDK serialization、回交與 checkpoint 續接，不保證真實模型選對路由。
+
+### 本機離線 SDK 重入驗收
+
+在 repository 根目錄執行。WSL 使用原生 Linux Python 3.13 與獨立 venv，
+不要共用或覆蓋 Windows 的 `src/.venv`；相依仍依原 `src/uv.lock` 還原：
+
+```bash
+ACCEPTANCE_ROOT="$(mktemp -d /tmp/ipm-handoff-acceptance.XXXXXX)"
+export UV_PROJECT_ENVIRONMENT="$ACCEPTANCE_ROOT/venv"
+uv sync --project src --locked --group dev --python 3.13 \
+  --default-index https://pypi.org/simple
+
+uv run --project src --no-sync python -m pytest -c src/pyproject.toml \
+  tests/unit/test_handoff_responses.py \
+  -k specialist_history_replay_after_checkpoint_restore -q
+
+uv run --project src --no-sync python -m pytest -c src/pyproject.toml \
+  tests/unit/test_handoff_responses.py tests/unit/test_main_sdk_compatibility.py -q
+```
+
+若原來源下載失敗，先確認核准的來源，不自行換 mirror、停用 TLS 驗證或修改版本／lock。
+SDK wire regression 涵蓋 Coding、Architect、Spec 各三組，共九組兩輪案例：
+
+- 六組經外層 HTTP `stream=True`／`False`，內部 SDK 均為 `stream=True`；
+  第二輪重建 host、workflow 與 `OpenAIChatClient`，由 checkpoint 還原。
+- 三組直接執行 `workflow.run(stream=False)`，實際 SDK wire 也是 `stream=False`；
+  第二輪重建 workflow、HTTP／OpenAI SDK client 與 agent client，讀回磁碟 checkpoint。
+- 共同檢查 `store=False`、strict schema、JSON 字串參數、call／output 一對一配對及順序、
+  每輪只回交一次、不重播舊 review。HTTP 須最終 `response.completed`／`status=completed`；
+  直接 workflow 須有完整當輪輸出並回到等待使用者輸入。
+
+2026-11-09 在 #9 的 `5f5fa30` 加上上述測試補強後，以 WSL Linux `aarch64`、
+CPython `3.13.11` 完成本機驗收。版本維持原 lock：
+`agent-framework-core==1.21.0`、`agent-framework-foundry==1.14.1`、
+`agent-framework-orchestrations==1.3.1`、`agent-framework-openai==1.15.0`、
+`azure-ai-agentserver-core==2.1.0`、`azure-ai-agentserver-responses==2.2.0b1`、
+`openai==2.48.0`、`pytest==9.1.1`、`httpx==0.28.1`。
+
+| 檢查 | 實際結果 |
+|---|---|
+| 隔離 red 對照，僅將合成回交的參數改回 `{}` | 九組首輪均為 200，第二次專家請求均因 object arguments 收到合成 400；九個 subtests 失敗，exit code 1（預期） |
+| 相同 replay 選取，參數維持 `"{}"` | 2 tests、9 subtests 通過，18 次專家請求均為 200；exit code 0 |
+| 完整 Handoff／Responses 與 SDK compatibility suites | 56 tests、126 subtests 通過，無跳過；exit code 0 |
+
+Red 使用目前測試的臨時程式副本，不含 `.env`、venv、真實 checkpoint 或 incident logs，
+不以切換 branch、reset 或操作 stash 製作對照。驗收另封鎖 socket 連線、DNS 與 datagram 傳送；
+上述各輪均為零次網路操作嘗試。400 由 `MockTransport` 按參數型別合成，
+不是 Foundry 原始失敗 request body 的證據；本機結果及既有 CI smoke 均不能取代上一節的 live 驗收。
+上述是本機驗收結果；後續正式 build、Foundry live 結果與 PR 範圍簽核另列於下方。
+
+同一份 [Handoff validation workflow](../.github/workflows/handoff-container-smoke.yml)
+另有 `sdk-regression` job，以原 lock 與 Linux Python 3.13 執行上述兩個完整 suites，
+封鎖測試期間的 socket 網路操作並保存 JUnit 結果；不使用 Azure 憑證或 live 模型。
+它會在相關 source、測試、workflow 變更與解除 Draft 時執行。
+`smoke` job 仍獨立驗證正式 image、readiness 與空白輸入契約；
+兩者都須核對實際 PR head，且都不能取代 Foundry live 驗收。
+
+### 2026-11-09 候選版本 live 結果與範圍簽核
+
+應用程式 source 為 #9 的 `2b3af69a3c02c55089e767fd35ae187e864be420`。
+[CI run 42582671192](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/42582671192)
+的 `sdk-regression` 與 `smoke` 均實際執行並成功；SDK job 在 Linux `x86_64`、
+CPython `3.13.11` 通過 56 tests、126 subtests，測試期間零次網路操作嘗試。
+
+本機 azd extension 1.0.0 無法解析既有 nested `config` 部署格式。
+另經使用者確認後，以現有 ACR 遠端建置已提交 source 的乾淨副本，
+再用原鎖定 Foundry SDK／公開 API 只建立候選 version 15；沒有升降版工具、
+修改部署 manifest、provision 或變更 RBAC。ACR build `cee` 成功，平台 `linux/amd64`，
+image digest 為 `sha256:7922150f08992e87f147250145e4b24ef225e9d125d638ee14ef1c00bd52f668`。
+原 endpoint selector 保持 version 14、100%；候選版本以 explicit-version session 測試。
+
+| 題序 | 實際結果 | Coding 重入 |
+|---|---|---|
+| T01 → T11 | 兩輪 completed；第二輪只有 Architecture review，Coding history 未增加 | **未通過** |
+| T11 → T01 | 兩輪 completed；Coding 模型成功 2 次、Architect 1 次，交接及 checkpoint 符合預期 | 通過 |
+| T01 → T01 | 兩輪 completed；第二輪只有 Primary 回覆，Coding 模型僅執行首輪 1 次 | **未通過** |
+| T01 → T01，第二輪明確要求重新執行 Coding | 兩輪 completed；Coding 模型成功 2 次，交接及 checkpoint 符合預期 | 補充案例通過，不取代原矩陣 |
+
+補充案例第二輪在 canonical T01 前加上：
+
+> 這一輪請重新執行 Coding Agent 的程式碼健檢；即使材料與上一輪相同，也不要沿用上一輪結果。
+
+這只是另獲准的驗收輸入，沒有修改產品 Prompt／路由政策。
+後三組均在停止前核對實際 runtime version 15、同一 session／conversation、
+各次模型 HTTP 200、framework transitions、成功終止及兩輪 checkpoint；
+沒有 schema 400。首組則用 production allowlist 安全讀回 checkpoint，
+確認 Coding 的 `full_conversation` 為 3 → 3、Architect 為 0 → 7。
+首組停止後才取得的 logs 屬較晚的 version-14 新啟動，不能證實先前請求的 runtime 邊界，
+因此也不計為完整的候選版本驗收。
+
+本次共送出 8 輪使用者請求，四個新建 session 均已停止並回讀為 idle；
+不刪除既有 session／checkpoint，不改原流量路由。
+SDK serialization 與實際 Coding 重入已有通過證據，但原矩陣仍有兩組未再次交接 Coding，
+不能因沒有 400 或回應 completed 就把這些案例改寫成通過。
+使用者先選擇只補驗收，因此沒有在本修復中調整 Prompt 或路由；這些缺口當時保留為 Ready blocker。
+
+#### 後續 Portal 人工驗收與 Ready 決定
+
+使用者於同日回報，在 Foundry Portal 對同一個 `qvn-ipm-review` v15 測試
+`T01 → T12` 與 `T12 → T01`，兩組對話均正常，並確認先前寫的 agent 名稱是筆誤。
+這是**使用者回報的人工驗收**，未另取得該兩組 session ID、framework transitions 或 logs，
+不可寫成助手已獨立重播或核對其實際模型路由。
+canonical T12 是 Spec＋Architect，因此這兩組不包含第二次 Coding；
+Coding 重入證據仍來自上述 `T11 → T01` 與明確重跑 Coding 的補充案例。
+
+使用者隨後明確接受本 PR 的 **serialization-only 修復**，
+將原 `T01 → T11`、`T01 → T01` 未再次交接 Coding 的路由缺口列為**非阻擋限制**，
+授權更新 #9 並解除 Draft，不自動 merge。
+Ready for review 依據此範圍簽核，而不是宣稱原矩陣全數通過、路由缺口已修復，
+或用 Portal 正常對話取代 SDK red/green 與真正重入驗證。
+
 ## 步驟七：CLI 呼叫與續接
 
 先在自己的 shell 查看 `azd ai agent invoke --help`；本頁核對的 preview 支援
@@ -277,6 +405,8 @@ CLI 成功仍不能代替 Playground 成功。
 
 三位專家保留原 instructions／strict schema／交接工具，模型先產出 review 或釐清文字，
 再由程式補必要的回交控制 call，SDK 實際交回 Primary；control-only 回覆會被拒絕。
+控制 call 的 `arguments` 使用 JSON 字串 `"{}"`，不是 object `{}`，
+使它在下一輪從本機 history replay 到 Responses API 時仍符合欄位型別。
 同次完全相同的合法 review 可保守合併，不丟掉不同結果。
 
 Primary 不指定 JSON response format，**真實模型仍決定路由、完成與釐清**；
@@ -287,6 +417,8 @@ Primary 不指定 JSON response format，**真實模型仍決定路由、完成�
 SDK 本機 history 與既有 checkpoint 仍持久化，下一輪會 replay 完整上下文，
 輸入 Token 成本／快取效果可能改變，**不是零額外成本**。
 首次升級使用新 session／conversation，不自動遷移、刪除舊 checkpoint 或清掉舊服務端 ID。
+先前已保存 `arguments={}` 的 checkpoint 不會因更新 image 自動修復，
+不可沿用這些舊 conversation 作為本次修復的驗收；既有對話續接不在本次相容保證內。
 資料位置／相容證據見[升級紀錄](native-hosting-migration.md#checkpoint-版本邊界新-session-與-rollback)；
 不能把限定合成還原測試推廣成任意舊 state 都相容。
 
