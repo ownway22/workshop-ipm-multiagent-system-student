@@ -305,7 +305,7 @@ Red 使用目前測試的臨時程式副本，不含 `.env`、venv、真實 chec
 不以切換 branch、reset 或操作 stash 製作對照。驗收另封鎖 socket 連線、DNS 與 datagram 傳送；
 上述各輪均為零次網路操作嘗試。400 由 `MockTransport` 按參數型別合成，
 不是 Foundry 原始失敗 request body 的證據；本機結果及既有 CI smoke 均不能取代上一節的 live 驗收。
-上述是本機驗收結果；後續正式 build 與 Foundry live 結果另列於下方，PR 仍維持 Draft。
+上述是本機驗收結果；後續正式 build、Foundry live 結果與 PR 範圍簽核另列於下方。
 
 同一份 [Handoff validation workflow](../.github/workflows/handoff-container-smoke.yml)
 另有 `sdk-regression` job，以原 lock 與 Linux Python 3.13 執行上述兩個完整 suites，
@@ -314,7 +314,7 @@ Red 使用目前測試的臨時程式副本，不含 `.env`、venv、真實 chec
 `smoke` job 仍獨立驗證正式 image、readiness 與空白輸入契約；
 兩者都須核對實際 PR head，且都不能取代 Foundry live 驗收。
 
-### 2026-11-09 候選版本 live 結果：仍未通過 Ready gate
+### 2026-11-09 候選版本 live 結果與範圍簽核
 
 應用程式 source 為 #9 的 `2b3af69a3c02c55089e767fd35ae187e864be420`。
 [CI run 42582671192](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/42582671192)
@@ -350,8 +350,23 @@ image digest 為 `sha256:7922150f08992e87f147250145e4b24ef225e9d125d638ee14ef1c0
 本次共送出 8 輪使用者請求，四個新建 session 均已停止並回讀為 idle；
 不刪除既有 session／checkpoint，不改原流量路由。
 SDK serialization 與實際 Coding 重入已有通過證據，但原矩陣仍有兩組未再次交接 Coding，
-不能因沒有 400 或回應 completed 就解除 Draft。使用者選擇只補驗收，
-這些路由缺口保留為 Ready blocker，不在本修復中擅自調整 Prompt 或路由。
+不能因沒有 400 或回應 completed 就把這些案例改寫成通過。
+使用者先選擇只補驗收，因此沒有在本修復中調整 Prompt 或路由；這些缺口當時保留為 Ready blocker。
+
+#### 後續 Portal 人工驗收與 Ready 決定
+
+使用者於同日回報，在 Foundry Portal 對同一個 `qvn-ipm-review` v15 測試
+`T01 → T12` 與 `T12 → T01`，兩組對話均正常，並確認先前寫的 agent 名稱是筆誤。
+這是**使用者回報的人工驗收**，未另取得該兩組 session ID、framework transitions 或 logs，
+不可寫成助手已獨立重播或核對其實際模型路由。
+canonical T12 是 Spec＋Architect，因此這兩組不包含第二次 Coding；
+Coding 重入證據仍來自上述 `T11 → T01` 與明確重跑 Coding 的補充案例。
+
+使用者隨後明確接受本 PR 的 **serialization-only 修復**，
+將原 `T01 → T11`、`T01 → T01` 未再次交接 Coding 的路由缺口列為**非阻擋限制**，
+授權更新 #9 並解除 Draft，不自動 merge。
+Ready for review 依據此範圍簽核，而不是宣稱原矩陣全數通過、路由缺口已修復，
+或用 Portal 正常對話取代 SDK red/green 與真正重入驗證。
 
 ## 步驟七：CLI 呼叫與續接
 
