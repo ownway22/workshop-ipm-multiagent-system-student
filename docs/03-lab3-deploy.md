@@ -305,7 +305,7 @@ Red 使用目前測試的臨時程式副本，不含 `.env`、venv、真實 chec
 不以切換 branch、reset 或操作 stash 製作對照。驗收另封鎖 socket 連線、DNS 與 datagram 傳送；
 上述各輪均為零次網路操作嘗試。400 由 `MockTransport` 按參數型別合成，
 不是 Foundry 原始失敗 request body 的證據；本機結果及既有 CI smoke 均不能取代上一節的 live 驗收。
-本次未部署、呼叫 live 模型或重跑正式 image build，PR 仍維持 Draft。
+上述是本機驗收結果；後續正式 build 與 Foundry live 結果另列於下方，PR 仍維持 Draft。
 
 同一份 [Handoff validation workflow](../.github/workflows/handoff-container-smoke.yml)
 另有 `sdk-regression` job，以原 lock 與 Linux Python 3.13 執行上述兩個完整 suites，
@@ -313,6 +313,45 @@ Red 使用目前測試的臨時程式副本，不含 `.env`、venv、真實 chec
 它會在相關 source、測試、workflow 變更與解除 Draft 時執行。
 `smoke` job 仍獨立驗證正式 image、readiness 與空白輸入契約；
 兩者都須核對實際 PR head，且都不能取代 Foundry live 驗收。
+
+### 2026-11-09 候選版本 live 結果：仍未通過 Ready gate
+
+應用程式 source 為 #9 的 `2b3af69a3c02c55089e767fd35ae187e864be420`。
+[CI run 42582671192](https://github.com/ownway22/workshop-ipm-multiagent-system-student/actions/runs/42582671192)
+的 `sdk-regression` 與 `smoke` 均實際執行並成功；SDK job 在 Linux `x86_64`、
+CPython `3.13.11` 通過 56 tests、126 subtests，測試期間零次網路操作嘗試。
+
+本機 azd extension 1.0.0 無法解析既有 nested `config` 部署格式。
+另經使用者確認後，以現有 ACR 遠端建置已提交 source 的乾淨副本，
+再用原鎖定 Foundry SDK／公開 API 只建立候選 version 15；沒有升降版工具、
+修改部署 manifest、provision 或變更 RBAC。ACR build `cee` 成功，平台 `linux/amd64`，
+image digest 為 `sha256:7922150f08992e87f147250145e4b24ef225e9d125d638ee14ef1c00bd52f668`。
+原 endpoint selector 保持 version 14、100%；候選版本以 explicit-version session 測試。
+
+| 題序 | 實際結果 | Coding 重入 |
+|---|---|---|
+| T01 → T11 | 兩輪 completed；第二輪只有 Architecture review，Coding history 未增加 | **未通過** |
+| T11 → T01 | 兩輪 completed；Coding 模型成功 2 次、Architect 1 次，交接及 checkpoint 符合預期 | 通過 |
+| T01 → T01 | 兩輪 completed；第二輪只有 Primary 回覆，Coding 模型僅執行首輪 1 次 | **未通過** |
+| T01 → T01，第二輪明確要求重新執行 Coding | 兩輪 completed；Coding 模型成功 2 次，交接及 checkpoint 符合預期 | 補充案例通過，不取代原矩陣 |
+
+補充案例第二輪在 canonical T01 前加上：
+
+> 這一輪請重新執行 Coding Agent 的程式碼健檢；即使材料與上一輪相同，也不要沿用上一輪結果。
+
+這只是另獲准的驗收輸入，沒有修改產品 Prompt／路由政策。
+後三組均在停止前核對實際 runtime version 15、同一 session／conversation、
+各次模型 HTTP 200、framework transitions、成功終止及兩輪 checkpoint；
+沒有 schema 400。首組則用 production allowlist 安全讀回 checkpoint，
+確認 Coding 的 `full_conversation` 為 3 → 3、Architect 為 0 → 7。
+首組停止後才取得的 logs 屬較晚的 version-14 新啟動，不能證實先前請求的 runtime 邊界，
+因此也不計為完整的候選版本驗收。
+
+本次共送出 8 輪使用者請求，四個新建 session 均已停止並回讀為 idle；
+不刪除既有 session／checkpoint，不改原流量路由。
+SDK serialization 與實際 Coding 重入已有通過證據，但原矩陣仍有兩組未再次交接 Coding，
+不能因沒有 400 或回應 completed 就解除 Draft。使用者選擇只補驗收，
+這些路由缺口保留為 Ready blocker，不在本修復中擅自調整 Prompt 或路由。
 
 ## 步驟七：CLI 呼叫與續接
 
