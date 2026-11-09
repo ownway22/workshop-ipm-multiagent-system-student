@@ -187,7 +187,7 @@ class ScriptedHandoffClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseCh
                 raise AssertionError(f"Framework did not inject {tool_name}")
             updates.append(ChatResponseUpdate(
                 contents=[Content.from_function_call(
-                    call_id=message_id, name=tool_name, arguments={}
+                    call_id=message_id, name=tool_name, arguments="{}"
                 )],
                 role="assistant",
                 author_name=self.name,
@@ -1858,6 +1858,148 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restarted_sources[0].clients[coding].calls, 1)
         self.assertEqual(restarted_sources[0].clients[primary].calls, 2)
 
+    async def test_http_specialist_history_replay_after_checkpoint_restore(self):
+        for key, category in (
+            ("coding", "code"), ("architect", "architecture"), ("spec", "specification"),
+        ):
+            for stream in (True, False):
+                with self.subTest(specialist=key, stream=stream):
+                    requests = []
+                    sources_by_turn = []
+                    invoked_tools = []
+                    reviews = [
+                        SpecialistReview(
+                            category=category, summary=f"Synthetic review {index}.",
+                            findings=[f"Synthetic finding {index}."], severity="LOW",
+                            evidence=["Synthetic material."], recommendations=["Synthetic advice."],
+                            limitations=["Offline fixture only."],
+                        )
+                        for index in (1, 2)
+                    ]
+
+                    def provider(request):
+                        body = json.loads(request.content)
+                        requests.append(body)
+                        if any(
+                            item["type"] == "function_call"
+                            and not isinstance(item["arguments"], str)
+                            for item in body["input"]
+                        ):
+                            return Response(400, json={"error": {
+                                "code": "invalid_payload",
+                                "message": "Function call arguments must be JSON text.",
+                            }})
+                        self.assertLessEqual(len(requests), 2)
+                        return Response(
+                            200, headers={"content-type": "text/event-stream"},
+                            text=provider_responses_events((
+                                reviews[len(requests) - 1].model_dump_json() + "\n",
+                            )),
+                        )
+
+                    @function_middleware
+                    async def observe_tool(context, call_next):
+                        invoked_tools.append(context.function.name)
+                        await call_next()
+
+                    async with AsyncClient(transport=MockTransport(provider)) as provider_http:
+                        async with AsyncOpenAI(
+                            api_key="offline-fixture-not-a-real-key",
+                            base_url="http://offline.invalid/v1",
+                            http_client=provider_http, max_retries=0,
+                        ) as openai_client:
+                            def client_factory(name, script):
+                                if name == roles[key].agent_name:
+                                    return OpenAIChatClient(
+                                        model="offline-responses", async_client=openai_client,
+                                        middleware=[observe_tool],
+                                    )
+                                return ScriptedHandoffClient(name, script)
+
+                            for turn, review in enumerate(reviews):
+                                host, roles, sources = self.production_host({
+                                    "primary": [
+                                        ((f"START-{turn + 1}\n",), key), (("SUMMARY\n",), None),
+                                    ],
+                                }, suffix=f"wire-history-{key}-{stream}", client_factory=client_factory)
+                                sources_by_turn.append(sources)
+                                async with AsyncClient(
+                                    transport=ASGITransport(app=host), base_url="http://localhost"
+                                ) as client:
+                                    with self.assertLogs("workflows.responses", level="INFO") as captured:
+                                        response = await client.post("/responses", json={
+                                            "input": f"Synthetic material {turn + 1}.",
+                                            "conversation": f"conv_wire_history_{key}_{stream}",
+                                            "stream": stream,
+                                        })
+                                self.assertEqual(response.status_code, 200, response.text)
+                                self.assertEqual(len(requests), turn + 1)
+                                body = requests[-1]
+                                self.assertIs(body["store"], False)
+                                self.assertIs(body["stream"], True)
+                                self.assertEqual(body["tool_choice"], "none")
+                                self.assertTrue(body["text"]["format"]["strict"])
+                                self.assertFalse(any(
+                                    body.get(name) for name in ("previous_response_id", "conversation")
+                                ))
+                                calls = [
+                                    item for item in body["input"] if item["type"] == "function_call"
+                                ]
+                                outputs = [
+                                    item for item in body["input"] if item["type"] == "function_call_output"
+                                ]
+                                for call in calls:
+                                    self.assertIsInstance(call["arguments"], str)
+                                    self.assertEqual(json.loads(call["arguments"]), {})
+                                self.assertEqual(len({call["call_id"] for call in calls}), len(calls))
+                                self.assertCountEqual(
+                                    [call["call_id"] for call in calls],
+                                    [output["call_id"] for output in outputs],
+                                )
+                                primary = roles["primary"].agent_name
+                                specialist = roles[key].agent_name
+                                return_calls = [
+                                    call for call in calls if call["name"] == f"handoff_to_{primary}"
+                                ]
+                                self.assertEqual(len(return_calls), turn)
+                                for call in return_calls:
+                                    output = next(
+                                        item for item in outputs if item["call_id"] == call["call_id"]
+                                    )
+                                    self.assertLess(body["input"].index(call), body["input"].index(output))
+                                    self.assertEqual(json.loads(output["output"]), {"handoff_to": primary})
+                                events = [
+                                    json.loads(line.removeprefix("data: "))
+                                    for line in response.text.splitlines() if line.startswith("data: {")
+                                ] if stream else []
+                                payload = events[-1]["response"] if stream else response.json()
+                                self.assertEqual(payload["status"], "completed", "\n".join(captured.output))
+                                self.assertIsNone(payload.get("error"))
+                                if stream:
+                                    self.assertEqual(events[-1]["type"], "response.completed")
+                                    self.assertFalse(any(event["type"] == "response.failed" for event in events))
+                                actual = "".join(
+                                    part["text"]
+                                    for item in payload["output"] if item["type"] == "message"
+                                    for part in item["content"] if part["type"] == "output_text"
+                                )
+                                self.assertEqual(actual, (
+                                    f"START-{turn + 1}\n" + review.model_dump_json() + "\n"
+                                    + _render_primary_summary([(specialist, review)], "")
+                                ))
+                                self.assertEqual([
+                                    record.args for record in captured.records
+                                    if record.msg == "Handoff transition: source=%s target=%s"
+                                ], [(primary, specialist), (specialist, primary)])
+                                self.assertEqual(len(sources), 1)
+                                self.assertEqual(sources[0].clients[primary].calls, 2)
+                    specialist = roles[key].agent_name
+                    self.assertIsNot(
+                        sources_by_turn[0][0].clients[specialist],
+                        sources_by_turn[1][0].clients[specialist],
+                    )
+                    self.assertEqual(invoked_tools, [f"handoff_to_{roles['primary'].agent_name}"] * 2)
+
     async def test_production_return_policy_nonstream_agent_path(self):
         roles = build_agent_roles("nonstream-")
         primary = roles["primary"].agent_name
@@ -2197,10 +2339,14 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         ], [(primary, coding), (coding, primary)])
         for name in (primary, coding):
             messages = source.clients[name].requests[2 if name == primary else 1]
-            calls = {
-                part["call_id"] for message in messages for part in message["contents"]
+            call_contents = [
+                part for message in messages for part in message["contents"]
                 if part["type"] == "function_call"
-            }
+            ]
+            for call in call_contents:
+                self.assertIsInstance(call["arguments"], str)
+                self.assertEqual(json.loads(call["arguments"]), {})
+            calls = {call["call_id"] for call in call_contents}
             results = {
                 part["call_id"] for message in messages for part in message["contents"]
                 if part["type"] == "function_result"

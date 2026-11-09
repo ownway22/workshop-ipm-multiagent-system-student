@@ -240,6 +240,24 @@ uv run --no-sync python -c "from fixtures.test_items import TEST_ITEMS, render_p
 驗證文字完整性使用原始回應／checkpoint 或實際 UI，不以 CLI pretty formatter 的中文字形判斷。
 Checkpoint 含完整對話，若下載核對只存於私有位置，維持原 allowed types，不關閉反序列化限制。
 
+### 升級後另驗證同一專家重入
+
+上述兩個追問要求不要再交接，只覆蓋 Primary 續接，不能驗證專家在下一輪重用 history。
+以下每組另開一個新 conversation，組內兩輪使用同一 agent version、session 與 conversation，
+每輪都貼上完整 canonical prompt，等待完成後再送下一輪：
+
+| 題目順序 | 驗證重點 |
+|---|---|
+| T01 → T11 | Coding 首輪完成後，第二輪可再次執行 |
+| T11 → T01 | 更換題目順序，Coding history 仍可 replay |
+| T01 → T01 | 不依賴複合題，單一專家也可連續兩輪執行 |
+
+兩輪都須有實際 Coding 模型請求與 `Primary → Coding → Primary` transition，
+不能只看 Primary 說已完成。第二輪不得出現 `400 invalid_payload`，
+最終須為 `response.completed`／`status=completed`，外層 HTTP 200 本身不算成功。
+T11 是否完成 Architect 審查仍需另外核對；沒有 400 不代表已完成全部子需求。
+離線 regression 只驗證 SDK serialization、回交與 checkpoint 續接，不保證真實模型選對路由。
+
 ## 步驟七：CLI 呼叫與續接
 
 先在自己的 shell 查看 `azd ai agent invoke --help`；本頁核對的 preview 支援
@@ -277,6 +295,8 @@ CLI 成功仍不能代替 Playground 成功。
 
 三位專家保留原 instructions／strict schema／交接工具，模型先產出 review 或釐清文字，
 再由程式補必要的回交控制 call，SDK 實際交回 Primary；control-only 回覆會被拒絕。
+控制 call 的 `arguments` 使用 JSON 字串 `"{}"`，不是 object `{}`，
+使它在下一輪從本機 history replay 到 Responses API 時仍符合欄位型別。
 同次完全相同的合法 review 可保守合併，不丟掉不同結果。
 
 Primary 不指定 JSON response format，**真實模型仍決定路由、完成與釐清**；
@@ -287,6 +307,8 @@ Primary 不指定 JSON response format，**真實模型仍決定路由、完成�
 SDK 本機 history 與既有 checkpoint 仍持久化，下一輪會 replay 完整上下文，
 輸入 Token 成本／快取效果可能改變，**不是零額外成本**。
 首次升級使用新 session／conversation，不自動遷移、刪除舊 checkpoint 或清掉舊服務端 ID。
+先前已保存 `arguments={}` 的 checkpoint 不會因更新 image 自動修復，
+不可沿用這些舊 conversation 作為本次修復的驗收；既有對話續接不在本次相容保證內。
 資料位置／相容證據見[升級紀錄](native-hosting-migration.md#checkpoint-版本邊界新-session-與-rollback)；
 不能把限定合成還原測試推廣成任意舊 state 都相容。
 
