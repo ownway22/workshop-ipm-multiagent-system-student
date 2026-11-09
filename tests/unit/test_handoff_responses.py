@@ -338,21 +338,30 @@ class ServiceDefaultHandoffClient(ScriptedHandoffClient):
     STORES_BY_DEFAULT = True
 
 
+def provider_response(chunks: Sequence[str]) -> dict[str, Any]:
+    return {
+        "id": "resp_offline_provider", "object": "response", "created_at": 1,
+        "model": "offline-responses", "parallel_tool_calls": False,
+        "tool_choice": "auto", "tools": [], "status": "completed",
+        "output": [{
+            "id": "msg_offline_provider", "type": "message", "role": "assistant",
+            "status": "completed", "content": [{
+                "type": "output_text", "text": "".join(chunks),
+                "annotations": [], "logprobs": [],
+            }],
+        }],
+    }
+
+
 def provider_responses_events(
     chunks: Sequence[str], *, target: str | None = None,
     status: str | None = "completed", incomplete_reason: str | None = None,
 ):
-    text = "".join(chunks)
-    response = {
-        "id": "resp_offline_provider", "object": "response", "created_at": 1,
-        "model": "offline-responses", "parallel_tool_calls": False,
-        "tool_choice": "auto", "tools": [], "output": [], "status": "in_progress",
-    }
-    part = {"type": "output_text", "text": text, "annotations": [], "logprobs": []}
-    message = {
-        "id": "msg_offline_provider", "type": "message", "role": "assistant",
-        "status": "completed", "content": [part],
-    }
+    completed = provider_response(chunks)
+    response = {**completed, "output": [], "status": "in_progress"}
+    message = completed["output"][0]
+    part = message["content"][0]
+    text = part["text"]
     location = {"item_id": message["id"], "output_index": 0, "content_index": 0}
     events = [
         {"type": "response.created", "response": response},
@@ -1858,6 +1867,36 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restarted_sources[0].clients[coding].calls, 1)
         self.assertEqual(restarted_sources[0].clients[primary].calls, 2)
 
+    def assert_specialist_replay_request(self, body, primary, turn, *, stream):
+        self.assertIs(body["store"], False)
+        self.assertIs(body["stream"], stream)
+        self.assertEqual(body["tool_choice"], "none")
+        self.assertTrue(body["text"]["format"]["strict"])
+        self.assertFalse(any(
+            body.get(name) for name in ("previous_response_id", "conversation")
+        ))
+        calls = [item for item in body["input"] if item["type"] == "function_call"]
+        outputs = [item for item in body["input"] if item["type"] == "function_call_output"]
+        for call in calls:
+            self.assertIsInstance(
+                call["arguments"], str,
+                f"request {turn + 1}: {call['name']} arguments must be JSON text",
+            )
+            self.assertEqual(json.loads(call["arguments"]), {})
+        self.assertEqual(len({call["call_id"] for call in calls}), len(calls))
+        self.assertCountEqual(
+            [call["call_id"] for call in calls],
+            [output["call_id"] for output in outputs],
+        )
+        for call in calls:
+            output = next(item for item in outputs if item["call_id"] == call["call_id"])
+            self.assertLess(body["input"].index(call), body["input"].index(output))
+        return_calls = [call for call in calls if call["name"] == f"handoff_to_{primary}"]
+        self.assertEqual(len(return_calls), turn)
+        for call in return_calls:
+            output = next(item for item in outputs if item["call_id"] == call["call_id"])
+            self.assertEqual(json.loads(output["output"]), {"handoff_to": primary})
+
     async def test_http_specialist_history_replay_after_checkpoint_restore(self):
         for key, category in (
             ("coding", "code"), ("architect", "architecture"), ("spec", "specification"),
@@ -1934,40 +1973,11 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                                         })
                                 self.assertEqual(response.status_code, 200, response.text)
                                 self.assertEqual(len(requests), turn + 1)
-                                body = requests[-1]
-                                self.assertIs(body["store"], False)
-                                self.assertIs(body["stream"], True)
-                                self.assertEqual(body["tool_choice"], "none")
-                                self.assertTrue(body["text"]["format"]["strict"])
-                                self.assertFalse(any(
-                                    body.get(name) for name in ("previous_response_id", "conversation")
-                                ))
-                                calls = [
-                                    item for item in body["input"] if item["type"] == "function_call"
-                                ]
-                                outputs = [
-                                    item for item in body["input"] if item["type"] == "function_call_output"
-                                ]
-                                for call in calls:
-                                    self.assertIsInstance(call["arguments"], str)
-                                    self.assertEqual(json.loads(call["arguments"]), {})
-                                self.assertEqual(len({call["call_id"] for call in calls}), len(calls))
-                                self.assertCountEqual(
-                                    [call["call_id"] for call in calls],
-                                    [output["call_id"] for output in outputs],
-                                )
                                 primary = roles["primary"].agent_name
                                 specialist = roles[key].agent_name
-                                return_calls = [
-                                    call for call in calls if call["name"] == f"handoff_to_{primary}"
-                                ]
-                                self.assertEqual(len(return_calls), turn)
-                                for call in return_calls:
-                                    output = next(
-                                        item for item in outputs if item["call_id"] == call["call_id"]
-                                    )
-                                    self.assertLess(body["input"].index(call), body["input"].index(output))
-                                    self.assertEqual(json.loads(output["output"]), {"handoff_to": primary})
+                                self.assert_specialist_replay_request(
+                                    requests[-1], primary, turn, stream=True
+                                )
                                 events = [
                                     json.loads(line.removeprefix("data: "))
                                     for line in response.text.splitlines() if line.startswith("data: {")
@@ -1999,6 +2009,123 @@ class HandoffResponsesTests(unittest.IsolatedAsyncioTestCase):
                         sources_by_turn[1][0].clients[specialist],
                     )
                     self.assertEqual(invoked_tools, [f"handoff_to_{roles['primary'].agent_name}"] * 2)
+
+    async def test_nonstream_specialist_history_replay_after_checkpoint_restore(self):
+        for key, category in (
+            ("coding", "code"), ("architect", "architecture"), ("spec", "specification"),
+        ):
+            with self.subTest(specialist=key):
+                roles = build_agent_roles("nonstream-wire-")
+                primary = roles["primary"].agent_name
+                specialist = roles[key].agent_name
+                requests = []
+                sources = []
+                sdk_clients = []
+                workflows = []
+                invoked_tools = []
+                reviews = [
+                    SpecialistReview(
+                        category=category, summary=f"Synthetic review {index}.",
+                        findings=[f"Synthetic finding {index}."], severity="LOW",
+                        evidence=["Synthetic material."], recommendations=["Synthetic advice."],
+                        limitations=["Offline fixture only."],
+                    )
+                    for index in (1, 2)
+                ]
+
+                def provider(request):
+                    body = json.loads(request.content)
+                    requests.append(body)
+                    if any(
+                        item["type"] == "function_call"
+                        and not isinstance(item["arguments"], str)
+                        for item in body["input"]
+                    ):
+                        return Response(400, json={"error": {
+                            "code": "invalid_payload",
+                            "message": "Function call arguments must be JSON text.",
+                        }})
+                    self.assertLessEqual(len(requests), 2)
+                    return Response(200, json=provider_response((
+                        reviews[len(requests) - 1].model_dump_json() + "\n",
+                    )))
+
+                @function_middleware
+                async def observe_tool(context, call_next):
+                    invoked_tools.append(context.function.name)
+                    await call_next()
+
+                for turn, review in enumerate(reviews):
+                    async with AsyncClient(transport=MockTransport(provider)) as provider_http:
+                        async with AsyncOpenAI(
+                            api_key="offline-fixture-not-a-real-key",
+                            base_url="http://offline.invalid/v1",
+                            http_client=provider_http, max_retries=0,
+                        ) as openai_client:
+                            sdk_clients.append(openai_client)
+
+                            def client_factory(name, script):
+                                if name == specialist:
+                                    return OpenAIChatClient(
+                                        model="offline-responses", async_client=openai_client,
+                                        middleware=[observe_tool],
+                                    )
+                                return ScriptedHandoffClient(name, script)
+
+                            source = ScriptedRoleClients({
+                                primary: [
+                                    ((f"START-{turn + 1}\n",), specialist), (("SUMMARY\n",), None),
+                                ],
+                            }, client_factory=client_factory)
+                            sources.append(source)
+                            storage = HandoffResponsesHost._storage(self.root / f"nonstream-wire-{key}")
+                            workflow = build_workflow(
+                                build_participants(source, roles, checkpoint_safe=True),
+                                checkpoint_storage=storage,
+                            )
+                            workflows.append(workflow)
+                            responses = None
+                            if turn:
+                                checkpoint = await storage.get_latest(workflow_name=workflow.name)
+                                self.assertIsNotNone(checkpoint)
+                                if checkpoint is None:
+                                    self.fail("The first turn did not persist a checkpoint.")
+                                self.assertEqual(len(checkpoint.pending_request_info_events), 1)
+                                await workflow.run(checkpoint_id=checkpoint.checkpoint_id)
+                                self.assertEqual(len(requests), 1)
+                                self.assertEqual(source.clients[primary].calls, 0)
+                                responses = {
+                                    request_id: HandoffAgentUserRequest.create_response(
+                                        "Synthetic material 2."
+                                    )
+                                    for request_id in checkpoint.pending_request_info_events
+                                }
+                            result = await workflow.run(
+                                "Synthetic material 1." if responses is None else None,
+                                responses=responses, stream=False,
+                            )
+                            self.assertEqual(len(requests), turn + 1)
+                            self.assert_specialist_replay_request(
+                                requests[-1], primary, turn, stream=False
+                            )
+                            self.assertEqual([
+                                (event.data.source, event.data.target)
+                                for event in result if event.type == "handoff_sent"
+                            ], [(primary, specialist), (specialist, primary)])
+                            pending = [event for event in result if event.type == "request_info"]
+                            self.assertEqual(len(pending), 1)
+                            self.assertIsInstance(pending[0].data, HandoffAgentUserRequest)
+                            self.assertEqual("".join(
+                                output.text for output in result.get_outputs()
+                            ), (
+                                f"START-{turn + 1}\n" + review.model_dump_json() + "\n"
+                                + _render_primary_summary([(specialist, review)], "")
+                            ))
+                            self.assertEqual(source.clients[primary].calls, 2)
+                self.assertIsNot(workflows[0], workflows[1])
+                self.assertIsNot(sdk_clients[0], sdk_clients[1])
+                self.assertIsNot(sources[0].clients[specialist], sources[1].clients[specialist])
+                self.assertEqual(invoked_tools, [f"handoff_to_{primary}"] * 2)
 
     async def test_production_return_policy_nonstream_agent_path(self):
         roles = build_agent_roles("nonstream-")

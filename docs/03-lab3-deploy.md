@@ -258,6 +258,62 @@ Checkpoint 含完整對話，若下載核對只存於私有位置，維持原 al
 T11 是否完成 Architect 審查仍需另外核對；沒有 400 不代表已完成全部子需求。
 離線 regression 只驗證 SDK serialization、回交與 checkpoint 續接，不保證真實模型選對路由。
 
+### 本機離線 SDK 重入驗收
+
+在 repository 根目錄執行。WSL 使用原生 Linux Python 3.13 與獨立 venv，
+不要共用或覆蓋 Windows 的 `src/.venv`；相依仍依原 `src/uv.lock` 還原：
+
+```bash
+ACCEPTANCE_ROOT="$(mktemp -d /tmp/ipm-handoff-acceptance.XXXXXX)"
+export UV_PROJECT_ENVIRONMENT="$ACCEPTANCE_ROOT/venv"
+uv sync --project src --locked --group dev --python 3.13 \
+  --default-index https://pypi.org/simple
+
+uv run --project src --no-sync python -m pytest -c src/pyproject.toml \
+  tests/unit/test_handoff_responses.py \
+  -k specialist_history_replay_after_checkpoint_restore -q
+
+uv run --project src --no-sync python -m pytest -c src/pyproject.toml \
+  tests/unit/test_handoff_responses.py tests/unit/test_main_sdk_compatibility.py -q
+```
+
+若原來源下載失敗，先確認核准的來源，不自行換 mirror、停用 TLS 驗證或修改版本／lock。
+SDK wire regression 涵蓋 Coding、Architect、Spec 各三組，共九組兩輪案例：
+
+- 六組經外層 HTTP `stream=True`／`False`，內部 SDK 均為 `stream=True`；
+  第二輪重建 host、workflow 與 `OpenAIChatClient`，由 checkpoint 還原。
+- 三組直接執行 `workflow.run(stream=False)`，實際 SDK wire 也是 `stream=False`；
+  第二輪重建 workflow、HTTP／OpenAI SDK client 與 agent client，讀回磁碟 checkpoint。
+- 共同檢查 `store=False`、strict schema、JSON 字串參數、call／output 一對一配對及順序、
+  每輪只回交一次、不重播舊 review。HTTP 須最終 `response.completed`／`status=completed`；
+  直接 workflow 須有完整當輪輸出並回到等待使用者輸入。
+
+2026-11-09 在 #9 的 `5f5fa30` 加上上述測試補強後，以 WSL Linux `aarch64`、
+CPython `3.13.11` 完成本機驗收。版本維持原 lock：
+`agent-framework-core==1.21.0`、`agent-framework-foundry==1.14.1`、
+`agent-framework-orchestrations==1.3.1`、`agent-framework-openai==1.15.0`、
+`azure-ai-agentserver-core==2.1.0`、`azure-ai-agentserver-responses==2.2.0b1`、
+`openai==2.48.0`、`pytest==9.1.1`、`httpx==0.28.1`。
+
+| 檢查 | 實際結果 |
+|---|---|
+| 隔離 red 對照，僅將合成回交的參數改回 `{}` | 九組首輪均為 200，第二次專家請求均因 object arguments 收到合成 400；九個 subtests 失敗，exit code 1（預期） |
+| 相同 replay 選取，參數維持 `"{}"` | 2 tests、9 subtests 通過，18 次專家請求均為 200；exit code 0 |
+| 完整 Handoff／Responses 與 SDK compatibility suites | 56 tests、126 subtests 通過，無跳過；exit code 0 |
+
+Red 使用目前測試的臨時程式副本，不含 `.env`、venv、真實 checkpoint 或 incident logs，
+不以切換 branch、reset 或操作 stash 製作對照。驗收另封鎖 socket 連線、DNS 與 datagram 傳送；
+上述各輪均為零次網路操作嘗試。400 由 `MockTransport` 按參數型別合成，
+不是 Foundry 原始失敗 request body 的證據；本機結果及既有 CI smoke 均不能取代上一節的 live 驗收。
+本次未部署、呼叫 live 模型或重跑正式 image build，PR 仍維持 Draft。
+
+同一份 [Handoff validation workflow](../.github/workflows/handoff-container-smoke.yml)
+另有 `sdk-regression` job，以原 lock 與 Linux Python 3.13 執行上述兩個完整 suites，
+封鎖測試期間的 socket 網路操作並保存 JUnit 結果；不使用 Azure 憑證或 live 模型。
+它會在相關 source、測試、workflow 變更與解除 Draft 時執行。
+`smoke` job 仍獨立驗證正式 image、readiness 與空白輸入契約；
+兩者都須核對實際 PR head，且都不能取代 Foundry live 驗收。
+
 ## 步驟七：CLI 呼叫與續接
 
 先在自己的 shell 查看 `azd ai agent invoke --help`；本頁核對的 preview 支援
